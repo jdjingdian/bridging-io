@@ -1,0 +1,11 @@
+[package]
+name = "bridgingio-mcp"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[dependencies]
+bridgingio-domain = { path = "../bridgingio-domain" }
+bridgingio-engine = { path = "../bridgingio-engine" }
+bridgingio-policy = { path = "../bridgingio-policy" }
+bridgingio-providers = { path = "../bridgingio-providers" }

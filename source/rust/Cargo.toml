@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "bridgingio-domain",
+    "bridgingio-engine",
+    "bridgingio-artifacts",
+    "bridgingio-policy",
+    "bridgingio-secrets",
+    "bridgingio-connectors",
+    "bridgingio-providers",
+    "bridgingio-mcp",
+    "bridgingio-app-api",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+

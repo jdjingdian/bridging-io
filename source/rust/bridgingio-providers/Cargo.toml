@@ -1,0 +1,10 @@
+[package]
+name = "bridgingio-providers"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[dependencies]
+bridgingio-artifacts = { path = "../bridgingio-artifacts" }
+bridgingio-domain = { path = "../bridgingio-domain" }
+bridgingio-policy = { path = "../bridgingio-policy" }

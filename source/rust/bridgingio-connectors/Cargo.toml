@@ -1,0 +1,8 @@
+[package]
+name = "bridgingio-connectors"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[dependencies]
+bridgingio-domain = { path = "../bridgingio-domain" }

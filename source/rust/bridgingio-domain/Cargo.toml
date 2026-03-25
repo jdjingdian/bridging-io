@@ -1,0 +1,8 @@
+[package]
+name = "bridgingio-domain"
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[dependencies]
+
