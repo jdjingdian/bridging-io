@@ -44,6 +44,51 @@ struct SettingsSheetView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
             VStack(alignment: .leading, spacing: 10) {
+                Text("Model Plane")
+                    .font(ConsoleTypography.heading(13, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Host")
+                        .font(ConsoleTypography.body(12))
+                        .foregroundStyle(theme.muted)
+                    TextField("127.0.0.1", text: $viewModel.modelPlaneHost)
+                        .consoleInput(theme: theme, surface: .panel)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Port")
+                        .font(ConsoleTypography.body(12))
+                        .foregroundStyle(theme.muted)
+                    TextField(
+                        "19718",
+                        text: Binding(
+                            get: { "\(viewModel.modelPlanePort)" },
+                            set: { viewModel.modelPlanePort = Int($0) ?? viewModel.modelPlanePort }
+                        )
+                    )
+                    .consoleInput(theme: theme, surface: .panel)
+                }
+
+                Text("Default: 127.0.0.1:19718. Saving will request managed core restart when needed.")
+                    .font(ConsoleTypography.body(12))
+                    .foregroundStyle(theme.muted)
+
+                Button("Save Model Plane") {
+                    viewModel.saveModelPlaneSettings()
+                }
+                .consoleButton(theme: theme, tone: .primary)
+                .accessibilityIdentifier("settings-save-model-plane")
+            }
+            .padding(12)
+            .background(theme.panel)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(theme.border, lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+
+            VStack(alignment: .leading, spacing: 10) {
                 Text(L10n.t("settings.artifact_cache"))
                     .font(ConsoleTypography.heading(13, weight: .semibold))
                     .foregroundStyle(theme.textPrimary)

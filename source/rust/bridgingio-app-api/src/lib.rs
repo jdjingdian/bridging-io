@@ -1,7 +1,8 @@
 use std::time::SystemTime;
 
 use bridgingio_domain::{
-    ApprovalRequestRecord, ArtifactRecord, SessionRecord, SessionReusePolicy, TargetProfile,
+    ApprovalRequestRecord, ArtifactRecord, ConnectionConfig, CredentialRef, PolicyProfile,
+    SessionRecord, SessionReusePolicy, TargetKind, TargetProfile,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,10 +81,24 @@ pub enum AppCommand {
     RequestShutdown,
     ListTargets,
     ListProfiles,
+    GetProfile {
+        target_id: String,
+    },
     UpsertProfile {
         profile: TargetProfile,
     },
     GetSettings,
+    UpdateSettings {
+        model_plane_host: Option<String>,
+        model_plane_port: Option<u16>,
+        artifact_cache_backend: Option<String>,
+        artifact_cache_root: Option<String>,
+        artifact_cache_max_bytes: Option<u64>,
+        artifact_cache_eviction_policy: Option<String>,
+        tool_override_command: Option<String>,
+        tool_override_path: Option<String>,
+    },
+    ClearArtifactCache,
     ListSessions,
     ListApprovals,
     GetToolchainDiagnostics,
@@ -193,6 +208,7 @@ pub enum ApiResponse {
     },
     Accepted {
         request_id: String,
+        apply_strategy: Option<String>,
     },
     Targets {
         request_id: String,
@@ -201,6 +217,10 @@ pub enum ApiResponse {
     Profiles {
         request_id: String,
         items: Vec<TargetProfile>,
+    },
+    Profile {
+        request_id: String,
+        payload_json: String,
     },
     Settings {
         request_id: String,
@@ -301,7 +321,51 @@ impl AppApiLineCodec {
             }
             AppCommand::ListTargets => base.push_str("|command=list_targets"),
             AppCommand::ListProfiles => base.push_str("|command=list_profiles"),
+            AppCommand::GetProfile { target_id } => {
+                base.push_str("|command=get_profile");
+                base.push_str(&format!("|target_id={}", escape(target_id)));
+            }
             AppCommand::GetSettings => base.push_str("|command=get_settings"),
+            AppCommand::UpdateSettings {
+                model_plane_host,
+                model_plane_port,
+                artifact_cache_backend,
+                artifact_cache_root,
+                artifact_cache_max_bytes,
+                artifact_cache_eviction_policy,
+                tool_override_command,
+                tool_override_path,
+            } => {
+                base.push_str("|command=update_settings");
+                if let Some(value) = model_plane_host {
+                    base.push_str(&format!("|model_plane_host={}", escape(value)));
+                }
+                if let Some(value) = model_plane_port {
+                    base.push_str(&format!("|model_plane_port={value}"));
+                }
+                if let Some(value) = artifact_cache_backend {
+                    base.push_str(&format!("|artifact_cache_backend={}", escape(value)));
+                }
+                if let Some(value) = artifact_cache_root {
+                    base.push_str(&format!("|artifact_cache_root={}", escape(value)));
+                }
+                if let Some(value) = artifact_cache_max_bytes {
+                    base.push_str(&format!("|artifact_cache_max_bytes={value}"));
+                }
+                if let Some(value) = artifact_cache_eviction_policy {
+                    base.push_str(&format!(
+                        "|artifact_cache_eviction_policy={}",
+                        escape(value)
+                    ));
+                }
+                if let Some(value) = tool_override_command {
+                    base.push_str(&format!("|tool_override_command={}", escape(value)));
+                }
+                if let Some(value) = tool_override_path {
+                    base.push_str(&format!("|tool_override_path={}", escape(value)));
+                }
+            }
+            AppCommand::ClearArtifactCache => base.push_str("|command=clear_artifact_cache"),
             AppCommand::ListSessions => base.push_str("|command=list_sessions"),
             AppCommand::ListApprovals => base.push_str("|command=list_approvals"),
             AppCommand::GetToolchainDiagnostics => base.push_str("|command=get_diagnostics"),
@@ -317,8 +381,8 @@ impl AppApiLineCodec {
                 base.push_str("|command=execute");
                 base.push_str(&format!(
                     "|session_id={}|exec={}|stream={}",
+                    escape(session_id),
                     escape(command),
-                    session_id,
                     stream
                 ));
             }
@@ -335,10 +399,61 @@ impl AppApiLineCodec {
             AppCommand::UpsertProfile { profile } => {
                 base.push_str("|command=upsert_profile");
                 base.push_str(&format!(
-                    "|target_id={}|target_name={}",
+                    "|target_id={}|target_name={}|target_kind={}",
                     profile.id,
-                    escape(&profile.name)
+                    escape(&profile.name),
+                    target_kind_label(&profile.kind),
                 ));
+                if let Some(alias) = profile.metadata.get("alias") {
+                    base.push_str(&format!("|target_alias={}", escape(alias)));
+                }
+                if let Some(notes) = profile.notes.as_ref() {
+                    base.push_str(&format!("|notes={}", escape(notes)));
+                }
+                if let Some(credential) = profile.credential_ref.as_ref() {
+                    base.push_str(&format!("|credential_ref={}", escape(&credential.id)));
+                }
+                match &profile.connection {
+                    ConnectionConfig::Ssh {
+                        host,
+                        port,
+                        username,
+                    } => {
+                        base.push_str(&format!(
+                            "|ssh_host={}|ssh_port={}|ssh_username={}",
+                            escape(host),
+                            port,
+                            escape(username)
+                        ));
+                    }
+                    ConnectionConfig::Adb { serial, transport } => {
+                        if let Some(serial) = serial.as_ref() {
+                            base.push_str(&format!("|adb_serial={}", escape(serial)));
+                        }
+                        if let Some(transport) = transport.as_ref() {
+                            base.push_str(&format!("|adb_transport={}", escape(transport)));
+                        }
+                    }
+                    ConnectionConfig::Serial { device, baud_rate } => {
+                        base.push_str(&format!(
+                            "|serial_device={}|serial_baud={}",
+                            escape(device),
+                            baud_rate
+                        ));
+                    }
+                    ConnectionConfig::Docker { container, context } => {
+                        base.push_str(&format!("|docker_container={}", escape(container)));
+                        if let Some(context) = context.as_ref() {
+                            base.push_str(&format!("|docker_context={}", escape(context)));
+                        }
+                    }
+                    ConnectionConfig::Custom { description } => {
+                        base.push_str(&format!(
+                            "|custom_description={}",
+                            escape(description)
+                        ));
+                    }
+                }
             }
             AppCommand::RequestApproval { request } => {
                 base.push_str("|command=request_approval");
@@ -396,7 +511,31 @@ impl AppApiLineCodec {
             "request_shutdown" => AppCommand::RequestShutdown,
             "list_targets" => AppCommand::ListTargets,
             "list_profiles" => AppCommand::ListProfiles,
+            "get_profile" => AppCommand::GetProfile {
+                target_id: unescape(required(&map, "target_id")?),
+            },
+            "upsert_profile" => AppCommand::UpsertProfile {
+                profile: parse_profile_from_fields(&map)?,
+            },
             "get_settings" => AppCommand::GetSettings,
+            "update_settings" => AppCommand::UpdateSettings {
+                model_plane_host: optional(&map, "model_plane_host").map(unescape),
+                model_plane_port: parse_optional_u16(optional(&map, "model_plane_port"))?,
+                artifact_cache_backend: optional(&map, "artifact_cache_backend").map(unescape),
+                artifact_cache_root: optional(&map, "artifact_cache_root").map(unescape),
+                artifact_cache_max_bytes: parse_optional_u64(optional(
+                    &map,
+                    "artifact_cache_max_bytes",
+                ))?,
+                artifact_cache_eviction_policy: optional(
+                    &map,
+                    "artifact_cache_eviction_policy",
+                )
+                .map(unescape),
+                tool_override_command: optional(&map, "tool_override_command").map(unescape),
+                tool_override_path: optional(&map, "tool_override_path").map(unescape),
+            },
+            "clear_artifact_cache" => AppCommand::ClearArtifactCache,
             "list_sessions" => AppCommand::ListSessions,
             "list_approvals" => AppCommand::ListApprovals,
             "get_diagnostics" => AppCommand::GetToolchainDiagnostics,
@@ -418,6 +557,19 @@ impl AppApiLineCodec {
                 limit: required(&map, "limit")?
                     .parse::<usize>()
                     .map_err(|_| invalid_request("limit must be usize"))?,
+            },
+            "request_approval" => AppCommand::RequestApproval {
+                request: ApprovalRequestRecord {
+                    id: required(&map, "approval_id")?.to_string(),
+                    scope_id: None,
+                    logical_session_id: String::new(),
+                    channel_id: None,
+                    session_id: String::new(),
+                    reason: String::new(),
+                    command_preview: String::new(),
+                    requested_at: SystemTime::UNIX_EPOCH,
+                    status: bridgingio_domain::ApprovalStatus::Pending,
+                },
             },
             other => return Err(invalid_request(&format!("unsupported command: {other}"))),
         };
@@ -484,8 +636,15 @@ impl AppApiLineCodec {
                 "kind=not_ready|request_id={request_id}|reason={}",
                 escape(reason)
             ),
-            ApiResponse::Accepted { request_id } => {
-                format!("kind=accepted|request_id={request_id}")
+            ApiResponse::Accepted {
+                request_id,
+                apply_strategy,
+            } => {
+                let mut line = format!("kind=accepted|request_id={request_id}");
+                if let Some(value) = apply_strategy.as_ref() {
+                    line.push_str(&format!("|apply_strategy={}", escape(value)));
+                }
+                line
             }
             ApiResponse::Targets { request_id, items } => {
                 format!("kind=targets|request_id={request_id}|count={}", items.len())
@@ -493,6 +652,13 @@ impl AppApiLineCodec {
             ApiResponse::Profiles { request_id, items } => {
                 format!("kind=profiles|request_id={request_id}|count={}", items.len())
             }
+            ApiResponse::Profile {
+                request_id,
+                payload_json,
+            } => format!(
+                "kind=profile|request_id={request_id}|payload={}",
+                escape(payload_json)
+            ),
             ApiResponse::Settings {
                 request_id,
                 settings,
@@ -602,7 +768,10 @@ impl AppApiLineCodec {
                 request_id,
                 reason: unescape(required(&map, "reason")?),
             }),
-            "accepted" => Ok(ApiResponse::Accepted { request_id }),
+            "accepted" => Ok(ApiResponse::Accepted {
+                request_id,
+                apply_strategy: optional(&map, "apply_strategy").map(unescape),
+            }),
             "targets" => Ok(ApiResponse::Targets {
                 request_id,
                 items: Vec::new(),
@@ -610,6 +779,10 @@ impl AppApiLineCodec {
             "profiles" => Ok(ApiResponse::Profiles {
                 request_id,
                 items: Vec::new(),
+            }),
+            "profile" => Ok(ApiResponse::Profile {
+                request_id,
+                payload_json: unescape(required(&map, "payload")?),
             }),
             "sessions" => Ok(ApiResponse::Sessions {
                 request_id,
@@ -662,10 +835,22 @@ impl AppApiLineCodec {
                     },
                 },
             }),
-            "session" => Ok(ApiResponse::Accepted { request_id }),
-            "execution" => Ok(ApiResponse::Accepted { request_id }),
-            "artifact" => Ok(ApiResponse::Accepted { request_id }),
-            "approval" => Ok(ApiResponse::Accepted { request_id }),
+            "session" => Ok(ApiResponse::Accepted {
+                request_id,
+                apply_strategy: None,
+            }),
+            "execution" => Ok(ApiResponse::Accepted {
+                request_id,
+                apply_strategy: None,
+            }),
+            "artifact" => Ok(ApiResponse::Accepted {
+                request_id,
+                apply_strategy: None,
+            }),
+            "approval" => Ok(ApiResponse::Accepted {
+                request_id,
+                apply_strategy: None,
+            }),
             "error" => Ok(ApiResponse::Error {
                 request_id,
                 error: ApiError {
@@ -709,6 +894,33 @@ fn required<'a>(
         .ok_or_else(|| invalid_request(&format!("missing field: {key}")))
 }
 
+fn optional<'a>(
+    map: &'a std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<&'a str> {
+    map.get(key).map(String::as_str)
+}
+
+fn parse_optional_u16(value: Option<&str>) -> Result<Option<u16>, ApiError> {
+    match value {
+        Some(raw) => raw
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|_| invalid_request("field must be u16")),
+        None => Ok(None),
+    }
+}
+
+fn parse_optional_u64(value: Option<&str>) -> Result<Option<u64>, ApiError> {
+    match value {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| invalid_request("field must be u64")),
+        None => Ok(None),
+    }
+}
+
 fn parse_reuse_policy(raw: &str) -> Result<SessionReusePolicy, ApiError> {
     match raw {
         "always_new" => Ok(SessionReusePolicy::AlwaysNew),
@@ -723,6 +935,83 @@ fn reuse_policy_label(policy: &SessionReusePolicy) -> &'static str {
         SessionReusePolicy::AlwaysNew => "always_new",
         SessionReusePolicy::ReuseIfAlive => "reuse_if_alive",
         SessionReusePolicy::ResumeOrCreate => "resume_or_create",
+    }
+}
+
+fn parse_profile_from_fields(
+    map: &std::collections::HashMap<String, String>,
+) -> Result<TargetProfile, ApiError> {
+    let id = required(map, "target_id")?.to_string();
+    let name = unescape(required(map, "target_name")?);
+    let kind = parse_target_kind(required(map, "target_kind")?);
+    let connection = match &kind {
+        TargetKind::Ssh => ConnectionConfig::Ssh {
+            host: unescape(required(map, "ssh_host")?),
+            port: required(map, "ssh_port")?
+                .parse::<u16>()
+                .map_err(|_| invalid_request("ssh_port must be u16"))?,
+            username: unescape(required(map, "ssh_username")?),
+        },
+        TargetKind::Adb => ConnectionConfig::Adb {
+            serial: optional(map, "adb_serial").map(unescape),
+            transport: optional(map, "adb_transport").map(unescape),
+        },
+        TargetKind::Serial => ConnectionConfig::Serial {
+            device: unescape(required(map, "serial_device")?),
+            baud_rate: required(map, "serial_baud")?
+                .parse::<u32>()
+                .map_err(|_| invalid_request("serial_baud must be u32"))?,
+        },
+        TargetKind::Docker => ConnectionConfig::Docker {
+            container: unescape(required(map, "docker_container")?),
+            context: optional(map, "docker_context").map(unescape),
+        },
+        TargetKind::Other(_) => ConnectionConfig::Custom {
+            description: optional(map, "custom_description")
+                .map(unescape)
+                .unwrap_or_else(|| "custom target".to_string()),
+        },
+    };
+
+    let mut metadata = std::collections::BTreeMap::new();
+    if let Some(alias) = optional(map, "target_alias").map(unescape) {
+        if !alias.trim().is_empty() {
+            metadata.insert("alias".to_string(), alias);
+        }
+    }
+
+    Ok(TargetProfile {
+        id,
+        name,
+        kind,
+        connection,
+        credential_ref: optional(map, "credential_ref").map(|raw| CredentialRef {
+            id: unescape(raw),
+            provider: "vault".into(),
+        }),
+        default_policy: PolicyProfile::default(),
+        notes: optional(map, "notes").map(unescape),
+        metadata,
+    })
+}
+
+fn parse_target_kind(raw: &str) -> TargetKind {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ssh" => TargetKind::Ssh,
+        "adb" => TargetKind::Adb,
+        "serial" => TargetKind::Serial,
+        "docker" => TargetKind::Docker,
+        other => TargetKind::Other(other.to_string()),
+    }
+}
+
+fn target_kind_label(kind: &TargetKind) -> &'static str {
+    match kind {
+        TargetKind::Ssh => "ssh",
+        TargetKind::Adb => "adb",
+        TargetKind::Serial => "serial",
+        TargetKind::Docker => "docker",
+        TargetKind::Other(_) => "custom",
     }
 }
 

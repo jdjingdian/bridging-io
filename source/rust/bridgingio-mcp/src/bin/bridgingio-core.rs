@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -24,7 +25,9 @@ enum LaunchMode {
 }
 
 struct CliArgs {
-    config_path: PathBuf,
+    config_path: Option<PathBuf>,
+    runtime_root: Option<PathBuf>,
+    control_plane_socket_override: Option<PathBuf>,
     mode: LaunchMode,
 }
 
@@ -45,22 +48,53 @@ fn main() {
 }
 
 fn run(args: CliArgs) -> Result<(), String> {
+    let config_path = resolve_config_path(&args)?;
     match args.mode {
-        LaunchMode::StandaloneDetachedLauncher => spawn_detached_child(&args.config_path),
-        LaunchMode::UiManagedEphemeral => run_core(args, CoreHostMode::UiManagedEphemeral),
-        LaunchMode::StandaloneRun => run_core(args, CoreHostMode::StandaloneRun),
-        LaunchMode::StandaloneDetachedChild => run_core(args, CoreHostMode::StandaloneDetached),
+        LaunchMode::StandaloneDetachedLauncher => {
+            spawn_detached_child(&config_path, args.control_plane_socket_override.as_deref())
+        }
+        LaunchMode::UiManagedEphemeral => run_core(
+            config_path,
+            args.mode,
+            CoreHostMode::UiManagedEphemeral,
+            args.control_plane_socket_override.as_deref(),
+        ),
+        LaunchMode::StandaloneRun => run_core(
+            config_path,
+            args.mode,
+            CoreHostMode::StandaloneRun,
+            args.control_plane_socket_override.as_deref(),
+        ),
+        LaunchMode::StandaloneDetachedChild => run_core(
+            config_path,
+            args.mode,
+            CoreHostMode::StandaloneDetached,
+            args.control_plane_socket_override.as_deref(),
+        ),
     }
 }
 
-fn run_core(args: CliArgs, host_mode: CoreHostMode) -> Result<(), String> {
-    let settings = CoreSettings::load_from_file(&args.config_path)
+fn run_core(
+    config_path: PathBuf,
+    mode: LaunchMode,
+    host_mode: CoreHostMode,
+    control_plane_socket_override: Option<&Path>,
+) -> Result<(), String> {
+    let mut settings = CoreSettings::load_from_file(&config_path)
         .map_err(|err| format!("invalid config: {err:?}"))?;
-    let toolchain_resolver = default_toolchain_resolver(&settings, &args.config_path);
+    apply_control_plane_socket_override(&mut settings, control_plane_socket_override)?;
+    let toolchain_resolver = default_toolchain_resolver(&settings, &config_path);
     let runtime =
         StandaloneCoreRuntime::from_settings_with_mode(settings.clone(), toolchain_resolver, host_mode)
             .map_err(|err| format!("{err:?}"))?
             .shared();
+    {
+        let mut locked = runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned while setting config path".to_string())?;
+        locked.settings_store.runtime_metadata.config_path =
+            Some(config_path.to_string_lossy().to_string());
+    }
 
     let mut handles = Vec::new();
     if mcp_trace_enabled() {
@@ -126,7 +160,7 @@ fn run_core(args: CliArgs, host_mode: CoreHostMode) -> Result<(), String> {
     };
     println!(
         "bridgingio-core started in mode={:?} (host_mode={:?}, readiness={})",
-        args.mode, host_mode, startup_state
+        mode, host_mode, startup_state
     );
     if host_mode == CoreHostMode::UiManagedEphemeral {
         println!("waiting for ui attach before model-plane becomes ready");
@@ -150,13 +184,23 @@ fn run_core(args: CliArgs, host_mode: CoreHostMode) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_detached_child(config_path: &Path) -> Result<(), String> {
+fn spawn_detached_child(
+    config_path: &Path,
+    control_plane_socket_override: Option<&Path>,
+) -> Result<(), String> {
     let exe = env::current_exe().map_err(|err| format!("resolve current_exe failed: {err}"))?;
-    let child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("run")
         .arg("--config")
         .arg(config_path)
-        .arg("--detached-child")
+        .arg("--detached-child");
+    if let Some(path) = control_plane_socket_override {
+        command
+            .arg("--control-plane-socket-override")
+            .arg(path);
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -176,6 +220,41 @@ fn mcp_trace_enabled() -> bool {
             matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
         }
         Err(_) => false,
+    }
+}
+
+fn apply_control_plane_socket_override(
+    settings: &mut CoreSettings,
+    control_plane_socket_override: Option<&Path>,
+) -> Result<(), String> {
+    let Some(override_path) = control_plane_socket_override else {
+        return Ok(());
+    };
+    if settings.control_plane.transport != "platform-ipc" {
+        return Ok(());
+    }
+    let normalized = normalize_control_plane_socket_override(override_path)?;
+    if let Some(parent) = normalized.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create control-plane socket override dir failed: {} ({err})",
+                parent.display()
+            )
+        })?;
+    }
+    settings.control_plane.endpoint = normalized.to_string_lossy().to_string();
+    Ok(())
+}
+
+fn normalize_control_plane_socket_override(path: &Path) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err("--control-plane-socket-override requires a non-empty path".to_string());
+    }
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        let cwd = env::current_dir().map_err(|err| format!("resolve current dir failed: {err}"))?;
+        Ok(cwd.join(path))
     }
 }
 
@@ -211,6 +290,8 @@ where
 {
     let mut mode = LaunchMode::StandaloneRun;
     let mut config_path = None::<PathBuf>;
+    let mut runtime_root = None::<PathBuf>;
+    let mut control_plane_socket_override = None::<PathBuf>;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -225,6 +306,18 @@ where
                     .ok_or_else(|| "--config requires a path".to_string())?;
                 config_path = Some(PathBuf::from(path));
             }
+            "--runtime-root" => {
+                let path = iter
+                    .next()
+                    .ok_or_else(|| "--runtime-root requires a path".to_string())?;
+                runtime_root = Some(PathBuf::from(path));
+            }
+            "--control-plane-socket-override" => {
+                let path = iter.next().ok_or_else(|| {
+                    "--control-plane-socket-override requires a path".to_string()
+                })?;
+                control_plane_socket_override = Some(PathBuf::from(path));
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -235,25 +328,188 @@ where
         }
     }
 
-    let config_path =
-        config_path.ok_or_else(|| "missing required argument: --config <path>".to_string())?;
-    Ok(CliArgs { config_path, mode })
+    match mode {
+        LaunchMode::UiManagedEphemeral => {
+            if runtime_root.is_none() && config_path.is_none() {
+                return Err(
+                    "ui-managed-ephemeral requires --runtime-root <dir> or --config <path>"
+                        .to_string(),
+                );
+            }
+            if runtime_root.is_some() && config_path.is_some() {
+                return Err(
+                    "ui-managed-ephemeral accepts either --runtime-root or --config, not both"
+                        .to_string(),
+                );
+            }
+        }
+        _ => {
+            if config_path.is_none() {
+                return Err("missing required argument: --config <path>".to_string());
+            }
+            if runtime_root.is_some() {
+                return Err("--runtime-root is only supported in ui-managed-ephemeral mode".into());
+            }
+        }
+    }
+    Ok(CliArgs {
+        config_path,
+        runtime_root,
+        control_plane_socket_override,
+        mode,
+    })
 }
 
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  bridgingio-core run --config <path-to-standalone.toml>");
     eprintln!("  bridgingio-core -d --config <path-to-standalone.toml>");
-    eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-standalone.toml>");
+    eprintln!("  bridgingio-core ui-managed-ephemeral --runtime-root <runtime-root-dir>");
+    eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-managed-core.toml>");
+    eprintln!("  optional for all modes: --control-plane-socket-override <path-to.sock>");
+}
+
+fn resolve_config_path(args: &CliArgs) -> Result<PathBuf, String> {
+    if let Some(path) = args.config_path.clone() {
+        return Ok(path);
+    }
+    if args.mode == LaunchMode::UiManagedEphemeral {
+        if let Some(runtime_root) = args.runtime_root.as_ref() {
+            return ensure_runtime_root_layout(runtime_root);
+        }
+    }
+    Err("missing config path".to_string())
+}
+
+fn ensure_runtime_root_layout(runtime_root: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(runtime_root)
+        .map_err(|err| format!("runtime root unavailable: {} ({err})", runtime_root.display()))?;
+    if !runtime_root.is_dir() {
+        return Err(format!(
+            "runtime root is not a directory: {}",
+            runtime_root.display()
+        ));
+    }
+    let config_dir = runtime_root.join("config");
+    let state_dir = runtime_root.join("state");
+    let artifacts_dir = runtime_root.join("artifacts");
+    let logs_dir = runtime_root.join("logs");
+    fs::create_dir_all(&config_dir)
+        .map_err(|err| format!("create config dir failed: {} ({err})", config_dir.display()))?;
+    fs::create_dir_all(&state_dir)
+        .map_err(|err| format!("create state dir failed: {} ({err})", state_dir.display()))?;
+    fs::create_dir_all(&artifacts_dir).map_err(|err| {
+        format!(
+            "create artifacts dir failed: {} ({err})",
+            artifacts_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&logs_dir)
+        .map_err(|err| format!("create logs dir failed: {} ({err})", logs_dir.display()))?;
+
+    let write_probe = logs_dir.join(".write-test");
+    fs::write(&write_probe, b"ok").map_err(|err| {
+        format!(
+            "runtime root is not writable: {} ({err})",
+            runtime_root.display()
+        )
+    })?;
+    let _ = fs::remove_file(&write_probe);
+
+    let config_path = config_dir.join("managed-core.toml");
+    if !config_path.exists() {
+        fs::write(
+            &config_path,
+            default_managed_core_config(runtime_root, &state_dir, &artifacts_dir),
+        )
+        .map_err(|err| {
+            format!(
+                "create managed config failed: {} ({err})",
+                config_path.display()
+            )
+        })?;
+    }
+    Ok(config_path)
+}
+
+fn default_managed_core_config(
+    runtime_root: &Path,
+    state_dir: &Path,
+    artifacts_dir: &Path,
+) -> String {
+    let data_dir = toml_escape_path(runtime_root);
+    let metadata_path = toml_escape_path(&state_dir.join("metadata.sqlite3"));
+    let artifacts_path = toml_escape_path(artifacts_dir);
+    let endpoint = toml_escape_path(&state_dir.join("control-plane.sock"));
+    format!(
+        r#"schema_version = 1
+
+[core]
+instance_name = "bridgingio-ui-managed"
+data_dir = "{data_dir}"
+log_level = "info"
+
+[storage]
+metadata_backend = "sqlite"
+metadata_path = "{metadata_path}"
+
+[storage.artifacts]
+backend = "filesystem"
+root = "{artifacts_path}"
+max_bytes = 268435456
+eviction_policy = "lru"
+
+[vault]
+backend = "os-native"
+namespace = "io.bridgingio"
+
+[control_plane]
+enabled = true
+transport = "platform-ipc"
+endpoint = "{endpoint}"
+
+[model_plane.http]
+enabled = true
+host = "127.0.0.1"
+port = 19718
+allow_non_loopback = false
+
+[model_plane.http.auth]
+mode = "none"
+required_when_non_loopback = true
+
+[policies.defaults]
+reuse_policy = "resume_or_create"
+approval_mode = "on-risk"
+capture_env_fingerprint = true
+"#
+    )
+}
+
+fn toml_escape_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args_from, LaunchMode};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use bridgingio_engine::CoreSettings;
+
+    use super::{parse_args_from, CliArgs, LaunchMode};
 
     fn parse(items: &[&str]) -> LaunchMode {
         let args = items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
         parse_args_from(args).expect("parse").mode
+    }
+
+    fn parse_cli(items: &[&str]) -> CliArgs {
+        let args = items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        parse_args_from(args).expect("parse")
     }
 
     #[test]
@@ -275,8 +531,59 @@ mod tests {
     #[test]
     fn parses_ui_managed_mode() {
         assert_eq!(
-            parse(&["ui-managed-ephemeral", "--config", "/tmp/standalone.toml"]),
+            parse(&["ui-managed-ephemeral", "--runtime-root", "/tmp/runtime"]),
             LaunchMode::UiManagedEphemeral
         );
+    }
+
+    #[test]
+    fn parses_control_plane_socket_override_for_ui_mode() {
+        let parsed = parse_cli(&[
+            "ui-managed-ephemeral",
+            "--runtime-root",
+            "/tmp/runtime",
+            "--control-plane-socket-override",
+            "/tmp/bridgingio-ui.sock",
+        ]);
+        assert_eq!(
+            parsed.control_plane_socket_override,
+            Some(PathBuf::from("/tmp/bridgingio-ui.sock"))
+        );
+    }
+
+    #[test]
+    fn parses_control_plane_socket_override_for_standalone_mode() {
+        let parsed = parse_cli(&[
+            "run",
+            "--config",
+            "/tmp/standalone.toml",
+            "--control-plane-socket-override",
+            "relative.sock",
+        ]);
+        assert_eq!(
+            parsed.control_plane_socket_override,
+            Some(PathBuf::from("relative.sock"))
+        );
+    }
+
+    #[test]
+    fn creates_runtime_root_layout_and_default_config() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = PathBuf::from("/tmp").join(format!("bridgingio-runtime-{stamp}"));
+        fs::create_dir_all(&root).expect("create runtime root");
+        let config_path = super::ensure_runtime_root_layout(&root).expect("layout");
+        assert!(root.join("config").is_dir());
+        assert!(root.join("state").is_dir());
+        assert!(root.join("artifacts").is_dir());
+        assert!(root.join("logs").is_dir());
+        assert!(config_path.exists());
+
+        let settings = CoreSettings::load_from_file(&config_path).expect("parse config");
+        assert_eq!(settings.model_plane.http.host, "127.0.0.1");
+        assert_eq!(settings.model_plane.http.port, 19718);
+        assert_eq!(settings.core.data_dir, root.to_string_lossy().to_string());
     }
 }

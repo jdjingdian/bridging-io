@@ -921,6 +921,196 @@ impl CoreSettings {
     pub fn complete_example() -> &'static str {
         include_str!("../tests/fixtures/standalone-complete.toml")
     }
+
+    pub fn to_toml_string(&self) -> String {
+        let mut lines = vec![
+            format!("schema_version = {}", self.schema_version),
+            String::new(),
+            "[core]".to_string(),
+            format!("instance_name = {}", toml_quote(&self.core.instance_name)),
+            format!("data_dir = {}", toml_quote(&self.core.data_dir)),
+            format!("log_level = {}", toml_quote(&self.core.log_level)),
+            String::new(),
+            "[storage]".to_string(),
+            format!(
+                "metadata_backend = {}",
+                toml_quote(&self.storage.metadata_backend)
+            ),
+            format!("metadata_path = {}", toml_quote(&self.storage.metadata_path)),
+            String::new(),
+            "[storage.artifacts]".to_string(),
+            format!("backend = {}", toml_quote(&self.storage.artifacts.backend)),
+            format!("root = {}", toml_quote(&self.storage.artifacts.root)),
+            format!("max_bytes = {}", self.storage.artifacts.max_bytes),
+            format!(
+                "eviction_policy = {}",
+                toml_quote(&self.storage.artifacts.eviction_policy)
+            ),
+            String::new(),
+            "[vault]".to_string(),
+            format!("backend = {}", toml_quote(&self.vault.backend)),
+            format!("namespace = {}", toml_quote(&self.vault.namespace)),
+            String::new(),
+            "[control_plane]".to_string(),
+            format!("enabled = {}", self.control_plane.enabled),
+            format!("transport = {}", toml_quote(&self.control_plane.transport)),
+            format!("endpoint = {}", toml_quote(&self.control_plane.endpoint)),
+            String::new(),
+            "[model_plane.http]".to_string(),
+            format!("enabled = {}", self.model_plane.http.enabled),
+            format!("host = {}", toml_quote(&self.model_plane.http.host)),
+            format!("port = {}", self.model_plane.http.port),
+            format!(
+                "allow_non_loopback = {}",
+                self.model_plane.http.allow_non_loopback
+            ),
+            String::new(),
+            "[model_plane.http.auth]".to_string(),
+            format!("mode = {}", toml_quote(&self.model_plane.http.auth.mode)),
+            format!(
+                "required_when_non_loopback = {}",
+                self.model_plane.http.auth.required_when_non_loopback
+            ),
+            String::new(),
+            "[policies.defaults]".to_string(),
+            format!(
+                "reuse_policy = {}",
+                toml_quote(reuse_policy_to_str(&self.policies.reuse_policy))
+            ),
+            format!("approval_mode = {}", toml_quote(&self.policies.approval_mode)),
+            format!(
+                "capture_env_fingerprint = {}",
+                self.policies.capture_env_fingerprint
+            ),
+            String::new(),
+        ];
+
+        let mut toolchain_keys = self.toolchains.keys().cloned().collect::<Vec<_>>();
+        toolchain_keys.sort();
+        for key in toolchain_keys {
+            let section = self
+                .toolchains
+                .get(&key)
+                .expect("toolchain key from sorted iteration");
+            lines.push(format!("[toolchains.{}]", key));
+            lines.push(format!(
+                "path_override = {}",
+                toml_quote(&section.path_override)
+            ));
+            lines.push(format!(
+                "prefer_builtin_fallback = {}",
+                section.prefer_builtin_fallback
+            ));
+            lines.push(String::new());
+        }
+
+        for target in &self.targets {
+            lines.push("[[targets]]".to_string());
+            lines.push(format!("id = {}", toml_quote(&target.id)));
+            lines.push(format!(
+                "display_name = {}",
+                toml_quote(&target.display_name)
+            ));
+            lines.push(format!(
+                "kind = {}",
+                toml_quote(target_kind_to_str(&target.kind))
+            ));
+            lines.push(format!("enabled = {}", target.enabled));
+            lines.push(format!("aliases = {}", toml_string_array(&target.aliases)));
+            if let Some(credential_ref) = target.credential_ref.as_ref() {
+                lines.push(format!("credential_ref = {}", toml_quote(credential_ref)));
+            }
+            if let Some(notes) = target.notes.as_ref() {
+                lines.push(format!("notes = {}", toml_quote(notes)));
+            }
+            lines.push(String::new());
+
+            lines.push("[targets.connection]".to_string());
+            if let Some(host) = target.connection.host.as_ref() {
+                lines.push(format!("host = {}", toml_quote(host)));
+            }
+            if let Some(port) = target.connection.port {
+                lines.push(format!("port = {}", port));
+            }
+            if let Some(username) = target.connection.username.as_ref() {
+                lines.push(format!("username = {}", toml_quote(username)));
+            }
+            if let Some(policy) = target.connection.known_hosts_policy.as_ref() {
+                lines.push(format!("known_hosts_policy = {}", toml_quote(policy)));
+            }
+            if let Some(selector_kind) = target.connection.selector_kind.as_ref() {
+                lines.push(format!("selector_kind = {}", toml_quote(selector_kind)));
+            }
+            if let Some(selector_value) = target.connection.selector_value.as_ref() {
+                lines.push(format!("selector_value = {}", toml_quote(selector_value)));
+            }
+            lines.push(String::new());
+
+            lines.push("[targets.providers.terminal]".to_string());
+            lines.push(format!("enabled = {}", target.terminal_provider.enabled));
+            if let Some(shell) = target.terminal_provider.shell.as_ref() {
+                lines.push(format!("shell = {}", toml_quote(shell)));
+            }
+            lines.push(String::new());
+
+            for repo in &target.git_repositories {
+                lines.push("[[targets.providers.git.repositories]]".to_string());
+                lines.push(format!("id = {}", toml_quote(&repo.id)));
+                lines.push(format!("path = {}", toml_quote(&repo.path)));
+                if let Some(remote_name) = repo.remote_name.as_ref() {
+                    lines.push(format!("remote_name = {}", toml_quote(remote_name)));
+                }
+                if let Some(web_url) = repo.web_url.as_ref() {
+                    lines.push(format!("web_url = {}", toml_quote(web_url)));
+                }
+                lines.push(String::new());
+                if let Some(review) = repo.review.as_ref() {
+                    lines.push("[targets.providers.git.repositories.review]".to_string());
+                    lines.push(format!("kind = {}", toml_quote(&review.kind)));
+                    lines.push(format!("base_url = {}", toml_quote(&review.base_url)));
+                    lines.push(format!("project = {}", toml_quote(&review.project)));
+                    lines.push(String::new());
+                }
+            }
+        }
+
+        lines.join("\n") + "\n"
+    }
+}
+
+fn target_kind_to_str(kind: &TargetKind) -> &str {
+    match kind {
+        TargetKind::Ssh => "ssh",
+        TargetKind::Adb => "adb",
+        TargetKind::Serial => "serial",
+        TargetKind::Docker => "docker",
+        TargetKind::Other(value) => value.as_str(),
+    }
+}
+
+fn reuse_policy_to_str(policy: &SessionReusePolicy) -> &'static str {
+    match policy {
+        SessionReusePolicy::AlwaysNew => "always_new",
+        SessionReusePolicy::ReuseIfAlive => "reuse_if_alive",
+        SessionReusePolicy::ResumeOrCreate => "resume_or_create",
+    }
+}
+
+fn toml_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn toml_string_array(values: &[String]) -> String {
+    if values.is_empty() {
+        "[]".to_string()
+    } else {
+        let body = values
+            .iter()
+            .map(|value| toml_quote(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{body}]")
+    }
 }
 
 fn strip_comment(line: &str) -> &str {

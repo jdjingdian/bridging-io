@@ -614,6 +614,18 @@ struct UiAttachment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SettingsUpdateRequest {
+    model_plane_host: Option<String>,
+    model_plane_port: Option<u16>,
+    artifact_cache_backend: Option<String>,
+    artifact_cache_root: Option<String>,
+    artifact_cache_max_bytes: Option<u64>,
+    artifact_cache_eviction_policy: Option<String>,
+    tool_override_command: Option<String>,
+    tool_override_path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TargetCommandExecution {
     requested_target_ref: String,
     resolved_target_id: String,
@@ -1252,6 +1264,144 @@ impl StandaloneCoreRuntime {
         }
     }
 
+    fn persist_settings_to_disk(&self) -> Result<(), CoreRuntimeError> {
+        let path = self
+            .settings_store
+            .runtime_metadata
+            .config_path
+            .as_ref()
+            .ok_or_else(|| {
+                CoreRuntimeError::Config("runtime config path unavailable for persistence".into())
+            })?;
+        let text = self.settings_store.settings.to_toml_string();
+        std::fs::write(path, text)
+            .map_err(|err| CoreRuntimeError::Io(format!("persist config: {err}")))
+    }
+
+    fn rebuild_profile_cache_from_settings(&mut self) -> Result<(), CoreRuntimeError> {
+        let mut profiles = HashMap::new();
+        let mut target_refs = HashMap::new();
+        for configured in &self.settings_store.settings.targets {
+            let profile = to_target_profile(configured)?;
+            let target_id = profile.id.clone();
+            register_target_ref(&mut target_refs, &target_id, &target_id)?;
+            for alias in &configured.aliases {
+                register_target_ref(&mut target_refs, alias, &target_id)?;
+            }
+            profiles.insert(target_id, profile.clone());
+            self.tool_handler.metadata_mut().upsert_profile(profile);
+        }
+        self.profiles = profiles;
+        self.target_refs = target_refs;
+        Ok(())
+    }
+
+    fn upsert_profile_and_persist(
+        &mut self,
+        profile: TargetProfile,
+    ) -> Result<String, CoreRuntimeError> {
+        if profile.id.trim().is_empty() {
+            return Err(CoreRuntimeError::Config("target id is required".into()));
+        }
+        if profile.name.trim().is_empty() {
+            return Err(CoreRuntimeError::Config("target name is required".into()));
+        }
+
+        let standalone = to_standalone_target_profile(&profile)?;
+        let mut settings = self.settings_store.settings.clone();
+        if let Some(index) = settings
+            .targets
+            .iter()
+            .position(|existing| existing.id == standalone.id)
+        {
+            settings.targets[index] = standalone;
+        } else {
+            settings.targets.push(standalone);
+        }
+        settings.validate().map_err(|err| {
+            CoreRuntimeError::Config(format!("profile validation failed: {err:?}"))
+        })?;
+
+        self.settings_store.settings = settings;
+        self.rebuild_profile_cache_from_settings()?;
+        self.persist_settings_to_disk()?;
+        Ok("live_applied".to_string())
+    }
+
+    fn update_settings_and_persist(
+        &mut self,
+        update: SettingsUpdateRequest,
+    ) -> Result<String, CoreRuntimeError> {
+        let mut settings = self.settings_store.settings.clone();
+        let mut restart_required = false;
+
+        if let Some(host) = update.model_plane_host {
+            settings.model_plane.http.host = host;
+            restart_required = true;
+        }
+        if let Some(port) = update.model_plane_port {
+            settings.model_plane.http.port = port;
+            restart_required = true;
+        }
+
+        if let Some(backend) = update.artifact_cache_backend {
+            settings.storage.artifacts.backend = backend;
+            restart_required = true;
+        }
+        if let Some(root) = update.artifact_cache_root {
+            settings.storage.artifacts.root = root;
+            restart_required = true;
+        }
+        if let Some(max_bytes) = update.artifact_cache_max_bytes {
+            settings.storage.artifacts.max_bytes = max_bytes;
+            restart_required = true;
+        }
+        if let Some(eviction) = update.artifact_cache_eviction_policy {
+            settings.storage.artifacts.eviction_policy = eviction;
+            restart_required = true;
+        }
+
+        match (update.tool_override_command, update.tool_override_path) {
+            (Some(command), Some(path)) => {
+                let entry = settings.toolchains.entry(command).or_insert(
+                    bridgingio_engine::ToolchainSection {
+                        path_override: String::new(),
+                        prefer_builtin_fallback: false,
+                    },
+                );
+                entry.path_override = path;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(CoreRuntimeError::Config(
+                    "tool override update requires command and path".into(),
+                ))
+            }
+        }
+
+        settings.validate().map_err(|err| {
+            CoreRuntimeError::Config(format!("settings validation failed: {err:?}"))
+        })?;
+        self.settings_store.settings = settings;
+        self.persist_settings_to_disk()?;
+
+        if restart_required {
+            Ok("restart_required".to_string())
+        } else {
+            Ok("live_applied".to_string())
+        }
+    }
+
+    fn clear_artifact_cache_live(&mut self) -> Result<(), CoreRuntimeError> {
+        let store = ArtifactStore::new(artifact_store_config_from_settings(
+            &self.settings_store.settings,
+        )?)
+        .map_err(|err| CoreRuntimeError::Config(err.message))?;
+        self.tool_handler.artifact_service = ArtifactService::new(store);
+        self.tool_handler.metadata_mut().artifacts.clear();
+        Ok(())
+    }
+
     fn timeline_entries(&self, limit: usize) -> Vec<TimelineEntry> {
         let mut items = self.timeline.clone();
         items.sort_by_key(|item| std::cmp::Reverse(system_time_to_unix_millis(item.created_at)));
@@ -1359,6 +1509,12 @@ impl StandaloneCoreRuntime {
                 })
             })
             .collect::<Vec<_>>();
+        let mut profiles = self.profiles.values().cloned().collect::<Vec<_>>();
+        profiles.sort_by(|a, b| a.id.cmp(&b.id));
+        let profiles_json = profiles
+            .iter()
+            .map(target_profile_json_value)
+            .collect::<Vec<_>>();
 
         let mut sessions = self.sessions.values().cloned().collect::<Vec<_>>();
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1431,13 +1587,25 @@ impl StandaloneCoreRuntime {
             })
             .collect::<Vec<_>>();
 
+        let runtime_root = self.settings_store.settings.core.data_dir.clone();
+        let runtime_root_path = PathBuf::from(&runtime_root);
+        let runtime_root_diagnostics = json!({
+            "path": runtime_root,
+            "config_path": self.settings_store.runtime_metadata.config_path.clone(),
+            "logs_dir": runtime_root_path.join("logs").to_string_lossy().to_string(),
+            "state_dir": runtime_root_path.join("state").to_string_lossy().to_string(),
+            "accessible": runtime_root_path.exists(),
+        });
+
         json!({
             "host_mode": self.host_mode.as_label(),
             "readiness_state": self.readiness_state_label(),
             "model_plane_ready": self.model_plane_ready(),
             "targets": targets_json,
+            "profiles": profiles_json,
             "sessions": sessions_json,
             "approvals": approvals_json,
+            "runtime_root": runtime_root_diagnostics,
             "settings": {
                 "schema_version": settings.schema_version,
                 "instance_name": settings.instance_name,
@@ -1647,33 +1815,112 @@ impl StandaloneCoreRuntime {
                     request_id: request.request_id,
                 }
             }
-            AppCommand::ListTargets | AppCommand::ListProfiles => {
+            AppCommand::ListTargets => {
                 let mut items = self.profiles.values().cloned().collect::<Vec<_>>();
                 items.sort_by(|a, b| a.id.cmp(&b.id));
-                match request.command {
-                    AppCommand::ListTargets => ApiResponse::Targets {
-                        request_id: request.request_id,
-                        items,
-                    },
-                    _ => ApiResponse::Profiles {
-                        request_id: request.request_id,
-                        items,
-                    },
+                ApiResponse::Targets {
+                    request_id: request.request_id,
+                    items,
+                }
+            }
+            AppCommand::ListProfiles => {
+                let mut items = self.profiles.values().cloned().collect::<Vec<_>>();
+                items.sort_by(|a, b| a.id.cmp(&b.id));
+                ApiResponse::Profiles {
+                    request_id: request.request_id,
+                    items,
+                }
+            }
+            AppCommand::GetProfile { target_id } => {
+                let profile = match self.profiles.get(&target_id) {
+                    Some(profile) => profile,
+                    None => {
+                        return error_response(
+                            request.request_id,
+                            ApiErrorCode::NotFound,
+                            "target profile not found",
+                        )
+                    }
+                };
+                ApiResponse::Profile {
+                    request_id: request.request_id,
+                    payload_json: target_profile_payload_json(profile),
                 }
             }
             AppCommand::UpsertProfile { profile } => {
-                self.tool_handler
-                    .metadata_mut()
-                    .upsert_profile(profile.clone());
-                let _ = register_target_ref(&mut self.target_refs, &profile.id, &profile.id);
-                self.profiles.insert(profile.id.clone(), profile);
-                ApiResponse::Accepted {
-                    request_id: request.request_id,
+                match self.upsert_profile_and_persist(profile) {
+                    Ok(apply_strategy) => ApiResponse::Accepted {
+                        request_id: request.request_id,
+                        apply_strategy: Some(apply_strategy),
+                    },
+                    Err(CoreRuntimeError::Config(message)) => error_response(
+                        request.request_id,
+                        ApiErrorCode::ValidationFailed,
+                        &message,
+                    ),
+                    Err(err) => error_response(
+                        request.request_id,
+                        ApiErrorCode::Internal,
+                        &format!("{err:?}"),
+                    ),
                 }
             }
             AppCommand::GetSettings => ApiResponse::Settings {
                 request_id: request.request_id,
                 settings: self.settings_view(),
+            },
+            AppCommand::UpdateSettings {
+                model_plane_host,
+                model_plane_port,
+                artifact_cache_backend,
+                artifact_cache_root,
+                artifact_cache_max_bytes,
+                artifact_cache_eviction_policy,
+                tool_override_command,
+                tool_override_path,
+            } => {
+                let update = SettingsUpdateRequest {
+                    model_plane_host,
+                    model_plane_port,
+                    artifact_cache_backend,
+                    artifact_cache_root,
+                    artifact_cache_max_bytes,
+                    artifact_cache_eviction_policy,
+                    tool_override_command,
+                    tool_override_path,
+                };
+                match self.update_settings_and_persist(update) {
+                    Ok(apply_strategy) => ApiResponse::Accepted {
+                        request_id: request.request_id,
+                        apply_strategy: Some(apply_strategy),
+                    },
+                    Err(CoreRuntimeError::Config(message)) => error_response(
+                        request.request_id,
+                        ApiErrorCode::ValidationFailed,
+                        &message,
+                    ),
+                    Err(err) => error_response(
+                        request.request_id,
+                        ApiErrorCode::Internal,
+                        &format!("{err:?}"),
+                    ),
+                }
+            }
+            AppCommand::ClearArtifactCache => match self.clear_artifact_cache_live() {
+                Ok(()) => ApiResponse::Accepted {
+                    request_id: request.request_id,
+                    apply_strategy: Some("live_applied".to_string()),
+                },
+                Err(CoreRuntimeError::Config(message)) => error_response(
+                    request.request_id,
+                    ApiErrorCode::ValidationFailed,
+                    &message,
+                ),
+                Err(err) => error_response(
+                    request.request_id,
+                    ApiErrorCode::Internal,
+                    &format!("{err:?}"),
+                ),
             },
             AppCommand::ListSessions => {
                 let mut items = self.sessions.values().cloned().collect::<Vec<_>>();
@@ -2016,10 +2263,16 @@ fn to_target_profile(
     let connection = match configured.kind {
         TargetKind::Ssh => to_ssh_connection(&configured.connection)?,
         TargetKind::Adb => to_adb_connection(&configured.connection),
-        _ => bridgingio_domain::ConnectionConfig::Custom {
-            description: "unsupported target kind for MVP".into(),
+        TargetKind::Serial => to_serial_connection(&configured.connection),
+        TargetKind::Docker => to_docker_connection(&configured.connection),
+        TargetKind::Other(_) => bridgingio_domain::ConnectionConfig::Custom {
+            description: "custom target".into(),
         },
     };
+    let mut metadata = bridgingio_domain::MetadataMap::new();
+    if let Some(alias) = configured.aliases.first() {
+        metadata.insert("alias".to_string(), alias.clone());
+    }
     Ok(TargetProfile {
         id: configured.id.clone(),
         name: configured.display_name.clone(),
@@ -2033,7 +2286,7 @@ fn to_target_profile(
         }),
         default_policy: bridgingio_domain::PolicyProfile::default(),
         notes: configured.notes.clone(),
-        metadata: Default::default(),
+        metadata,
     })
 }
 
@@ -2063,6 +2316,142 @@ fn to_adb_connection(
         serial: connection.selector_value.clone(),
         transport: connection.selector_kind.clone(),
     }
+}
+
+fn to_serial_connection(connection: &StandaloneConnectionSection) -> bridgingio_domain::ConnectionConfig {
+    let device = connection
+        .selector_value
+        .clone()
+        .unwrap_or_else(|| "/dev/tty.usbmodem0".to_string());
+    let baud_rate = connection
+        .selector_kind
+        .as_ref()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(115_200);
+    bridgingio_domain::ConnectionConfig::Serial { device, baud_rate }
+}
+
+fn to_docker_connection(connection: &StandaloneConnectionSection) -> bridgingio_domain::ConnectionConfig {
+    let container = connection
+        .selector_value
+        .clone()
+        .unwrap_or_else(|| "container".to_string());
+    bridgingio_domain::ConnectionConfig::Docker {
+        container,
+        context: connection.selector_kind.clone(),
+    }
+}
+
+fn to_standalone_target_profile(
+    profile: &TargetProfile,
+) -> Result<StandaloneTargetProfile, CoreRuntimeError> {
+    let mut connection = StandaloneConnectionSection::default();
+    match &profile.connection {
+        ConnectionConfig::Ssh {
+            host,
+            port,
+            username,
+        } => {
+            connection.host = Some(host.clone());
+            connection.port = Some(*port);
+            connection.username = Some(username.clone());
+        }
+        ConnectionConfig::Adb { serial, transport } => {
+            connection.selector_value = serial.clone();
+            connection.selector_kind = transport.clone();
+        }
+        ConnectionConfig::Serial { device, baud_rate } => {
+            connection.selector_value = Some(device.clone());
+            connection.selector_kind = Some(baud_rate.to_string());
+        }
+        ConnectionConfig::Docker { container, context } => {
+            connection.selector_value = Some(container.clone());
+            connection.selector_kind = context.clone();
+        }
+        ConnectionConfig::Custom { description } => {
+            connection.selector_value = Some(description.clone());
+        }
+    }
+
+    Ok(StandaloneTargetProfile {
+        id: profile.id.clone(),
+        display_name: profile.name.clone(),
+        kind: profile.kind.clone(),
+        enabled: true,
+        aliases: profile
+            .metadata
+            .get("alias")
+            .map(|alias| vec![alias.clone()])
+            .unwrap_or_default(),
+        credential_ref: profile.credential_ref.as_ref().map(|value| value.id.clone()),
+        notes: profile.notes.clone(),
+        connection,
+        terminal_provider: bridgingio_engine::TerminalProviderSection {
+            enabled: false,
+            shell: None,
+        },
+        git_repositories: Vec::new(),
+    })
+}
+
+fn target_profile_payload_json(profile: &TargetProfile) -> String {
+    target_profile_json_value(profile).to_string()
+}
+
+fn target_profile_json_value(profile: &TargetProfile) -> Value {
+    let alias = profile.metadata.get("alias").cloned().unwrap_or_default();
+    let (connection_kind, connection_json) = match &profile.connection {
+        ConnectionConfig::Ssh {
+            host,
+            port,
+            username,
+        } => (
+            "ssh",
+            json!({
+                "host": host,
+                "port": port,
+                "username": username,
+            }),
+        ),
+        ConnectionConfig::Adb { serial, transport } => (
+            "adb",
+            json!({
+                "serial": serial,
+                "transport": transport,
+            }),
+        ),
+        ConnectionConfig::Serial { device, baud_rate } => (
+            "serial",
+            json!({
+                "device": device,
+                "baud_rate": baud_rate,
+            }),
+        ),
+        ConnectionConfig::Docker { container, context } => (
+            "docker",
+            json!({
+                "container": container,
+                "context": context,
+            }),
+        ),
+        ConnectionConfig::Custom { description } => (
+            "custom",
+            json!({
+                "description": description,
+            }),
+        ),
+    };
+
+    json!({
+        "id": profile.id,
+        "name": profile.name,
+        "kind": target_kind_label(&profile.kind),
+        "alias": alias,
+        "notes": profile.notes,
+        "credential_ref": profile.credential_ref.as_ref().map(|value| value.id.clone()),
+        "connection_kind": connection_kind,
+        "connection": connection_json,
+    })
 }
 
 fn to_toolchain_diagnostic(diag: ToolchainResolutionDiagnostics) -> ToolchainDiagnosticView {
@@ -3693,7 +4082,9 @@ fn parse_reuse_policy(value: &str) -> Result<SessionReusePolicy, CoreRuntimeErro
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    use bridgingio_app_api::{ApiRequest, ApiRequestContext, ApiResponse, AppCommand};
     use bridgingio_connectors::{BuiltInBinarySpec, BuiltInDistributionKind, ExecutableResolver};
     use bridgingio_domain::{ConnectionConfig, PolicyProfile};
 
@@ -3813,6 +4204,65 @@ mod tests {
         };
         let _http = ModelPlaneHttpServer::bind(runtime, &config).expect("http");
         let _client = ControlPlaneIpcClient::new(ipc.socket_path());
+    }
+
+    #[test]
+    fn update_settings_persists_and_returns_restart_required() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = PathBuf::from("/tmp").join(format!("bridgingio-update-settings-{stamp}"));
+        fs::create_dir_all(&root).expect("create root");
+        let config_path = root.join("managed-core.toml");
+        fs::write(&config_path, bridgingio_engine::CoreSettings::minimal_example()).expect("write config");
+
+        let settings = bridgingio_engine::CoreSettings::load_from_file(&config_path).expect("load");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime = StandaloneCoreRuntime::from_settings_with_mode(
+            settings,
+            resolver,
+            super::CoreHostMode::UiManagedEphemeral,
+        )
+        .expect("runtime");
+        runtime.settings_store.runtime_metadata.config_path =
+            Some(config_path.to_string_lossy().to_string());
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "req-settings".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::UpdateSettings {
+                model_plane_host: Some("127.0.0.1".into()),
+                model_plane_port: Some(19719),
+                artifact_cache_backend: None,
+                artifact_cache_root: None,
+                artifact_cache_max_bytes: None,
+                artifact_cache_eviction_policy: None,
+                tool_override_command: None,
+                tool_override_path: None,
+            },
+        });
+
+        match response {
+            ApiResponse::Accepted { apply_strategy, .. } => {
+                assert_eq!(apply_strategy.as_deref(), Some("restart_required"));
+            }
+            other => panic!("expected accepted response, got {other:?}"),
+        }
+
+        let persisted = fs::read_to_string(&config_path).expect("read persisted");
+        assert!(persisted.contains("port = 19719"), "persisted config: {persisted}");
+        let reloaded = bridgingio_engine::CoreSettings::load_from_file(&config_path).expect("reload");
+        assert_eq!(reloaded.model_plane.http.port, 19719);
     }
 
     #[test]

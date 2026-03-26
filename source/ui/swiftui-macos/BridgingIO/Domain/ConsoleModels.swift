@@ -313,6 +313,7 @@ struct OpenGrokConnectionConfig: Equatable {
 
 struct TargetProfile: Identifiable, Equatable {
     var id: UUID
+    var coreID: String
     var name: String
     var kind: TargetKind
     var aliasForModel: String
@@ -424,6 +425,7 @@ struct ArtifactCacheSettings: Equatable {
 
 struct TargetProfileDraft: Equatable {
     var existingID: UUID?
+    var existingCoreID: String?
     var name: String
     var kind: TargetKind
     var aliasForModel: String
@@ -440,6 +442,7 @@ struct TargetProfileDraft: Equatable {
 
     init(profile: TargetProfile? = nil) {
         self.existingID = profile?.id
+        self.existingCoreID = profile?.coreID
         self.name = profile?.name ?? ""
         self.kind = profile?.kind ?? .ssh
         self.aliasForModel = profile?.aliasForModel ?? ""

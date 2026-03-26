@@ -181,15 +181,19 @@ cargo run -p bridgingio-mcp --bin bridgingio-core -- run --config /absolute/path
 # standalone detached
 cargo run -p bridgingio-mcp --bin bridgingio-core -- -d --config /absolute/path/to/standalone.toml
 
-# bundled UI-managed mode
-cargo run -p bridgingio-mcp --bin bridgingio-core -- ui-managed-ephemeral --config /absolute/path/to/standalone.toml
+# bundled UI-managed mode (load-or-create from runtime root)
+cargo run -p bridgingio-mcp --bin bridgingio-core -- ui-managed-ephemeral --runtime-root /absolute/path/to/runtime-root
 ```
 
 Bundled lifecycle contract (`ui-managed-ephemeral`):
 
 - Core opens local control-plane first.
+- Core owns `config/managed-core.toml` under runtime root and performs load-or-create on startup.
+- Default model-plane listener is `127.0.0.1:19718` in freshly initialized runtime root config.
 - UI must attach through control-plane (`attach_ui`) before model-plane is considered ready.
 - Before UI attach succeeds, `/mcp` and equivalent model-plane entrypoints return explicit not-ready semantics.
+- Settings/profile writes are core-owned; UI submits updates through local control-plane IPC.
+- For updates marked `restart_required`, UI must perform managed core restart before treating changes as active.
 - When UI exits normally, UI host should request shutdown (`request_shutdown`) so managed core exits with it.
 
 Standalone lifecycle contract (`run` and `-d`):

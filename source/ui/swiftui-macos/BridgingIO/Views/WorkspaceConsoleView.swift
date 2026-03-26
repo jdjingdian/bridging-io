@@ -631,27 +631,54 @@ struct WorkspaceConsoleView: View {
         switch viewModel.coreConnectionState {
         case .connected:
             return theme.success
-        case .starting, .waitingForAttach:
+        case .startingCore, .attachingUI, .savingChanges, .restartRequired, .restartingCore:
             return theme.warning
-        case .attachFailed:
+        case .needsRuntimeRoot, .runtimeRootUnavailable, .attachFailed, .restartFailed:
             return theme.danger
         }
     }
 
     private var connectionStateView: some View {
-        EmptyStateView(
-            title: connectionStateTitle,
-            message: connectionStateMessage,
-            theme: theme
-        )
+        VStack(spacing: 14) {
+            EmptyStateView(
+                title: connectionStateTitle,
+                message: connectionStateMessage,
+                theme: theme
+            )
+            if connectionNeedsRuntimeRootSelection {
+                Button("Select Runtime Root") {
+                    viewModel.chooseRuntimeRoot()
+                }
+                .consoleButton(theme: theme, tone: .primary)
+                .accessibilityIdentifier("select-runtime-root")
+            }
+            if case .restartFailed = viewModel.coreConnectionState {
+                Button("Retry Restart") {
+                    viewModel.retryManagedConnection()
+                }
+                .consoleButton(theme: theme, tone: .secondary)
+            }
+        }
     }
 
     private var connectionStateTitle: String {
         switch viewModel.coreConnectionState {
-        case .starting:
+        case .needsRuntimeRoot:
+            return "Runtime root required"
+        case .runtimeRootUnavailable:
+            return "Runtime root unavailable"
+        case .startingCore:
             return L10n.t("workspace.connection.starting_title")
-        case .waitingForAttach:
+        case .attachingUI:
             return L10n.t("workspace.connection.waiting_title")
+        case .savingChanges:
+            return "Saving changes"
+        case .restartRequired:
+            return "Restart required"
+        case .restartingCore:
+            return "Restarting core"
+        case .restartFailed:
+            return "Core restart failed"
         case .attachFailed:
             return L10n.t("workspace.connection.failed_title")
         case .connected:
@@ -661,14 +688,35 @@ struct WorkspaceConsoleView: View {
 
     private var connectionStateMessage: String {
         switch viewModel.coreConnectionState {
-        case .starting:
+        case .needsRuntimeRoot:
+            return "Choose a runtime root directory before starting bundled managed core."
+        case .runtimeRootUnavailable(let path):
+            return "Saved runtime root is unavailable: \(path)"
+        case .startingCore:
             return L10n.t("workspace.connection.starting_message")
-        case .waitingForAttach:
+        case .attachingUI:
             return L10n.t("workspace.connection.waiting_message")
+        case .savingChanges:
+            return "Submitting changes to core-owned settings."
+        case .restartRequired:
+            return "The latest change requires a managed core restart."
+        case .restartingCore:
+            return "Restarting core and re-attaching UI..."
+        case .restartFailed(let message):
+            return message
         case .attachFailed(let message):
             return L10n.f("workspace.connection.failed_format", message)
         case .connected:
             return ""
+        }
+    }
+
+    private var connectionNeedsRuntimeRootSelection: Bool {
+        switch viewModel.coreConnectionState {
+        case .needsRuntimeRoot, .runtimeRootUnavailable:
+            return true
+        default:
+            return false
         }
     }
 }

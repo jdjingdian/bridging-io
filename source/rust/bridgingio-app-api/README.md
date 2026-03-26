@@ -17,16 +17,19 @@ the Rust core engine.
 Commands currently cover:
 
 - target listing
-- profile upsert/list
-- settings snapshot
+- profile detail read (`get_profile`) and upsert
+- settings snapshot and update (`update_settings`)
+- artifact cache clear
 - sessions/approvals/diagnostics listing
 - session opening
 - command execution
 - artifact reading
 - approval request dispatch
 
-The request/response layer now includes settings/profile and diagnostics access
-needed by trusted control-plane clients.
+For trusted local UI hosts, profile/settings writes are core-owned: the core
+validates and persists changes, then returns `apply_strategy` (for example
+`live_applied` or `restart_required`) so host state machines can drive managed
+restart flows.
 
 ## Response Model
 

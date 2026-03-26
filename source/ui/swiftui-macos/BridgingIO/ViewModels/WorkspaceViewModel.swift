@@ -1,39 +1,38 @@
 import Foundation
 import SwiftUI
 import Combine
+import AppKit
 import Darwin
 
 enum WorkspaceCoreConnectionState: Equatable {
-    case starting
-    case waitingForAttach
+    case needsRuntimeRoot
+    case runtimeRootUnavailable(String)
+    case startingCore
+    case attachingUI
     case attachFailed(String)
+    case savingChanges
+    case restartRequired
+    case restartingCore
+    case restartFailed(String)
     case connected
 }
 
-final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
+final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
     private let lock = NSLock()
     private var process: Process?
     private var coreLogHandle: FileHandle?
     private var requestSequence: Int = 0
     private var targetIDMap: [String: UUID] = [:]
     private let uiInstanceID: String
-    private let socketPath: String
-    private let configPath: String
-    private let coreLogPath: String
-    private let runtimeRootPath: String
+    private var socketPath: String = ""
+    private var coreLogPath: String = ""
+    private var runtimeRootPath: String?
+    private static let runtimeRootDefaultsKey = "bridgingio.runtime_root"
 
     init() {
         let shortID = String(UUID().uuidString.lowercased().prefix(8))
-        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? tmpDir
         uiInstanceID = "swiftui-\(shortID)"
-        socketPath = tmpDir.appendingPathComponent("bridgingio-ui-\(shortID).sock").path
-        configPath = tmpDir.appendingPathComponent("bridgingio-ui-\(shortID).toml").path
-        coreLogPath = tmpDir.appendingPathComponent("bridgingio-core-\(shortID).log").path
-        runtimeRootPath = appSupportDir
-            .appendingPathComponent("BridgingIORuntime", isDirectory: true)
-            .path
+        runtimeRootPath = UserDefaults.standard.string(forKey: Self.runtimeRootDefaultsKey)
     }
 
     func bootstrapSnapshot() throws -> WorkspaceSnapshot {
@@ -63,24 +62,67 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
         }
         try? coreLogHandle?.close()
         coreLogHandle = nil
-        try? FileManager.default.removeItem(atPath: socketPath)
+        if !socketPath.isEmpty {
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+    }
+
+    func hasRuntimeRootSelection() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return runtimeRootPath != nil
+    }
+
+    func setRuntimeRoot(path: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        runtimeRootPath = path
+        UserDefaults.standard.set(path, forKey: Self.runtimeRootDefaultsKey)
+    }
+
+    func selectedRuntimeRoot() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return runtimeRootPath
+    }
+
+    func controlledRestart() throws -> WorkspaceSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        stopCoreLocked()
+        try ensureCoreStartedLocked()
+        try attachUILocked()
+        return try fetchBootstrapLocked()
     }
 
     private func ensureCoreStartedLocked() throws {
         if let process, process.isRunning {
             return
         }
-        process = nil
-        try? coreLogHandle?.close()
-        coreLogHandle = nil
+        let runtimeRoot = try validatedRuntimeRootLocked()
+        let stateDir = URL(fileURLWithPath: runtimeRoot, isDirectory: true)
+            .appendingPathComponent("state", isDirectory: true)
+        let logsDir = URL(fileURLWithPath: runtimeRoot, isDirectory: true)
+            .appendingPathComponent("logs", isDirectory: true)
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        socketPath = try controlPlaneSocketPathLocked()
+        coreLogPath = logsDir.appendingPathComponent("bridgingio-core.log").path
+
+        stopCoreLocked()
         try? FileManager.default.removeItem(atPath: socketPath)
-        try writeConfigLocked()
         let executable = try resolveCoreExecutablePath()
         FileManager.default.createFile(atPath: coreLogPath, contents: nil)
         let logHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: coreLogPath))
         let coreProcess = Process()
         coreProcess.executableURL = URL(fileURLWithPath: executable)
-        coreProcess.arguments = ["ui-managed-ephemeral", "--config", configPath]
+        coreProcess.arguments = [
+            "ui-managed-ephemeral",
+            "--runtime-root",
+            runtimeRoot,
+            "--control-plane-socket-override",
+            socketPath
+        ]
         coreProcess.standardOutput = logHandle
         coreProcess.standardError = logHandle
         do {
@@ -106,61 +148,32 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
         }
     }
 
-    private func writeConfigLocked() throws {
-        let stateDir = "\(runtimeRootPath)/state"
-        let artifactsDir = "\(runtimeRootPath)/artifacts"
-        try FileManager.default.createDirectory(
-            atPath: stateDir,
-            withIntermediateDirectories: true
-        )
-        try FileManager.default.createDirectory(
-            atPath: artifactsDir,
-            withIntermediateDirectories: true
-        )
+    private func stopCoreLocked() {
+        if let running = process, running.isRunning {
+            running.terminate()
+        }
+        process = nil
+        try? coreLogHandle?.close()
+        coreLogHandle = nil
+        if !socketPath.isEmpty {
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+    }
 
-        let toml = """
-        schema_version = 1
-
-        [core]
-        instance_name = "bridgingio-ui"
-        data_dir = "\(runtimeRootPath)"
-        log_level = "info"
-
-        [storage]
-        metadata_backend = "sqlite"
-        metadata_path = "\(stateDir)/metadata.sqlite3"
-
-        [storage.artifacts]
-        backend = "memory"
-        root = "\(artifactsDir)"
-        max_bytes = 268435456
-        eviction_policy = "lru"
-
-        [vault]
-        backend = "os-native"
-        namespace = "io.bridgingio"
-
-        [control_plane]
-        enabled = true
-        transport = "platform-ipc"
-        endpoint = "\(socketPath)"
-
-        [model_plane.http]
-        enabled = true
-        host = "127.0.0.1"
-        port = 0
-        allow_non_loopback = false
-
-        [model_plane.http.auth]
-        mode = "none"
-        required_when_non_loopback = true
-
-        [policies.defaults]
-        reuse_policy = "resume_or_create"
-        approval_mode = "on-risk"
-        capture_env_fingerprint = true
-        """
-        try toml.write(toFile: configPath, atomically: true, encoding: .utf8)
+    private func validatedRuntimeRootLocked() throws -> String {
+        guard let runtimeRootPath,
+              !runtimeRootPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw WorkspaceDataSourceError.needsRuntimeRoot
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: runtimeRootPath, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw WorkspaceDataSourceError.runtimeRootUnavailable(runtimeRootPath)
+        }
+        guard FileManager.default.isWritableFile(atPath: runtimeRootPath) else {
+            throw WorkspaceDataSourceError.runtimeRootUnavailable(runtimeRootPath)
+        }
+        return runtimeRootPath
     }
 
     private func resolveCoreExecutablePath() throws -> String {
@@ -184,6 +197,21 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
             return path
         }
         throw WorkspaceDataSourceError.transport("cannot find bridgingio-core executable")
+    }
+
+    private func controlPlaneSocketPathLocked() throws -> String {
+        let ipcDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bridgingio-ipc", isDirectory: true)
+        try FileManager.default.createDirectory(at: ipcDir, withIntermediateDirectories: true)
+        let shortID = String(uiInstanceID.suffix(8))
+        let candidate = ipcDir.appendingPathComponent("cp-\(shortID).sock").path
+        let maxSocketPathBytes = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
+        if candidate.utf8CString.count > maxSocketPathBytes {
+            throw WorkspaceDataSourceError.transport(
+                "control-plane socket path too long: \(candidate)"
+            )
+        }
+        return candidate
     }
 
     private func waitForSocketReady(timeoutSeconds: TimeInterval) -> Bool {
@@ -234,6 +262,126 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
             throw WorkspaceDataSourceError.protocolViolation("unexpected response kind: \(kind)")
         }
         return try decodeBootstrapPayload(unescape(payload))
+    }
+
+    func fetchProfileDraft(coreID: String) throws -> TargetProfileDraft {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureCoreStartedLocked()
+        let response = try sendCommandLocked(
+            command: "get_profile",
+            fields: ["target_id": coreID]
+        )
+        if response["kind"] == "error" {
+            throw WorkspaceDataSourceError.transport(unescape(response["message"] ?? "get_profile failed"))
+        }
+        guard response["kind"] == "profile",
+              let payload = response["payload"] else {
+            throw WorkspaceDataSourceError.protocolViolation("unexpected get_profile response")
+        }
+        guard let data = unescape(payload).data(using: .utf8),
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw WorkspaceDataSourceError.protocolViolation("invalid profile payload")
+        }
+        return try parseDraftFromProfilePayload(root)
+    }
+
+    func upsertProfile(draft: TargetProfileDraft) throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureCoreStartedLocked()
+        var fields: [String: String] = [
+            "target_id": draft.existingCoreID ?? UUID().uuidString.lowercased(),
+            "target_name": draft.name,
+            "target_kind": targetKindLabel(for: draft.kind),
+            "target_alias": draft.aliasForModel,
+            "notes": draft.notes,
+            "credential_ref": draft.credentialReference
+        ]
+        switch draft.kind {
+        case .ssh:
+            fields["ssh_host"] = draft.sshConfig.host
+            fields["ssh_port"] = "\(draft.sshConfig.port)"
+            fields["ssh_username"] = draft.sshConfig.username
+        case .adb:
+            fields["adb_serial"] = draft.adbConfig.serial
+            fields["adb_transport"] = draft.adbConfig.transport
+        case .serial:
+            fields["serial_device"] = draft.serialConfig.devicePath
+            fields["serial_baud"] = "\(draft.serialConfig.baudRate)"
+        case .docker:
+            fields["docker_container"] = draft.dockerConfig.containerName
+            fields["docker_context"] = draft.dockerConfig.context
+        case .httpDebug:
+            fields["custom_description"] = "http_debug:\(draft.httpDebugConfig.baseURL)"
+        case .openGrok:
+            fields["custom_description"] = "opengrok:\(draft.openGrokConfig.endpoint)"
+        }
+        let response = try sendCommandLocked(command: "upsert_profile", fields: fields)
+        return try parseApplyStrategyOrThrow(response: response)
+    }
+
+    func updateModelPlane(host: String, port: Int) throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureCoreStartedLocked()
+        let response = try sendCommandLocked(
+            command: "update_settings",
+            fields: [
+                "model_plane_host": host,
+                "model_plane_port": "\(port)"
+            ]
+        )
+        return try parseApplyStrategyOrThrow(response: response)
+    }
+
+    func updateArtifactCache(_ settings: ArtifactCacheSettings) throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureCoreStartedLocked()
+        let response = try sendCommandLocked(
+            command: "update_settings",
+            fields: [
+                "artifact_cache_backend": settings.backend.rawValue,
+                "artifact_cache_root": settings.rootPath,
+                "artifact_cache_max_bytes": "\(settings.maxCacheMB * 1024 * 1024)",
+                "artifact_cache_eviction_policy": settings.evictionPolicy.rawValue
+            ]
+        )
+        return try parseApplyStrategyOrThrow(response: response)
+    }
+
+    func updateToolOverride(connectorID: String, newPath: String) throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureCoreStartedLocked()
+        let response = try sendCommandLocked(
+            command: "update_settings",
+            fields: [
+                "tool_override_command": connectorID,
+                "tool_override_path": newPath
+            ]
+        )
+        return try parseApplyStrategyOrThrow(response: response)
+    }
+
+    func clearArtifactCache() throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureCoreStartedLocked()
+        let response = try sendCommandLocked(command: "clear_artifact_cache", fields: [:])
+        return try parseApplyStrategyOrThrow(response: response)
+    }
+
+    private func parseApplyStrategyOrThrow(response: [String: String]) throws -> String {
+        let kind = response["kind"] ?? ""
+        if kind == "error" {
+            throw WorkspaceDataSourceError.transport(unescape(response["message"] ?? "unknown error"))
+        }
+        guard kind == "accepted" else {
+            throw WorkspaceDataSourceError.protocolViolation("unexpected response kind: \(kind)")
+        }
+        return unescape(response["apply_strategy"] ?? "live_applied")
     }
 
     private func sendCommandLocked(command: String, fields: [String: String]) throws -> [String: String] {
@@ -419,6 +567,14 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
             )
         }
 
+        let profileRows = root["profiles"] as? [[String: Any]] ?? []
+        var profileByCoreID: [String: [String: Any]] = [:]
+        for row in profileRows {
+            if let id = row["id"] as? String {
+                profileByCoreID[id] = row
+            }
+        }
+
         let targetRows = root["targets"] as? [[String: Any]] ?? []
         let targets: [TargetProfile] = targetRows.map { row in
             let coreID = row["id"] as? String ?? UUID().uuidString
@@ -431,20 +587,33 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
             let capabilities = (row["capability_ids"] as? [String] ?? []).map { capabilityID in
                 CapabilitySummary(id: capabilityID, title: capabilityTitle(for: capabilityID))
             }
+            let profilePayload = profileByCoreID[coreID]
+            let draft = profilePayload.flatMap { try? parseDraftFromProfilePayload($0) }
+            let resolvedName = {
+                guard let draft else { return row["name"] as? String ?? coreID }
+                let trimmed = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? (row["name"] as? String ?? coreID) : draft.name
+            }()
+            let resolvedAlias = {
+                guard let draft else { return coreID }
+                let trimmed = draft.aliasForModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? coreID : draft.aliasForModel
+            }()
             return TargetProfile(
                 id: targetID,
-                name: row["name"] as? String ?? coreID,
-                kind: mapTargetKind(row["kind"] as? String),
-                aliasForModel: coreID,
-                notes: row["notes"] as? String ?? "",
-                credentialReference: "vault://\(coreID)",
-                policyDefaults: .default,
-                sshConfig: .empty,
-                adbConfig: .empty,
-                serialConfig: .empty,
-                dockerConfig: .empty,
-                httpDebugConfig: .empty,
-                openGrokConfig: .empty,
+                coreID: coreID,
+                name: resolvedName,
+                kind: draft?.kind ?? mapTargetKind(row["kind"] as? String),
+                aliasForModel: resolvedAlias,
+                notes: draft?.notes ?? (row["notes"] as? String ?? ""),
+                credentialReference: draft?.credentialReference ?? "vault://\(coreID)",
+                policyDefaults: draft?.policyDefaults ?? .default,
+                sshConfig: draft?.sshConfig ?? .empty,
+                adbConfig: draft?.adbConfig ?? .empty,
+                serialConfig: draft?.serialConfig ?? .empty,
+                dockerConfig: draft?.dockerConfig ?? .empty,
+                httpDebugConfig: draft?.httpDebugConfig ?? .empty,
+                openGrokConfig: draft?.openGrokConfig ?? .empty,
                 connectionState: connectionState,
                 lastActivity: .now,
                 sessionSummary: SessionSummary(
@@ -460,7 +629,7 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
                     )
                 ),
                 capabilities: capabilities,
-                toolDiagnostics: toolDiagnostics
+                toolDiagnostics: draft?.toolDiagnostics ?? toolDiagnostics
             )
         }
 
@@ -523,6 +692,8 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
         }
 
         let cacheSettings = decodeCacheSettings(root["settings"] as? [String: Any])
+        let modelPlane = decodeModelPlaneSettings(root["settings"] as? [String: Any])
+        let runtimeRoot = decodeRuntimeRootDiagnostics(root["runtime_root"] as? [String: Any])
 
         return WorkspaceSnapshot(
             targets: targets,
@@ -530,7 +701,11 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
             artifacts: artifacts,
             approvals: approvals,
             shellChannels: shellChannels,
-            cacheSettings: cacheSettings
+            cacheSettings: cacheSettings,
+            modelPlaneHost: modelPlane.host,
+            modelPlanePort: modelPlane.port,
+            runtimeRootPath: runtimeRoot.path,
+            runtimeRootAccessible: runtimeRoot.accessible
         )
     }
 
@@ -549,6 +724,91 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
             evictionPolicy: eviction,
             usedCacheMB: max(0, Int(usedBytes / 1024 / 1024))
         )
+    }
+
+    private func decodeModelPlaneSettings(_ settings: [String: Any]?) -> (host: String, port: Int) {
+        let modelPlane = settings?["model_plane_http"] as? [String: Any]
+        let host = modelPlane?["host"] as? String ?? "127.0.0.1"
+        let portValue = modelPlane?["port"]
+        if let port = portValue as? Int {
+            return (host, port)
+        }
+        if let port = portValue as? Double {
+            return (host, Int(port))
+        }
+        if let port = portValue as? String, let parsed = Int(port) {
+            return (host, parsed)
+        }
+        return (host, 19718)
+    }
+
+    private func decodeRuntimeRootDiagnostics(_ root: [String: Any]?) -> (path: String?, accessible: Bool) {
+        let path = root?["path"] as? String
+        let accessible = root?["accessible"] as? Bool ?? true
+        return (path, accessible)
+    }
+
+    private func parseDraftFromProfilePayload(_ payload: [String: Any]) throws -> TargetProfileDraft {
+        var draft = TargetProfileDraft()
+        draft.existingCoreID = payload["id"] as? String
+        draft.name = payload["name"] as? String ?? ""
+        draft.aliasForModel = payload["alias"] as? String ?? ""
+        draft.notes = payload["notes"] as? String ?? ""
+        draft.credentialReference = payload["credential_ref"] as? String ?? draft.credentialReference
+        draft.kind = mapTargetKind(payload["kind"] as? String)
+
+        let connection = payload["connection"] as? [String: Any] ?? [:]
+        switch draft.kind {
+        case .ssh:
+            draft.sshConfig.host = connection["host"] as? String ?? ""
+            if let port = connection["port"] as? Int {
+                draft.sshConfig.port = port
+            } else if let port = connection["port"] as? Double {
+                draft.sshConfig.port = Int(port)
+            }
+            draft.sshConfig.username = connection["username"] as? String ?? ""
+        case .adb:
+            draft.adbConfig.serial = connection["serial"] as? String ?? ""
+            draft.adbConfig.transport = connection["transport"] as? String ?? "usb"
+        case .serial:
+            draft.serialConfig.devicePath = connection["device"] as? String ?? draft.serialConfig.devicePath
+            if let baud = connection["baud_rate"] as? Int {
+                draft.serialConfig.baudRate = baud
+            } else if let baud = connection["baud_rate"] as? Double {
+                draft.serialConfig.baudRate = Int(baud)
+            }
+        case .docker:
+            draft.dockerConfig.containerName = connection["container"] as? String ?? ""
+            draft.dockerConfig.context = connection["context"] as? String ?? draft.dockerConfig.context
+        case .httpDebug:
+            let description = connection["description"] as? String ?? ""
+            if let value = description.split(separator: ":", maxSplits: 1).dropFirst().first {
+                draft.httpDebugConfig.baseURL = String(value)
+            }
+        case .openGrok:
+            let description = connection["description"] as? String ?? ""
+            if let value = description.split(separator: ":", maxSplits: 1).dropFirst().first {
+                draft.openGrokConfig.endpoint = String(value)
+            }
+        }
+        return draft
+    }
+
+    private func targetKindLabel(for kind: TargetKind) -> String {
+        switch kind {
+        case .ssh:
+            return "ssh"
+        case .adb:
+            return "adb"
+        case .serial:
+            return "serial"
+        case .docker:
+            return "docker"
+        case .httpDebug:
+            return "http-debug"
+        case .openGrok:
+            return "open-grok"
+        }
     }
 
     private func uuid(forCoreTargetID coreID: String) -> UUID {
@@ -580,6 +840,10 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
             return .serial
         case "docker":
             return .docker
+        case "http-debug", "httpdebug":
+            return .httpDebug
+        case "open-grok", "opengrok":
+            return .openGrok
         default:
             return .ssh
         }
@@ -652,6 +916,8 @@ final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
 }
 
 enum WorkspaceDataSourceError: Error {
+    case needsRuntimeRoot
+    case runtimeRootUnavailable(String)
     case waitingForAttach
     case transport(String)
     case protocolViolation(String)
@@ -664,12 +930,27 @@ struct WorkspaceSnapshot {
     var approvals: [ApprovalRequestItem]
     var shellChannels: [ShellChannel]
     var cacheSettings: ArtifactCacheSettings
+    var modelPlaneHost: String
+    var modelPlanePort: Int
+    var runtimeRootPath: String?
+    var runtimeRootAccessible: Bool
 }
 
 protocol WorkspaceDataSource: AnyObject {
-    func bootstrapSnapshot() throws -> WorkspaceSnapshot
-    func refreshSnapshot() throws -> WorkspaceSnapshot
-    func shutdown()
+    nonisolated func bootstrapSnapshot() throws -> WorkspaceSnapshot
+    nonisolated func refreshSnapshot() throws -> WorkspaceSnapshot
+    nonisolated func shutdown()
+}
+
+protocol ManagedWorkspaceDataSource: WorkspaceDataSource {
+    nonisolated func fetchProfileDraft(coreID: String) throws -> TargetProfileDraft
+    nonisolated func upsertProfile(draft: TargetProfileDraft) throws -> String
+    nonisolated func updateModelPlane(host: String, port: Int) throws -> String
+    nonisolated func updateArtifactCache(_ settings: ArtifactCacheSettings) throws -> String
+    nonisolated func updateToolOverride(connectorID: String, newPath: String) throws -> String
+    nonisolated func clearArtifactCache() throws -> String
+    nonisolated func setRuntimeRoot(path: String)
+    nonisolated func controlledRestart() throws -> WorkspaceSnapshot
 }
 
 final class FixtureWorkspaceDataSource: WorkspaceDataSource {
@@ -707,9 +988,11 @@ final class WorkspaceViewModel: ObservableObject {
     @Published var shellInput: String = ""
     @Published var cacheSettings: ArtifactCacheSettings = .default
     @Published var cacheSettingsNeedRestart: Bool = false
+    @Published var modelPlaneHost: String = "127.0.0.1"
+    @Published var modelPlanePort: Int = 19718
     @Published var targetEditorContext: TargetEditorContext?
     @Published var isShowingSettingsSheet: Bool = false
-    @Published private(set) var coreConnectionState: WorkspaceCoreConnectionState = .starting
+    @Published private(set) var coreConnectionState: WorkspaceCoreConnectionState = .startingCore
 
     @Published private(set) var targets: [TargetProfile]
     @Published private(set) var timeline: [CommandTimelineItem]
@@ -722,6 +1005,7 @@ final class WorkspaceViewModel: ObservableObject {
     private var refreshTimer: Timer?
     private var refreshInFlight = false
     private var appliedCacheBackend: ArtifactCacheBackend
+    private var runtimeRootPath: String?
 
     convenience init() {
         self.init(dataSource: ManagedCoreWorkspaceDataSource())
@@ -739,6 +1023,10 @@ final class WorkspaceViewModel: ObservableObject {
         loadInitialSnapshot()
     }
 
+    private var managedDataSource: (any ManagedWorkspaceDataSource)? {
+        dataSource as? any ManagedWorkspaceDataSource
+    }
+
     deinit {
         refreshTimer?.invalidate()
         dataSource.shutdown()
@@ -746,24 +1034,42 @@ final class WorkspaceViewModel: ObservableObject {
 
     var connectionStatusText: String {
         switch coreConnectionState {
-        case .starting:
+        case .needsRuntimeRoot:
+            return "Select runtime root to start managed core"
+        case .runtimeRootUnavailable:
+            return "Saved runtime root unavailable"
+        case .startingCore:
             return L10n.t("workspace.connection.starting")
-        case .waitingForAttach:
+        case .attachingUI:
             return L10n.t("workspace.connection.waiting")
         case .connected:
             return L10n.t("workspace.connection.connected")
+        case .savingChanges:
+            return "Saving changes..."
+        case .restartRequired:
+            return "Restart required to apply changes"
+        case .restartingCore:
+            return "Restarting managed core..."
+        case .restartFailed(let message):
+            return "Restart failed: \(message)"
         case .attachFailed(let message):
             return L10n.f("workspace.connection.failed_format", message)
         }
     }
 
     private func loadInitialSnapshot() {
-        coreConnectionState = .starting
+        coreConnectionState = .startingCore
         if !(dataSource is ManagedCoreWorkspaceDataSource) {
             do {
                 let snapshot = try dataSource.bootstrapSnapshot()
                 applySnapshot(snapshot)
                 coreConnectionState = .connected
+            } catch WorkspaceDataSourceError.needsRuntimeRoot {
+                coreConnectionState = .needsRuntimeRoot
+            } catch WorkspaceDataSourceError.runtimeRootUnavailable(let path) {
+                coreConnectionState = .runtimeRootUnavailable(path)
+            } catch WorkspaceDataSourceError.waitingForAttach {
+                coreConnectionState = .attachingUI
             } catch {
                 coreConnectionState = .attachFailed(message(for: error))
             }
@@ -779,9 +1085,17 @@ final class WorkspaceViewModel: ObservableObject {
                     self.coreConnectionState = .connected
                     self.startRefreshTimer()
                 }
+            } catch WorkspaceDataSourceError.needsRuntimeRoot {
+                await MainActor.run {
+                    self.coreConnectionState = .needsRuntimeRoot
+                }
+            } catch WorkspaceDataSourceError.runtimeRootUnavailable(let path) {
+                await MainActor.run {
+                    self.coreConnectionState = .runtimeRootUnavailable(path)
+                }
             } catch WorkspaceDataSourceError.waitingForAttach {
                 await MainActor.run {
-                    self.coreConnectionState = .waitingForAttach
+                    self.coreConnectionState = .attachingUI
                     self.startRefreshTimer()
                 }
             } catch {
@@ -819,9 +1133,17 @@ final class WorkspaceViewModel: ObservableObject {
                     self.applySnapshot(snapshot)
                     self.coreConnectionState = .connected
                 }
+            } catch WorkspaceDataSourceError.needsRuntimeRoot {
+                await MainActor.run {
+                    self.coreConnectionState = .needsRuntimeRoot
+                }
+            } catch WorkspaceDataSourceError.runtimeRootUnavailable(let path) {
+                await MainActor.run {
+                    self.coreConnectionState = .runtimeRootUnavailable(path)
+                }
             } catch WorkspaceDataSourceError.waitingForAttach {
                 await MainActor.run {
-                    self.coreConnectionState = .waitingForAttach
+                    self.coreConnectionState = .attachingUI
                 }
             } catch {
                 await MainActor.run {
@@ -838,6 +1160,12 @@ final class WorkspaceViewModel: ObservableObject {
         approvals = snapshot.approvals
         shellChannels = snapshot.shellChannels
         cacheSettings = snapshot.cacheSettings
+        modelPlaneHost = snapshot.modelPlaneHost
+        modelPlanePort = snapshot.modelPlanePort
+        runtimeRootPath = snapshot.runtimeRootPath
+        if !snapshot.runtimeRootAccessible, let path = snapshot.runtimeRootPath {
+            coreConnectionState = .runtimeRootUnavailable(path)
+        }
         appliedCacheBackend = cacheSettings.backend
 
         if let selectedTargetID,
@@ -866,6 +1194,10 @@ final class WorkspaceViewModel: ObservableObject {
 
     private func message(for error: WorkspaceDataSourceError) -> String {
         switch error {
+        case .needsRuntimeRoot:
+            return "runtime root is required"
+        case .runtimeRootUnavailable(let path):
+            return "runtime root unavailable: \(path)"
         case .waitingForAttach:
             return L10n.t("workspace.connection.waiting")
         case .transport(let message):
@@ -958,17 +1290,37 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func openCreateTargetSheet() {
-        guard isFixtureDataSource else { return }
+        guard coreConnectionState == .connected || isFixtureDataSource else { return }
         targetEditorContext = TargetEditorContext(mode: .create, draft: TargetProfileDraft())
     }
 
     func openEditTargetSheet(for target: TargetProfile) {
-        guard isFixtureDataSource else { return }
-        targetEditorContext = TargetEditorContext(mode: .edit, draft: TargetProfileDraft(profile: target))
+        if isFixtureDataSource {
+            targetEditorContext = TargetEditorContext(mode: .edit, draft: TargetProfileDraft(profile: target))
+            return
+        }
+        guard let managed = managedDataSource else { return }
+        do {
+            let draft = try managed.fetchProfileDraft(coreID: target.coreID)
+            targetEditorContext = TargetEditorContext(mode: .edit, draft: draft)
+        } catch {
+            coreConnectionState = .attachFailed(message(for: error))
+        }
     }
 
     func saveTarget(draft: TargetProfileDraft) {
-        guard isFixtureDataSource else { return }
+        if !isFixtureDataSource {
+            guard let managed = managedDataSource else { return }
+            coreConnectionState = .savingChanges
+            do {
+                let strategy = try managed.upsertProfile(draft: draft)
+                targetEditorContext = nil
+                try applyManagedWriteStrategy(strategy, managed: managed)
+            } catch {
+                coreConnectionState = .attachFailed(message(for: error))
+            }
+            return
+        }
         let now = Date()
         if let existingID = draft.existingID,
            let index = targets.firstIndex(where: { $0.id == existingID }) {
@@ -984,7 +1336,17 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func updateToolOverride(connectorID: String, newPath: String) {
-        guard isFixtureDataSource else { return }
+        if !isFixtureDataSource {
+            guard let managed = managedDataSource else { return }
+            coreConnectionState = .savingChanges
+            do {
+                let strategy = try managed.updateToolOverride(connectorID: connectorID, newPath: newPath)
+                try applyManagedWriteStrategy(strategy, managed: managed)
+            } catch {
+                coreConnectionState = .attachFailed(message(for: error))
+            }
+            return
+        }
         guard let selectedTargetID,
               let targetIndex = targets.firstIndex(where: { $0.id == selectedTargetID }),
               let diagIndex = targets[targetIndex].toolDiagnostics.firstIndex(where: { $0.id == connectorID }) else {
@@ -1129,17 +1491,98 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func applyCacheSettings() {
+        if !isFixtureDataSource {
+            guard let managed = managedDataSource else { return }
+            coreConnectionState = .savingChanges
+            do {
+                let strategy = try managed.updateArtifactCache(cacheSettings)
+                try applyManagedWriteStrategy(strategy, managed: managed)
+            } catch {
+                coreConnectionState = .attachFailed(message(for: error))
+            }
+            return
+        }
         appliedCacheBackend = cacheSettings.backend
         cacheSettingsNeedRestart = false
     }
 
     func clearArtifactCache() {
+        if !isFixtureDataSource {
+            guard let managed = managedDataSource else { return }
+            coreConnectionState = .savingChanges
+            do {
+                let strategy = try managed.clearArtifactCache()
+                try applyManagedWriteStrategy(strategy, managed: managed)
+            } catch {
+                coreConnectionState = .attachFailed(message(for: error))
+            }
+            return
+        }
         cacheSettings.usedCacheMB = 0
+    }
+
+    func saveModelPlaneSettings() {
+        guard !isFixtureDataSource else { return }
+        guard let managed = managedDataSource else { return }
+        coreConnectionState = .savingChanges
+        do {
+            let strategy = try managed.updateModelPlane(host: modelPlaneHost, port: modelPlanePort)
+            try applyManagedWriteStrategy(strategy, managed: managed)
+        } catch {
+            coreConnectionState = .attachFailed(message(for: error))
+        }
+    }
+
+    func chooseRuntimeRoot() {
+        guard let managed = managedDataSource else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Select"
+        panel.message = "Choose a runtime root folder for BridgingIO managed core."
+        if panel.runModal() == .OK, let url = panel.url {
+            managed.setRuntimeRoot(path: url.path)
+            coreConnectionState = .startingCore
+            loadInitialSnapshot()
+        }
+    }
+
+    func retryManagedConnection() {
+        guard !isFixtureDataSource else { return }
+        coreConnectionState = .startingCore
+        loadInitialSnapshot()
+    }
+
+    private func applyManagedWriteStrategy(
+        _ strategyRaw: String,
+        managed: any ManagedWorkspaceDataSource
+    ) throws {
+        let strategy = strategyRaw.lowercased()
+        if strategy == "restart_required" {
+            coreConnectionState = .restartRequired
+            coreConnectionState = .restartingCore
+            do {
+                let snapshot = try managed.controlledRestart()
+                applySnapshot(snapshot)
+                coreConnectionState = .connected
+            } catch {
+                coreConnectionState = .restartFailed(message(for: error))
+                return
+            }
+        } else {
+            let snapshot = try managed.refreshSnapshot()
+            applySnapshot(snapshot)
+            coreConnectionState = .connected
+        }
+        cacheSettingsNeedRestart = false
     }
 
     private func buildProfile(from draft: TargetProfileDraft, id: UUID, createdAt: Date) -> TargetProfile {
         TargetProfile(
             id: id,
+            coreID: draft.existingCoreID ?? id.uuidString.lowercased(),
             name: draft.name,
             kind: draft.kind,
             aliasForModel: draft.aliasForModel,
@@ -1187,7 +1630,11 @@ final class WorkspaceViewModel: ObservableObject {
             artifacts: seed.artifacts,
             approvals: seed.approvals,
             shellChannels: seed.shellChannels,
-            cacheSettings: seed.cacheSettings
+            cacheSettings: seed.cacheSettings,
+            modelPlaneHost: "127.0.0.1",
+            modelPlanePort: 19718,
+            runtimeRootPath: "~/Library/Application Support/BridgingIO",
+            runtimeRootAccessible: true
         )
     }
 
@@ -1207,6 +1654,7 @@ final class WorkspaceViewModel: ObservableObject {
         let targets = [
             TargetProfile(
                 id: opsID,
+                coreID: "ops-prod",
                 name: "ops-prod",
                 kind: .ssh,
                 aliasForModel: "prod",
@@ -1260,6 +1708,7 @@ final class WorkspaceViewModel: ObservableObject {
             ),
             TargetProfile(
                 id: pixelID,
+                coreID: "pixel-8",
                 name: "pixel-8",
                 kind: .adb,
                 aliasForModel: "android-main",
@@ -1303,6 +1752,7 @@ final class WorkspaceViewModel: ObservableObject {
             ),
             TargetProfile(
                 id: labID,
+                coreID: "lab-host",
                 name: "lab-host",
                 kind: .ssh,
                 aliasForModel: "lab",
