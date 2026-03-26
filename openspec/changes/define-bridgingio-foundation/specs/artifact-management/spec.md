@@ -14,6 +14,67 @@
 - **当** 调用方基于已有 artifact 发现首次过滤结果过窄，并提交新的过滤条件
 - **那么** 系统必须基于已有 artifact 生成新的派生 artifact，而不是重新连接目标并重跑原始命令
 
+### 需求:Artifact 重分析必须是独立于 Target 类型的一级能力
+系统必须将基于 artifact 的重读取、重过滤和重分析建模为独立于具体 target 类型的一级核心能力。只要某个 target 或 provider 产出了文本 artifact，该能力就必须可用，而不能仅在 SSH、ADB 等终端型 target 下成立。
+
+#### 场景:未来非终端型 Target 复用 Artifact 重分析
+- **当** 一个未来的 target（例如 HTTP 调试、OpenGrok 搜索、Gerrit 变更查询或其他文本型 provider）产出了可缓存的文本 artifact
+- **那么** 系统必须允许调用方像处理终端日志一样，对该 artifact 执行重新读取、重新过滤和重新分析，而不要求该 target 复用 `terminal.exec` 语义
+
+### 需求:Artifact 重分析必须支持显式的数据处理归属
+系统必须允许调用方在 typed tool 的输入参数中显式声明文本处理归属，至少覆盖“源侧过滤 / BridgingIO 代理处理 / 自动选择”三种语义，而不能只依赖提示词暗示模型该使用哪一侧处理数据。
+
+#### 场景:调用方显式要求由 BridgingIO 代理处理文本
+- **当** MCP 客户端希望先保留较完整的原始输出，再由 BridgingIO 对 artifact 做关键字、正则或其他文本过滤
+- **那么** 系统必须允许其通过显式参数声明该偏好，并确保生成的 artifact 元数据能够反映本次处理由 BridgingIO 代理完成
+
+#### 场景:调用方显式要求优先源侧过滤
+- **当** MCP 客户端明确要求优先在源头减少输出，例如日志量极大且更关心带宽或采集成本
+- **那么** 系统必须允许其通过显式参数表达该偏好，并在可行时优先采用源侧过滤策略
+
+### 需求:Artifact cache 必须支持可配置 backend
+系统必须将 artifact cache 建模为可配置存储后端，而不是硬编码为进程内内存。MVP 至少必须支持 `memory` 与 `filesystem` 两种 backend。
+
+#### 场景:操作员选择仅内存缓存
+- **当** 操作员将 artifact cache backend 配置为 `memory`
+- **那么** 系统可以只在进程内保存 artifact，并允许这些 artifact 在 core 重启后消失
+
+#### 场景:操作员选择文件系统持久化
+- **当** 操作员将 artifact cache backend 配置为 `filesystem`
+- **那么** 系统必须把 raw artifact、derived artifact 及其必要元数据持久化到本地存储，而不是仅保存在当前进程内
+
+### 需求:持久化 artifact 必须在 core 重启后可继续读取与重分析
+只要持久化 backend 中的 artifact 尚未被清理，系统就必须允许调用方在 core 重启后继续基于该 artifact 执行读取、续读和派生分析，而不要求重新连接目标并重跑原始命令。
+
+#### 场景:core 重启后重新读取 artifact
+- **当** core 以同一份 artifact 持久化配置重新启动，且某个 artifact 仍保存在持久化 backend 中
+- **那么** 调用方必须能够继续基于该 artifact id 读取其元数据与文本内容
+
+#### 场景:core 重启后继续派生过滤
+- **当** 调用方在 core 重启后基于一个仍存在的原始 artifact 提交新的过滤条件
+- **那么** 系统必须允许其继续生成新的 derived artifact，而不是要求重新执行原始命令
+
+### 需求:Artifact cache 必须支持容量上限与淘汰策略
+对于持久化 artifact cache，系统必须允许操作员配置最大缓存限制与淘汰策略。MVP 至少必须支持按总大小限制缓存，并在超限时执行确定性的自动淘汰，而不是静默无限增长。
+
+#### 场景:持久化缓存达到上限
+- **当** `filesystem` backend 的 artifact cache 已接近或达到配置的最大缓存限制
+- **那么** 系统必须按照配置的淘汰策略回收旧 artifact，或拒绝继续写入并返回明确诊断，而不是无边界地继续占用磁盘
+
+### 需求:Artifact 标识必须是稳定 hash-like object id
+系统不得继续使用仅在当前进程生命周期内有效的自增序号作为 artifact 对外标识。每个 artifact 必须拥有稳定的 hash-like object id，并且该标识必须可跨 core 重启继续用于查询与引用。
+
+#### 场景:调用方持有一次旧会话中的 artifact 标识
+- **当** 用户或 MCP 客户端保存了某个 artifact 的 hash-like id，并在稍后再次访问系统
+- **那么** 只要该 artifact 仍存在于 cache 中，系统就必须允许调用方继续使用该标识访问它
+
+### 需求:Artifact 元数据必须保留内容摘要与来源追溯信息
+除了稳定 artifact id，系统还必须保存独立的内容摘要指纹以及足够的 provenance 元数据，至少覆盖来源命令或来源描述、所属逻辑会话、所属通道、父子派生关系和创建时间。这样 UI 与 MCP 才能基于 artifact hash 反查当时的执行上下文。
+
+#### 场景:用户基于 artifact hash 反查执行情况
+- **当** 用户在 UI 或其他控制面中输入一个 artifact hash
+- **那么** 系统必须能够返回该 artifact 的来源命令、所属会话/通道、父子关系与摘要信息，而不是只返回一段脱离上下文的文本内容
+
 ### 需求:流式输出必须支持分块续读
 对于持续增长或超长的输出流，系统必须以分块方式保存内容，并且必须允许调用方按偏移、批次或续读标记获取后续内容。系统不得要求调用方重复读取已经消费过的块。
 

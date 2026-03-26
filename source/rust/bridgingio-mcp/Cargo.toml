@@ -5,7 +5,12 @@ version = "0.1.0"
 license = "MIT"
 
 [dependencies]
+bridgingio-app-api = { path = "../bridgingio-app-api" }
+bridgingio-artifacts = { path = "../bridgingio-artifacts" }
+bridgingio-connectors = { path = "../bridgingio-connectors" }
 bridgingio-domain = { path = "../bridgingio-domain" }
 bridgingio-engine = { path = "../bridgingio-engine" }
 bridgingio-policy = { path = "../bridgingio-policy" }
 bridgingio-providers = { path = "../bridgingio-providers" }
+bridgingio-secrets = { path = "../bridgingio-secrets" }
+serde_json = "1.0"

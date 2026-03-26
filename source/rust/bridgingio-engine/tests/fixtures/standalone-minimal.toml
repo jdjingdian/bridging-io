@@ -1,0 +1,57 @@
+schema_version = 1
+
+[core]
+instance_name = "bridgingio-local"
+data_dir = "~/.bridgingio"
+log_level = "info"
+
+[storage]
+metadata_backend = "sqlite"
+metadata_path = "~/.bridgingio/state/metadata.sqlite3"
+
+[storage.artifacts]
+backend = "memory"
+root = "~/.bridgingio/artifacts"
+max_bytes = 268435456
+eviction_policy = "lru"
+
+[vault]
+backend = "os-native"
+namespace = "io.bridgingio"
+
+[control_plane]
+enabled = true
+transport = "platform-ipc"
+endpoint = "auto"
+
+[model_plane.http]
+enabled = true
+host = "127.0.0.1"
+port = 19718
+allow_non_loopback = false
+
+[model_plane.http.auth]
+mode = "none"
+required_when_non_loopback = true
+
+[policies.defaults]
+reuse_policy = "resume_or_create"
+approval_mode = "on-risk"
+capture_env_fingerprint = true
+
+[[targets]]
+id = "local-ssh"
+display_name = "Local SSH"
+kind = "ssh"
+enabled = true
+aliases = ["local"]
+credential_ref = "vault://bridgingio/ssh/local"
+
+[targets.connection]
+host = "127.0.0.1"
+port = 22
+username = "dev"
+
+[targets.providers.terminal]
+enabled = true
+shell = "/bin/sh"

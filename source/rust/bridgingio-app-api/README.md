@@ -17,10 +17,16 @@ the Rust core engine.
 Commands currently cover:
 
 - target listing
+- profile upsert/list
+- settings snapshot
+- sessions/approvals/diagnostics listing
 - session opening
 - command execution
 - artifact reading
 - approval request dispatch
+
+The request/response layer now includes settings/profile and diagnostics access
+needed by trusted control-plane clients.
 
 ## Response Model
 
@@ -36,9 +42,13 @@ Commands currently cover:
 These events are intended for UI timeline rendering and sensitive operation
 feedback.
 
+## IPC Line Codec
+
+`AppApiLineCodec` provides a transport-ready line protocol that can encode and
+decode typed `ApiRequest`/`ApiResponse` payloads for local IPC adapters.
+
 ## Error Model
 
 - `ApiErrorCode` captures high-level classes (not found, permission denied,
   validation failed, dependency unavailable, internal).
 - `ApiError` includes retriable hint for user-facing recovery behavior.
-

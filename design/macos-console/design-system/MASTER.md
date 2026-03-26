@@ -186,3 +186,21 @@ Type-specific module examples:
 
 - `pages/workspace-console.md`
 - `pages/target-profile-sheet.md`
+
+## Pixso Capture Baseline
+
+To reduce design drift during implementation, canonical Pixso exports should be
+stored under `design/macos-console/design-system/assets/`.
+
+Capture status:
+
+- 2026-03-26 (attempt 1): Pixso MCP fetch returned `Nothing is selected`.
+- 2026-03-26 (attempt 2): selected frame `dev` fetch succeeded via Pixso MCP.
+  - frame id: `3:1`
+  - frame size: `2387 x 2858`
+  - preview retrieval: success (`get_image`)
+  - export retrieval: success (`get_export_image`)
+- 2026-03-26 (attempt 3): final baseline artifact saved as PNG.
+  - file: `design/macos-console/design-system/assets/macos-console-dev-frame.png`
+  - image size: `4774 x 5716`
+  - source: manually exported from Pixso after validation

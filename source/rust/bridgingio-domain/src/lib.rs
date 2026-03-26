@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
+
 pub type MetadataMap = BTreeMap<String, String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,13 +253,13 @@ impl SessionRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactKind {
     RawCommandOutput,
     DerivedView,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactFilter {
     pub keyword: Option<String>,
     pub regex: Option<String>,
@@ -265,9 +267,10 @@ pub struct ArtifactFilter {
     pub line_end: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRecord {
     pub id: String,
+    pub content_digest: String,
     pub logical_session_id: String,
     pub transport_session_id: Option<String>,
     pub channel_id: Option<String>,
@@ -277,6 +280,9 @@ pub struct ArtifactRecord {
     pub source_command: Option<String>,
     pub filter: Option<ArtifactFilter>,
     pub created_at: SystemTime,
+    pub last_accessed_at: SystemTime,
+    pub byte_count: u64,
+    pub line_count: usize,
     pub summary: String,
 }
 

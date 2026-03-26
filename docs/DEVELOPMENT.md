@@ -34,6 +34,15 @@ Current MVP scope:
   policy check
 - macOS UI: currently design-first, implementation after design confirmation
 
+Terminal provider runtime notes:
+
+- `one-shot exec` keeps command-level isolation.
+- `interactive shell` is channel-scoped and stateful (`cwd`, env, transcript,
+  interrupt, close).
+- Interactive shell prefers a PTY backend for TTY-dependent commands (`top`,
+  `stty`); if PTY allocation fails it falls back to pipe backend and emits a
+  transcript-level runtime hint.
+
 Out of current MVP:
 
 - serial, docker, HTTP/Postman-style debug, OpenGrok, Gerrit
@@ -63,6 +72,94 @@ Default test command:
 ```bash
 cd source/rust
 cargo test
+```
+
+## Standalone Core Quick Start
+
+1. Prepare a standalone config (TOML). You can start from:
+
+- `source/rust/bridgingio-engine/tests/fixtures/standalone-minimal.toml`
+- `source/rust/bridgingio-engine/tests/fixtures/standalone-complete.toml`
+
+2. Start core:
+
+```bash
+cd source/rust
+cargo run -p bridgingio-mcp --bin bridgingio-core -- --config /absolute/path/to/standalone.toml
+```
+
+3. Validate model-plane HTTP:
+
+```bash
+curl http://127.0.0.1:19718/health
+```
+
+For local verification, model-plane endpoints currently include:
+
+- `GET /health`
+- `GET /state/sessions`
+- `GET /state/logical-sessions`
+- `POST /mcp` (JSON-RPC MCP entrypoint, for AI model clients)
+- `POST /tool/terminal.exec` (key-value body, debug/internal compatibility)
+
+MCP client config example:
+
+```json
+{
+  "type": "http",
+  "url": "http://127.0.0.1:19718/mcp"
+}
+```
+
+Minimal JSON-RPC verification:
+
+```bash
+curl -s http://127.0.0.1:19718/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+Artifact refine quick example (regex-like post filter without inline `grep`):
+
+```bash
+curl -s http://127.0.0.1:19718/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":3,
+    "method":"tools/call",
+    "params":{
+      "name":"bridgingio.artifacts.refine",
+      "arguments":{
+        "source_artifact_id":"mcp-artifact-000001",
+        "pattern":"system_server|netd",
+        "mode":"auto",
+        "grep_flags":"Ei"
+      }
+    }
+  }'
+```
+
+Alias-based tool call example (`target = "local"` is alias from config, not raw `adb -s ...`):
+
+```bash
+curl -s http://127.0.0.1:19718/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":2,
+    "method":"tools/call",
+    "params":{
+      "name":"bridgingio.target.inspect_basic",
+      "arguments":{
+        "target":"local",
+        "agent_id":"agent-local",
+        "run_id":"run-1",
+        "client_session_id":"client-1",
+        "reuse_policy":"reuse_if_alive"
+      }
+    }
+  }'
 ```
 
 ## Archive Handoff Requirements

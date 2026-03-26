@@ -1,0 +1,94 @@
+schema_version = 1
+
+[core]
+instance_name = "bridgingio-local"
+data_dir = "~/.bridgingio"
+log_level = "info"
+
+[storage]
+metadata_backend = "sqlite"
+metadata_path = "~/.bridgingio/state/metadata.sqlite3"
+
+[storage.artifacts]
+backend = "filesystem"
+root = "~/.bridgingio/artifacts"
+max_bytes = 1073741824
+eviction_policy = "lru"
+
+[vault]
+backend = "os-native"
+namespace = "io.bridgingio"
+
+[control_plane]
+enabled = true
+transport = "platform-ipc"
+endpoint = "auto"
+
+[model_plane.http]
+enabled = true
+host = "127.0.0.1"
+port = 19718
+allow_non_loopback = false
+
+[model_plane.http.auth]
+mode = "none"
+required_when_non_loopback = true
+
+[toolchains.ssh]
+path_override = ""
+prefer_builtin_fallback = false
+
+[toolchains.adb]
+path_override = "/opt/homebrew/bin/adb"
+prefer_builtin_fallback = true
+
+[policies.defaults]
+reuse_policy = "resume_or_create"
+approval_mode = "on-risk"
+capture_env_fingerprint = true
+
+[[targets]]
+id = "lab-ssh-01"
+display_name = "Lab Ubuntu"
+kind = "ssh"
+enabled = true
+aliases = ["lab", "ubuntu-main"]
+credential_ref = "vault://bridgingio/ssh/lab"
+notes = "Primary lab server"
+
+[targets.connection]
+host = "10.0.0.18"
+port = 22
+username = "debug"
+known_hosts_policy = "system-default"
+
+[targets.providers.terminal]
+enabled = true
+shell = "/bin/bash"
+
+[[targets.providers.git.repositories]]
+id = "bridgingio"
+path = "/srv/repos/bridgingio"
+remote_name = "origin"
+web_url = "https://gerrit.example.com/plugins/gitiles/bridgingio"
+
+[targets.providers.git.repositories.review]
+kind = "gerrit"
+base_url = "https://gerrit.example.com"
+project = "bridgingio"
+
+[[targets]]
+id = "android-emulator"
+display_name = "Android Emulator"
+kind = "adb"
+enabled = true
+aliases = ["emu", "pixel-test"]
+credential_ref = "vault://bridgingio/adb/default"
+
+[targets.connection]
+selector_kind = "serial"
+selector_value = "emulator-5554"
+
+[targets.providers.terminal]
+enabled = true
+shell = "/system/bin/sh"

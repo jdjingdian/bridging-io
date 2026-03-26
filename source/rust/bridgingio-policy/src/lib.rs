@@ -18,9 +18,15 @@ pub enum PolicyDecision {
 pub fn evaluate(policy: &PolicyProfile, operation: OperationKind) -> PolicyDecision {
     match operation {
         OperationKind::Read => PolicyDecision::Allow,
-        OperationKind::Write if policy.require_approval_for_write => PolicyDecision::RequireApproval,
-        OperationKind::Delete if policy.require_approval_for_delete => PolicyDecision::RequireApproval,
-        OperationKind::Privileged if policy.require_approval_for_privileged => PolicyDecision::RequireApproval,
+        OperationKind::Write if policy.require_approval_for_write => {
+            PolicyDecision::RequireApproval
+        }
+        OperationKind::Delete if policy.require_approval_for_delete => {
+            PolicyDecision::RequireApproval
+        }
+        OperationKind::Privileged if policy.require_approval_for_privileged => {
+            PolicyDecision::RequireApproval
+        }
         OperationKind::SensitiveRead if policy.require_approval_for_sensitive_read => {
             PolicyDecision::RequireApproval
         }
@@ -46,4 +52,3 @@ mod tests {
         assert_eq!(decision, PolicyDecision::Allow);
     }
 }
-

@@ -85,6 +85,120 @@ impl ExecutableResolver {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuiltInDistributionKind {
+    AppBundleResource,
+    StandalonePackage,
+    PlatformAsset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltInBinarySpec {
+    pub command: String,
+    pub relative_path: PathBuf,
+    pub distribution: BuiltInDistributionKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolchainResolutionDiagnostics {
+    pub command: String,
+    pub selected_source: Option<String>,
+    pub selected_path: Option<PathBuf>,
+    pub user_override: Option<PathBuf>,
+    pub searched_system_paths: Vec<PathBuf>,
+    pub builtin_candidates: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
+impl ToolchainResolutionDiagnostics {
+    pub fn selected_label(&self) -> Option<&str> {
+        self.selected_source.as_deref()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolchainResolver {
+    executable: ExecutableResolver,
+    builtin_root: PathBuf,
+    builtin_specs: HashMap<String, BuiltInBinarySpec>,
+}
+
+impl ToolchainResolver {
+    pub fn new(
+        executable: ExecutableResolver,
+        builtin_root: impl Into<PathBuf>,
+        builtin_specs: Vec<BuiltInBinarySpec>,
+    ) -> Self {
+        let mut specs = HashMap::new();
+        for spec in builtin_specs {
+            specs.insert(spec.command.clone(), spec);
+        }
+        Self {
+            executable,
+            builtin_root: builtin_root.into(),
+            builtin_specs: specs,
+        }
+    }
+
+    pub fn resolve_with_diagnostics(
+        &self,
+        command: &str,
+        user_override: Option<&Path>,
+    ) -> (
+        Result<ExecutableSelection, ResolveError>,
+        ToolchainResolutionDiagnostics,
+    ) {
+        let builtin_candidates = self
+            .builtin_specs
+            .get(command)
+            .map(|spec| vec![self.builtin_root.join(&spec.relative_path)])
+            .unwrap_or_default();
+
+        let builtin_path = builtin_candidates.first().map(PathBuf::as_path);
+        let result = self
+            .executable
+            .resolve(command, user_override, builtin_path);
+        let searched_system_paths = self
+            .executable
+            .search_paths
+            .iter()
+            .map(|path| path.join(command))
+            .collect::<Vec<_>>();
+
+        let mut diagnostics = ToolchainResolutionDiagnostics {
+            command: command.to_string(),
+            selected_source: None,
+            selected_path: None,
+            user_override: user_override.map(Path::to_path_buf),
+            searched_system_paths,
+            builtin_candidates,
+            warnings: Vec::new(),
+        };
+
+        match &result {
+            Ok(selected) => {
+                diagnostics.selected_source = Some(
+                    match selected.source {
+                        ExecutableSource::UserOverride => "user_override",
+                        ExecutableSource::SystemPath => "system_path",
+                        ExecutableSource::BuiltInFallback => "builtin_fallback",
+                    }
+                    .to_string(),
+                );
+                diagnostics.selected_path = Some(selected.path.clone());
+            }
+            Err(ResolveError::NotFound { .. }) => {
+                diagnostics.warnings.push(
+                    "no executable found in override, system path, or built-in fallback".into(),
+                );
+            }
+            Err(_) => {}
+        }
+
+        (result, diagnostics)
+    }
+}
+
 fn command_variants(command: &str) -> Vec<String> {
     if cfg!(windows) {
         vec![
@@ -184,7 +298,11 @@ impl SshConnector {
         }
     }
 
-    pub fn connect(&self, target: &TargetProfile, now: SystemTime) -> Result<SessionRecord, ResolveError> {
+    pub fn connect(
+        &self,
+        target: &TargetProfile,
+        now: SystemTime,
+    ) -> Result<SessionRecord, ResolveError> {
         if !matches!(target.kind, TargetKind::Ssh) {
             return Err(ResolveError::InvalidTargetKind {
                 expected: "ssh".into(),
@@ -229,6 +347,36 @@ impl SshConnector {
                 format!("{username}@{host}"),
                 command.to_string(),
             ],
+        })
+    }
+
+    pub fn build_interactive_invocation(
+        &self,
+        target: &TargetProfile,
+    ) -> Result<CommandInvocation, ResolveError> {
+        if !matches!(target.kind, TargetKind::Ssh) {
+            return Err(ResolveError::InvalidTargetKind {
+                expected: "ssh".into(),
+                actual: format!("{:?}", target.kind),
+            });
+        }
+        let (host, port, username) = match &target.connection {
+            ConnectionConfig::Ssh {
+                host,
+                port,
+                username,
+            } => (host.clone(), *port, username.clone()),
+            _ => {
+                return Err(ResolveError::InvalidTargetKind {
+                    expected: "ConnectionConfig::Ssh".into(),
+                    actual: "other config".into(),
+                })
+            }
+        };
+
+        Ok(CommandInvocation {
+            program: self.executable.clone(),
+            args: vec!["-p".into(), port.to_string(), format!("{username}@{host}")],
         })
     }
 
@@ -293,7 +441,11 @@ impl AdbConnector {
         }
     }
 
-    pub fn connect(&self, target: &TargetProfile, now: SystemTime) -> Result<SessionRecord, ResolveError> {
+    pub fn connect(
+        &self,
+        target: &TargetProfile,
+        now: SystemTime,
+    ) -> Result<SessionRecord, ResolveError> {
         if !matches!(target.kind, TargetKind::Adb) {
             return Err(ResolveError::InvalidTargetKind {
                 expected: "adb".into(),
@@ -326,6 +478,32 @@ impl AdbConnector {
         }
         args.push("shell".into());
         args.push(command.to_string());
+
+        Ok(CommandInvocation {
+            program: self.executable.clone(),
+            args,
+        })
+    }
+
+    pub fn build_interactive_invocation(
+        &self,
+        target: &TargetProfile,
+    ) -> Result<CommandInvocation, ResolveError> {
+        if !matches!(target.kind, TargetKind::Adb) {
+            return Err(ResolveError::InvalidTargetKind {
+                expected: "adb".into(),
+                actual: format!("{:?}", target.kind),
+            });
+        }
+
+        let mut args = Vec::<String>::new();
+        if let ConnectionConfig::Adb { serial, .. } = &target.connection {
+            if let Some(s) = serial {
+                args.push("-s".into());
+                args.push(s.clone());
+            }
+        }
+        args.push("shell".into());
 
         Ok(CommandInvocation {
             program: self.executable.clone(),
@@ -387,9 +565,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use bridgingio_domain::{ChannelKind, ChannelStatus, ConnectionConfig, PolicyProfile, TargetKind, TargetProfile};
+    use bridgingio_domain::{
+        ChannelKind, ChannelStatus, ConnectionConfig, PolicyProfile, TargetKind, TargetProfile,
+    };
 
-    use super::{AdbConnector, ExecutableResolver, ExecutableSource, SshConnector};
+    use super::{
+        AdbConnector, BuiltInBinarySpec, BuiltInDistributionKind, ExecutableResolver,
+        ExecutableSource, SshConnector, ToolchainResolver,
+    };
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -434,6 +617,30 @@ mod tests {
     }
 
     #[test]
+    fn resolver_reports_builtin_distribution_diagnostics() {
+        let root = temp_dir("toolchain-diag");
+        let bundled = root.join("bin").join("adb");
+        fs::create_dir_all(bundled.parent().expect("parent")).expect("create dir");
+        fs::write(&bundled, "binary").expect("write bundled");
+
+        let toolchain = ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(vec![root.join("not-found")]),
+            &root,
+            vec![BuiltInBinarySpec {
+                command: "adb".into(),
+                relative_path: PathBuf::from("bin/adb"),
+                distribution: BuiltInDistributionKind::StandalonePackage,
+            }],
+        );
+
+        let (selected, diagnostics) = toolchain.resolve_with_diagnostics("adb", None);
+        let selected = selected.expect("must resolve");
+        assert_eq!(selected.source, ExecutableSource::BuiltInFallback);
+        assert_eq!(diagnostics.selected_label(), Some("builtin_fallback"));
+        assert_eq!(diagnostics.builtin_candidates.len(), 1);
+    }
+
+    #[test]
     fn builds_ssh_invocation_with_user_host_and_port() {
         let connector = SshConnector::new(PathBuf::from("/usr/bin/ssh"));
         let target = TargetProfile {
@@ -460,6 +667,32 @@ mod tests {
     }
 
     #[test]
+    fn builds_ssh_interactive_invocation() {
+        let connector = SshConnector::new(PathBuf::from("/usr/bin/ssh"));
+        let target = TargetProfile {
+            id: "t-ssh".into(),
+            name: "ssh-host".into(),
+            kind: TargetKind::Ssh,
+            connection: ConnectionConfig::Ssh {
+                host: "10.1.1.8".into(),
+                port: 22,
+                username: "root".into(),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: Default::default(),
+        };
+
+        let invocation = connector
+            .build_interactive_invocation(&target)
+            .expect("ssh interactive invocation");
+        assert_eq!(invocation.args[0], "-p");
+        assert_eq!(invocation.args[1], "22");
+        assert_eq!(invocation.args[2], "root@10.1.1.8");
+    }
+
+    #[test]
     fn builds_adb_shell_invocation_with_serial() {
         let connector = AdbConnector::new(PathBuf::from("/usr/bin/adb"));
         let target = TargetProfile {
@@ -479,6 +712,31 @@ mod tests {
         let invocation = connector
             .build_exec_invocation(&target, "getprop ro.build.version.release")
             .expect("adb invocation");
+        assert_eq!(invocation.args[0], "-s");
+        assert_eq!(invocation.args[1], "device-01");
+        assert_eq!(invocation.args[2], "shell");
+    }
+
+    #[test]
+    fn builds_adb_interactive_invocation_with_serial() {
+        let connector = AdbConnector::new(PathBuf::from("/usr/bin/adb"));
+        let target = TargetProfile {
+            id: "t-adb".into(),
+            name: "pixel".into(),
+            kind: TargetKind::Adb,
+            connection: ConnectionConfig::Adb {
+                serial: Some("device-01".into()),
+                transport: None,
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: Default::default(),
+        };
+
+        let invocation = connector
+            .build_interactive_invocation(&target)
+            .expect("adb interactive invocation");
         assert_eq!(invocation.args[0], "-s");
         assert_eq!(invocation.args[1], "device-01");
         assert_eq!(invocation.args[2], "shell");

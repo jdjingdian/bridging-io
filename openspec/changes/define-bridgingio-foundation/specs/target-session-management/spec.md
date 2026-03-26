@@ -18,8 +18,8 @@ BridgingIO 必须允许用户使用统一的数据模型保存目标 profile，�
 - **当** 用户系统未安装所需的 ADB 或 SSH 工具，但产品分发包中存在可用的内置后备二进制
 - **那么** 系统必须使用该内置后备建立相关能力，并且在目标或诊断信息中显示当前来源为内置后备
 
-### 需求:standalone core 必须统一管理配置装载与设置入口
-系统必须允许 Rust core 以前台进程或 daemon 形式独立运行，并且在启动时读取操作员提供的配置文件。该配置文件与 UI、CLI、后续其他前端看到的目标/profile 设置，必须映射到同一套 core-owned 数据模型与校验语义，而不是由 UI 自行维护一份独立 schema。
+### 需求:standalone core 必须统一管理配置装载、设置入口与控制平面
+系统必须允许 Rust core 以前台进程或 daemon 形式独立运行，并且在启动时读取操作员提供的配置文件。该配置文件与 UI、CLI、后续其他前端看到的目标/profile 设置，必须映射到同一套 core-owned 数据模型与校验语义，而不是由 UI 自行维护一份独立 schema。受信任的本地 UI/control plane 默认必须通过本地 app API IPC 接入 core，而不是复用面向 AI 的 MCP HTTP 能力面。
 
 #### 场景:standalone core 启动并装载目标配置
 - **当** 用户以 standalone 模式启动 core，并提供包含 SSH/ADB 目标、默认策略或工具偏好的配置文件
@@ -28,6 +28,41 @@ BridgingIO 必须允许用户使用统一的数据模型保存目标 profile，�
 #### 场景:UI 修改目标设置
 - **当** 用户在 UI 中修改某个 SSH 目标的主机地址、用户名、调用别名或凭据引用
 - **那么** 该修改必须通过 core 的设置接口完成校验和持久化，而不是只停留在 UI 的本地状态中
+
+#### 场景:UI 通过本地控制平面访问 core
+- **当** 平台 UI 作为完整发行物的一部分启动并连接本地 core
+- **那么** UI 必须通过受信任的本地 control-plane app API 访问 session、settings、approval 和诊断能力，而不是依赖面向 AI 的 MCP HTTP 入口
+
+### 需求:core 设置必须包含模型平面监听配置
+系统必须将模型平面的 MCP HTTP 监听配置纳入 core-owned settings/config 边界。该配置至少必须覆盖监听 host、监听 port、是否允许非 loopback 暴露，以及与之配套的认证或安全约束开关。
+
+#### 场景:操作员修改 MCP HTTP 监听配置
+- **当** 操作员在配置文件或 UI 中修改 MCP HTTP 的监听地址或端口
+- **那么** core 必须对该配置执行标准化和校验，并将结果持久化到统一的 settings/config 模型中
+
+### 需求:core 设置必须包含 artifact cache 配置
+系统必须将 artifact cache backend 与容量治理配置纳入 core-owned settings/config 边界。该配置在 MVP 中至少必须覆盖 backend 类型、持久化根目录、最大缓存限制与淘汰策略。
+
+#### 场景:操作员在配置文件中切换 artifact cache backend
+- **当** 操作员在 standalone 配置中把 artifact cache 从 `memory` 切换到 `filesystem`
+- **那么** core 必须校验并装载该配置，使后续 artifact 采集与读取遵循新的 backend 语义
+
+#### 场景:操作员在 UI 中修改持久化缓存限制
+- **当** 操作员在 UI 或本地 control plane 中修改 artifact cache 的最大缓存限制或淘汰策略
+- **那么** core 必须通过统一 settings/config 模型完成校验、持久化与诊断回显，而不是由 UI 私自保存一份本地偏好
+
+### 需求:standalone 配置文件必须具备版本化结构与参考样例
+MVP 必须为 standalone core 定义一个规范化、可版本迁移的人类可编辑配置结构，并提供至少一份可直接用于启动验证的参考样例。该配置在 MVP 中必须以 TOML 作为规范格式，并且至少覆盖 `schema_version`、`core`、`storage`、`storage.artifacts`、`vault`、`control_plane`、`model_plane.http`、`toolchains`、`policies.defaults` 和 `targets` 等顶层语义。
+
+配置文件只允许承载操作员声明式配置和 `CredentialRef` 一类的非敏感引用；session、artifact、approval、environment fingerprint cache 等运行时状态必须进入 core 的运行期存储，而不是写入该配置文件。
+
+#### 场景:操作员在 UI 之前使用样例配置启动 standalone core
+- **当** 操作员在尚未完成平台 UI 的阶段，使用项目提供的 standalone TOML 样例文件启动 core
+- **那么** core 必须能够完成配置装载、target 标准化、模型平面监听参数初始化以及本地控制平面初始化，从而让团队先验证 core 的基本能力
+
+#### 场景:配置文件 schema 版本不受支持
+- **当** core 读取到一个 `schema_version` 不受当前版本支持的 standalone 配置文件
+- **那么** 系统必须返回明确的版本不兼容或迁移提示，而不是静默忽略未知结构继续运行
 
 ### 需求:会话生命周期管理
 系统必须为每次连接创建稳定的 session 标识，并且必须记录其状态、开始时间、最后活动时间和关闭原因。会话状态至少必须覆盖“连接中、已连接、降级、失败、已关闭”。
@@ -56,6 +91,27 @@ BridgingIO 必须允许用户使用统一的数据模型保存目标 profile，�
 #### 场景:一个通道执行命令，另一个通道采集日志
 - **当** 用户或 AI 在同一个逻辑会话内同时打开两个针对同一服务器的 SSH 通道，其中一个用于执行命令，另一个用于持续获取日志
 - **那么** 系统必须保留它们属于同一个逻辑会话的关联关系，同时区分两个通道各自的命令事件、输出和状态
+
+### 需求:终端型 Target 必须同时支持单次执行与交互式通道
+对于 SSH、ADB 等终端型 target，系统必须同时支持 `one-shot exec` 与 `interactive shell` 两种操作方式。两种方式必须共享同一套逻辑会话与审计体系，但必须保持不同的状态语义。
+
+`one-shot exec` 用于单次命令访问，默认不保留 shell 上下文；`interactive shell` 用于在同一个 shell 进程中连续执行多步任务，并保留工作目录、环境变量、prompt 与进程状态直到 channel 关闭。
+
+#### 场景:单次命令访问 ADB 或 SSH 目标
+- **当** 用户或 AI 只需要执行一次类似 `whoami`、`uname -r` 的短命令
+- **那么** 系统必须允许通过单次执行模式完成调用，而不要求先创建持久 shell 句柄
+
+#### 场景:在同一交互式 shell 中连续执行依赖上下文的命令
+- **当** 用户或 AI 在一个终端型 target 上先执行 `export BUILD_MODE=debug`，随后继续执行依赖该环境变量的命令
+- **那么** 系统必须允许这些命令在同一个交互式 channel 中执行，并保留该 shell 的上下文状态
+
+#### 场景:同一逻辑会话内两个交互式 shell 默认彼此隔离
+- **当** 用户或 AI 在同一个逻辑会话内同时打开两个 SSH 或 ADB 交互式 shell，其中一个 channel 执行了 `cd /tmp` 或 `export X=1`
+- **那么** 这些 shell 级状态必须只影响当前 channel，而不能自动泄漏到另一个 channel
+
+#### 场景:交互式命令依赖 TTY 能力
+- **当** 用户或 AI 在交互式 shell channel 中执行 `top`、`stty -a` 等依赖 TTY 的命令
+- **那么** 系统必须优先以 PTY 后端承载该 channel；若当前平台无法分配 PTY，系统必须回退到 pipe 并在 transcript 中写入可观测的降级提示
 
 ### 需求:环境指纹与能力发现
 系统必须在会话建立后探测并缓存标准化的环境指纹与能力摘要。该摘要必须至少包含操作系统类型、架构、内核版本或设备版本、默认 shell、检测到的关键工具和支持的结构化能力。
