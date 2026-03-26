@@ -3,7 +3,7 @@
 BridgingIO 当前还是一个空白项目，但产品方向已经比较清晰：它不是单纯把若干命令行工具塞进 MCP，而是要为 AI 模型提供一层统一、安全、低 token 成本的开发环境桥接层。这个桥接层需要同时服务两类入口：
 
 - MCP 客户端，用于结构化调用连接、执行、查询与缓存能力
-- 本地桌面 UI，用于展示目标、会话、命令事件、日志、审批与凭据状态
+- 本地桌面 UI，用于展示和配置目标、会话、命令事件、日志、审批与凭据状态
 
 该项目有几个天然约束：
 
@@ -17,7 +17,8 @@ BridgingIO 当前还是一个空白项目，但产品方向已经比较清晰：
 ```text
 ┌──────────────────────────────────────────────────────┐
 │                  SwiftUI macOS App                  │
-│  Targets / Sessions / Timeline / Approvals / Vault  │
+│ Targets / Sessions / Timeline / Approvals / Vault / │
+│                    Settings                          │
 └──────────────────────────────┬───────────────────────┘
                                │ local app API
 ┌──────────────────────────────▼───────────────────────┐
@@ -46,7 +47,7 @@ BridgingIO 当前还是一个空白项目，但产品方向已经比较清晰：
 - 用内容寻址的 Artifact 机制处理长输出、流式日志和二次过滤
 - 用结构化的 MCP tools/resources 暴露能力，优先 typed tools，保留受控兜底
 - 用凭据句柄和审批流隔离敏感信息与高风险操作
-- 在 macOS SwiftUI 中提供可观察、可审计、可审批的操作台体验
+- 在 macOS SwiftUI 中提供可观察、可审计、可审批、可配置的操作台体验
 
 **非目标：**
 
@@ -95,7 +96,7 @@ BridgingIO 将以 Rust 作为核心实现语言，承载 domain、session manage
 - `Target`：可访问目标及其 profile
 - `Session`：一次活跃连接及其生命周期状态
 - `Capability`：当前目标/会话可提供的结构化能力
-- `Profile`：连接、仓库、默认策略、模板等配置
+- `Profile`：连接、凭据引用、别名/备注、工具覆盖、默认策略、模板等配置
 - `CredentialRef`：指向保险库的凭据引用
 - `Artifact`：命令输出、日志流、diff、搜索结果及其派生视图
 - `ApprovalRequest`：需要人工确认的高风险操作
@@ -159,6 +160,50 @@ Artifact 存储分为两部分：
 - 仅按 target 复用会话：会导致不同 agent、不同运行之间的数据污染
 - 把每个终端都建模成完全独立的会话：隔离过强，不利于在一次工作会话内统一管理 artifacts 和 approvals
 
+### 决策 4.6：standalone 模式由 Core 持有配置真相，并同时服务 UI 与配置文件
+
+考虑到短期内产品只推进 macOS UI，但核心能力需要支持前台二进制和 daemon 两种 standalone 运行形态，BridgingIO 必须把“设置”也纳入 Rust Core，而不是由 UI 私有维护一份配置模型。
+
+推荐边界如下：
+
+- Core 维护统一的 settings/profile 模型，并负责校验、持久化和对外暴露 typed settings API
+- standalone 模式允许 core 在启动时读取操作员提供的配置文件，以完成 headless 启动和默认目标装载
+- UI、CLI、后续其他平台前端通过 app API 调用同一套 settings/profile 接口，而不是各自定义配置语义
+- 非敏感设置可来自配置文件或 core 管理的持久层；敏感凭据始终通过 `CredentialRef` 指向 vault backend
+
+这样可以同时满足：
+
+- 没有 UI 时，用户仍然可以靠配置文件启动 core
+- 有 UI 时，设置修改仍然经过 core 的统一模型和校验链路
+- 未来切换 IPC 方案或扩展到其他桌面平台时，不需要重定义设置语义
+
+不推荐的方案：
+
+- 仅让 UI 保存设置，再把结果“喂给” core：会导致 headless 模式缺失能力，也会让其他前端重复实现设置逻辑
+- 仅让 core 读取配置文件，但不提供设置 API：会把 UI 降级成只读审计台，无法承载目标管理和凭据选择
+
+### 决策 4.7：外部工具优先以内置后备二进制接入，并由 Core 统一解析来源
+
+对于 SSH、ADB 等连接器依赖，BridgingIO 优先集成“可执行二进制后备”，而不是把第三方库直接静态或动态链接进 UI 进程。
+
+推荐策略：
+
+- 逻辑所有权属于 core 的 connector/tool resolver
+- 运行时按“用户覆盖路径 → 系统 PATH → 内置后备二进制”顺序决策
+- macOS UI 分发包可以物理携带这些后备二进制，但它们在语义上属于 core 运行时资源，而不是 UI 专属资源
+- 诊断接口必须能回显当前选中的工具路径与来源，方便 UI 展示和问题排查
+
+选择该方案的原因：
+
+- 当前 connector 抽象天然围绕可执行文件解析，而不是围绕库级 API
+- 可执行后备更利于不同分发形态复用，例如 `.app`、独立 daemon 包和未来其他平台发行物
+- 能保留用户覆盖系统工具路径的能力，避免把产品锁死在单一内置版本
+
+备选方案：
+
+- 把依赖库直接打进 UI：会让 standalone core 与其他平台前端失去复用价值
+- 只依赖系统安装：部署更轻，但会降低首次成功率和 AI 可用性
+
 ### 决策 5：优先 typed tools，保留受控 raw command 兜底
 
 MCP 暴露面将分两层：
@@ -198,6 +243,8 @@ MCP 暴露面将分两层：
 - 如果需要交互式凭据，则在 UI 中发起审批，由本地安全组件处理输入
 - 模型只能获得“批准/拒绝/失败”结果，不能看到明文密码
 
+为了兼容未来 roadmap 中的内置 vault，保险库访问必须继续通过可替换 backend abstraction 暴露。也就是说，profile、session 和配置文件应只认 `CredentialRef`，而不与具体的 macOS Keychain、文件型 vault 或未来自研 vault 实现耦合。
+
 备选方案：
 
 - 让模型直接读写凭据：风险过高
@@ -207,13 +254,16 @@ MCP 暴露面将分两层：
 
 首版 SwiftUI UI 不追求完整终端仿真器，而优先提供：
 
-- 目标列表与 profile 管理
+- 目标列表与 profile 管理，包括 SSH/ADB 目标创建、编辑、别名/备注维护和凭据引用选择
 - 会话详情、环境指纹和能力摘要
+- 连接器/Provider 诊断与工具来源回显，包括用户覆盖路径、系统 PATH 命中和内置后备来源
 - 可折叠命令卡片时间线
 - stdout/stderr/exit status/approval 事件的结构化呈现
 - Artifact 摘要、过滤历史与重读入口
 
 这样用户既能看见 AI 做了什么，也不会被大量原始终端输出淹没；必要时仍可展开查看原始内容。
+
+换句话说，首版 UI 不应该被定义成“纯审计屏”。它首先是一个以可观测性为核心的操作台，但同时必须承担受控设置入口，至少覆盖目标连接参数、凭据引用、可读名称/别名和工具来源诊断。
 
 在开始 SwiftUI 编码前，必须先使用 `ui-ux-pro-max` 生成可评审的 macOS 控制台设计系统，并与项目负责人确认方向。确认后的设计源文件将持久化到 `design/macos-console/design-system/MASTER.md`，页面级差异放在 `design/macos-console/design-system/pages/` 中，作为后续可编辑的设计基线。当前基于技能的初步检索结果显示，`JetBrains Mono + IBM Plex Sans` 的开发者工具字体组合和深色中性底色配绿色强调较适合 BridgingIO，但面向官网的 `Feature-Rich Showcase` 或 `Enterprise Gateway` 页面模式不能直接照搬到操作台，后续设计规范需要将其收敛成更适合高信息密度的桌面控制台布局。
 
@@ -300,6 +350,7 @@ PR 描述至少应覆盖：
 
 - 本地 app API 与跨进程协作会增加集成复杂度 → 通过稳定的请求/响应协议和明确的 domain model 降低耦合
 - 依赖系统 CLI 或外部工具时会遇到版本差异 → 提供可执行路径解析、健康检查和工具来源回显
+- standalone 配置文件、UI 设置和运行时状态如果边界不清容易产生多份真相 → 由 core 持有统一 settings/profile 模型，并让配置文件与 UI 都接入同一套校验语义
 - Artifact 缓存会持续增长 → 提供容量配额、TTL、手动清理和基于引用关系的回收策略
 - 能力抽象可能掩盖底层工具细节 → 提供 capability 摘要与受控 raw command 兜底
 - 首版只做 macOS UI，后续跨平台时可能暴露新的交互差异 → 把 UI 的共享状态机和 app API 提前稳定下来
@@ -310,15 +361,16 @@ PR 描述至少应覆盖：
 ## Migration Plan
 
 1. 初始化仓库结构，落定 Rust 核心模块、SwiftUI macOS 目录和 OpenSpec 文档基线
-2. 实现核心 domain model、session manager、policy engine、artifact metadata 和本地存储层
-3. 为 session manager 增加 access scope、logical session、transport session 和 channel 的建模与复用策略
-4. 接入 SSH 与 ADB 连接器，以及 terminal / git provider 的 MVP 能力
-5. 使用 `ui-ux-pro-max` 生成 BridgingIO macOS 控制台设计系统，与项目负责人确认后持久化到 `design/macos-console/design-system/`
-6. 基于已确认的设计系统实现 macOS 控制台，覆盖目标管理、会话视图、命令时间线、artifact 浏览和审批反馈
-7. 为 Rust 核心补齐单元测试和关键集成测试，并为 macOS 控制台补齐关键用户流 UI Test
-8. 在每次 change archive 后，基于 `.gitmessage` 生成建议的 git commit message 与 pull request 描述
-9. 增加 MCP adapter，让外部 AI 客户端可通过同一核心引擎访问能力
-10. 在 MVP 稳定后，再引入 review、serial、docker、http、search 等 provider/connector
+2. 实现核心 domain model、settings/profile 模型、policy engine、artifact metadata 和本地存储层
+3. 为 standalone core 增加配置文件装载、vault backend abstraction 和 settings API 边界
+4. 为 session manager 增加 access scope、logical session、transport session 和 channel 的建模与复用策略
+5. 接入 SSH 与 ADB 连接器，以及 terminal / git provider 的 MVP 能力，同时落实用户覆盖路径、系统 PATH 和内置后备二进制的解析链路
+6. 使用 `ui-ux-pro-max` 生成 BridgingIO macOS 控制台设计系统，与项目负责人确认后持久化到 `design/macos-console/design-system/`
+7. 基于已确认的设计系统实现 macOS 控制台，覆盖目标管理、设置入口、会话视图、命令时间线、artifact 浏览和审批反馈
+8. 为 Rust 核心补齐单元测试和关键集成测试，并为 macOS 控制台补齐关键用户流 UI Test
+9. 在每次 change archive 后，基于 `.gitmessage` 生成建议的 git commit message 与 pull request 描述
+10. 增加 MCP adapter，让外部 AI 客户端可通过同一核心引擎访问能力
+11. 在 MVP 稳定后，再引入 review、serial、docker、http、search 等 provider/connector
 
 由于项目尚未发布，当前不需要复杂的线上迁移或回滚方案；如果某项能力不稳定，可通过 feature flag 或实验性入口限制暴露范围。
 
