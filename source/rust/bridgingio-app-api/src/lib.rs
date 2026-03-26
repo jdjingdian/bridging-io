@@ -56,6 +56,28 @@ pub struct ToolchainDiagnosticView {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppCommand {
+    AttachUi {
+        ui_instance_id: String,
+        ui_kind: String,
+    },
+    GetBootstrapState {
+        timeline_limit: usize,
+        artifact_limit: usize,
+        transcript_limit: usize,
+    },
+    GetTimeline {
+        limit: usize,
+    },
+    GetArtifacts {
+        limit: usize,
+    },
+    ListInteractiveShells,
+    ReadInteractiveTranscript {
+        shell_id: String,
+        offset: usize,
+        limit: usize,
+    },
+    RequestShutdown,
     ListTargets,
     ListProfiles,
     UpsertProfile {
@@ -134,6 +156,41 @@ pub struct ApiError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiResponse {
+    Attached {
+        request_id: String,
+        readiness_state: String,
+        model_plane_ready: bool,
+    },
+    Bootstrap {
+        request_id: String,
+        payload_json: String,
+    },
+    Timeline {
+        request_id: String,
+        payload_json: String,
+    },
+    ArtifactsSnapshot {
+        request_id: String,
+        payload_json: String,
+    },
+    InteractiveShells {
+        request_id: String,
+        payload_json: String,
+    },
+    InteractiveTranscript {
+        request_id: String,
+        shell_id: String,
+        offset: usize,
+        limit: usize,
+        payload_json: String,
+    },
+    ShutdownAccepted {
+        request_id: String,
+    },
+    NotReady {
+        request_id: String,
+        reason: String,
+    },
     Accepted {
         request_id: String,
     },
@@ -196,6 +253,52 @@ impl AppApiLineCodec {
             reuse_policy_label(&request.context.reuse_policy),
         );
         match &request.command {
+            AppCommand::AttachUi {
+                ui_instance_id,
+                ui_kind,
+            } => {
+                base.push_str("|command=attach_ui");
+                base.push_str(&format!(
+                    "|ui_instance_id={}|ui_kind={}",
+                    escape(ui_instance_id),
+                    escape(ui_kind)
+                ));
+            }
+            AppCommand::GetBootstrapState {
+                timeline_limit,
+                artifact_limit,
+                transcript_limit,
+            } => {
+                base.push_str("|command=get_bootstrap_state");
+                base.push_str(&format!(
+                    "|timeline_limit={timeline_limit}|artifact_limit={artifact_limit}|transcript_limit={transcript_limit}"
+                ));
+            }
+            AppCommand::GetTimeline { limit } => {
+                base.push_str("|command=get_timeline");
+                base.push_str(&format!("|limit={limit}"));
+            }
+            AppCommand::GetArtifacts { limit } => {
+                base.push_str("|command=get_artifacts");
+                base.push_str(&format!("|limit={limit}"));
+            }
+            AppCommand::ListInteractiveShells => {
+                base.push_str("|command=list_interactive_shells");
+            }
+            AppCommand::ReadInteractiveTranscript {
+                shell_id,
+                offset,
+                limit,
+            } => {
+                base.push_str("|command=read_interactive_transcript");
+                base.push_str(&format!(
+                    "|shell_id={}|offset={offset}|limit={limit}",
+                    escape(shell_id)
+                ));
+            }
+            AppCommand::RequestShutdown => {
+                base.push_str("|command=request_shutdown");
+            }
             AppCommand::ListTargets => base.push_str("|command=list_targets"),
             AppCommand::ListProfiles => base.push_str("|command=list_profiles"),
             AppCommand::GetSettings => base.push_str("|command=get_settings"),
@@ -255,6 +358,42 @@ impl AppApiLineCodec {
             reuse_policy: parse_reuse_policy(required(&map, "reuse_policy")?)?,
         };
         let command = match required(&map, "command")? {
+            "attach_ui" => AppCommand::AttachUi {
+                ui_instance_id: unescape(required(&map, "ui_instance_id")?),
+                ui_kind: unescape(required(&map, "ui_kind")?),
+            },
+            "get_bootstrap_state" => AppCommand::GetBootstrapState {
+                timeline_limit: required(&map, "timeline_limit")?
+                    .parse::<usize>()
+                    .map_err(|_| invalid_request("timeline_limit must be usize"))?,
+                artifact_limit: required(&map, "artifact_limit")?
+                    .parse::<usize>()
+                    .map_err(|_| invalid_request("artifact_limit must be usize"))?,
+                transcript_limit: required(&map, "transcript_limit")?
+                    .parse::<usize>()
+                    .map_err(|_| invalid_request("transcript_limit must be usize"))?,
+            },
+            "get_timeline" => AppCommand::GetTimeline {
+                limit: required(&map, "limit")?
+                    .parse::<usize>()
+                    .map_err(|_| invalid_request("limit must be usize"))?,
+            },
+            "get_artifacts" => AppCommand::GetArtifacts {
+                limit: required(&map, "limit")?
+                    .parse::<usize>()
+                    .map_err(|_| invalid_request("limit must be usize"))?,
+            },
+            "list_interactive_shells" => AppCommand::ListInteractiveShells,
+            "read_interactive_transcript" => AppCommand::ReadInteractiveTranscript {
+                shell_id: unescape(required(&map, "shell_id")?),
+                offset: required(&map, "offset")?
+                    .parse::<usize>()
+                    .map_err(|_| invalid_request("offset must be usize"))?,
+                limit: required(&map, "limit")?
+                    .parse::<usize>()
+                    .map_err(|_| invalid_request("limit must be usize"))?,
+            },
+            "request_shutdown" => AppCommand::RequestShutdown,
             "list_targets" => AppCommand::ListTargets,
             "list_profiles" => AppCommand::ListProfiles,
             "get_settings" => AppCommand::GetSettings,
@@ -291,6 +430,60 @@ impl AppApiLineCodec {
 
     pub fn encode_response_line(response: &ApiResponse) -> String {
         match response {
+            ApiResponse::Attached {
+                request_id,
+                readiness_state,
+                model_plane_ready,
+            } => format!(
+                "kind=attached|request_id={request_id}|readiness_state={}|model_plane_ready={model_plane_ready}",
+                escape(readiness_state)
+            ),
+            ApiResponse::Bootstrap {
+                request_id,
+                payload_json,
+            } => format!(
+                "kind=bootstrap|request_id={request_id}|payload={}",
+                escape(payload_json)
+            ),
+            ApiResponse::Timeline {
+                request_id,
+                payload_json,
+            } => format!(
+                "kind=timeline|request_id={request_id}|payload={}",
+                escape(payload_json)
+            ),
+            ApiResponse::ArtifactsSnapshot {
+                request_id,
+                payload_json,
+            } => format!(
+                "kind=artifacts_snapshot|request_id={request_id}|payload={}",
+                escape(payload_json)
+            ),
+            ApiResponse::InteractiveShells {
+                request_id,
+                payload_json,
+            } => format!(
+                "kind=interactive_shells|request_id={request_id}|payload={}",
+                escape(payload_json)
+            ),
+            ApiResponse::InteractiveTranscript {
+                request_id,
+                shell_id,
+                offset,
+                limit,
+                payload_json,
+            } => format!(
+                "kind=interactive_transcript|request_id={request_id}|shell_id={}|offset={offset}|limit={limit}|payload={}",
+                escape(shell_id),
+                escape(payload_json)
+            ),
+            ApiResponse::ShutdownAccepted { request_id } => {
+                format!("kind=shutdown_accepted|request_id={request_id}")
+            }
+            ApiResponse::NotReady { request_id, reason } => format!(
+                "kind=not_ready|request_id={request_id}|reason={}",
+                escape(reason)
+            ),
             ApiResponse::Accepted { request_id } => {
                 format!("kind=accepted|request_id={request_id}")
             }
@@ -370,6 +563,45 @@ impl AppApiLineCodec {
         let kind = required(&map, "kind")?;
         let request_id = required(&map, "request_id")?.to_string();
         match kind {
+            "attached" => Ok(ApiResponse::Attached {
+                request_id,
+                readiness_state: unescape(required(&map, "readiness_state")?),
+                model_plane_ready: required(&map, "model_plane_ready")?
+                    .parse()
+                    .map_err(|_| invalid_request("model_plane_ready must be bool"))?,
+            }),
+            "bootstrap" => Ok(ApiResponse::Bootstrap {
+                request_id,
+                payload_json: unescape(required(&map, "payload")?),
+            }),
+            "timeline" => Ok(ApiResponse::Timeline {
+                request_id,
+                payload_json: unescape(required(&map, "payload")?),
+            }),
+            "artifacts_snapshot" => Ok(ApiResponse::ArtifactsSnapshot {
+                request_id,
+                payload_json: unescape(required(&map, "payload")?),
+            }),
+            "interactive_shells" => Ok(ApiResponse::InteractiveShells {
+                request_id,
+                payload_json: unescape(required(&map, "payload")?),
+            }),
+            "interactive_transcript" => Ok(ApiResponse::InteractiveTranscript {
+                request_id,
+                shell_id: unescape(required(&map, "shell_id")?),
+                offset: required(&map, "offset")?
+                    .parse()
+                    .map_err(|_| invalid_request("offset must be usize"))?,
+                limit: required(&map, "limit")?
+                    .parse()
+                    .map_err(|_| invalid_request("limit must be usize"))?,
+                payload_json: unescape(required(&map, "payload")?),
+            }),
+            "shutdown_accepted" => Ok(ApiResponse::ShutdownAccepted { request_id }),
+            "not_ready" => Ok(ApiResponse::NotReady {
+                request_id,
+                reason: unescape(required(&map, "reason")?),
+            }),
             "accepted" => Ok(ApiResponse::Accepted { request_id }),
             "targets" => Ok(ApiResponse::Targets {
                 request_id,
@@ -548,6 +780,35 @@ mod tests {
     }
 
     #[test]
+    fn encodes_and_decodes_attach_request() {
+        let request = ApiRequest {
+            request_id: "req-attach".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::AttachUi {
+                ui_instance_id: "swiftui-main".into(),
+                ui_kind: "swiftui-macos".into(),
+            },
+        };
+        let line = AppApiLineCodec::encode_request_line(&request);
+        let parsed = AppApiLineCodec::decode_request_line(&line).expect("decode");
+        match parsed.command {
+            AppCommand::AttachUi {
+                ui_instance_id,
+                ui_kind,
+            } => {
+                assert_eq!(ui_instance_id, "swiftui-main");
+                assert_eq!(ui_kind, "swiftui-macos");
+            }
+            other => panic!("expected attach_ui command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn encodes_settings_response_line() {
         let line = AppApiLineCodec::encode_response_line(&ApiResponse::Settings {
             request_id: "r1".into(),
@@ -593,6 +854,22 @@ mod tests {
                 assert_eq!(settings.artifact_cache.max_bytes, 2048);
             }
             other => panic!("expected settings response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_bootstrap_payload_response() {
+        let response = ApiResponse::Bootstrap {
+            request_id: "boot-1".into(),
+            payload_json: "{\"targets\":[]}".into(),
+        };
+        let line = AppApiLineCodec::encode_response_line(&response);
+        let parsed = AppApiLineCodec::decode_response_line(&line).expect("decode response");
+        match parsed {
+            ApiResponse::Bootstrap { payload_json, .. } => {
+                assert_eq!(payload_json, "{\"targets\":[]}");
+            }
+            other => panic!("expected bootstrap response, got {other:?}"),
         }
     }
 }

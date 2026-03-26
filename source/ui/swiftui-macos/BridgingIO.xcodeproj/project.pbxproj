@@ -100,6 +100,7 @@
 			buildConfigurationList = 39B6B0992F742C3900421AF7 /* Build configuration list for PBXNativeTarget "BridgingIO" */;
 			buildPhases = (
 				39B6B0722F742C3800421AF7 /* Sources */,
+				7E8A8B7F2FA1A00100A0B0C0 /* Embed bridgingio-core */,
 				39B6B0732F742C3800421AF7 /* Frameworks */,
 				39B6B0742F742C3800421AF7 /* Resources */,
 			);
@@ -231,6 +232,33 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		7E8A8B7F2FA1A00100A0B0C0 /* Embed bridgingio-core */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+				inputPaths = (
+					"$(PROJECT_DIR)/../../rust/target/debug/bridgingio-core",
+					"$(PROJECT_DIR)/../../rust/target/release/bridgingio-core",
+					"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Info.plist",
+				);
+			name = "Embed bridgingio-core";
+			outputFileListPaths = (
+			);
+				outputPaths = (
+					"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/bridgingio-core",
+					"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/bridgingio-core.cstemp",
+				);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\n\nREPO_SOURCE_ROOT=\"${PROJECT_DIR}/../..\"\nPROFILE=\"debug\"\nif [ \"${CONFIGURATION}\" = \"Release\" ]; then\n  PROFILE=\"release\"\nfi\n\nif [ -n \"${BRIDGINGIO_CORE_BIN:-}\" ]; then\n  CORE_BIN=\"${BRIDGINGIO_CORE_BIN}\"\nelse\n  CORE_BIN=\"${REPO_SOURCE_ROOT}/rust/target/${PROFILE}/bridgingio-core\"\nfi\n\nif [ ! -x \"${CORE_BIN}\" ]; then\n  echo \"error: bridgingio-core not found at ${CORE_BIN}\"\n  echo \"error: build it first: cd ${REPO_SOURCE_ROOT}/rust && cargo build -p bridgingio-mcp --bin bridgingio-core\"\n  exit 1\nfi\n\nDEST=\"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/MacOS/bridgingio-core\"\ncp \"${CORE_BIN}\" \"${DEST}\"\nchmod +x \"${DEST}\"\n\nif [ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ] && [ \"${CODE_SIGNING_ALLOWED}\" = \"YES\" ]; then\n  /usr/bin/codesign --force --sign \"${EXPANDED_CODE_SIGN_IDENTITY}\" --timestamp=none --generate-entitlement-der \"${DEST}\"\nfi\n\necho \"embedded bridgingio-core -> ${DEST}\"";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		39B6B0722F742C3800421AF7 /* Sources */ = {
@@ -397,6 +425,8 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -427,6 +457,8 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;

@@ -6,7 +6,7 @@ import Testing
 struct BridgingIOTests {
 
     @Test func createTargetAddsProfileAndSelectsIt() throws {
-        let viewModel = WorkspaceViewModel()
+        let viewModel = WorkspaceViewModel(dataSource: WorkspaceViewModel.fixtureDataSource())
         let initialCount = viewModel.targets.count
 
         var draft = TargetProfileDraft()
@@ -22,7 +22,7 @@ struct BridgingIOTests {
     }
 
     @Test func approvalTransitionUpdatesStatus() throws {
-        let viewModel = WorkspaceViewModel()
+        let viewModel = WorkspaceViewModel(dataSource: WorkspaceViewModel.fixtureDataSource())
         guard let pending = viewModel.selectedApprovals.first(where: { $0.status == .pending }) else {
             Issue.record("Expected a pending approval in seed data")
             return
@@ -35,7 +35,7 @@ struct BridgingIOTests {
     }
 
     @Test func artifactHashLookupMatchesPrefix() throws {
-        let viewModel = WorkspaceViewModel()
+        let viewModel = WorkspaceViewModel(dataSource: WorkspaceViewModel.fixtureDataSource())
         viewModel.artifactLookupHash = "8cf4"
         viewModel.lookupArtifactByHash()
 
@@ -52,6 +52,18 @@ struct BridgingIOTests {
         #expect(localized("workspace.toolbar.new_target", locale: "zh-Hans") == "新建目标")
     }
 
+    @Test func fixtureDataSourceStartsConnectedState() throws {
+        let viewModel = WorkspaceViewModel(dataSource: WorkspaceViewModel.fixtureDataSource())
+        #expect(viewModel.coreConnectionState == .connected)
+    }
+
+    @Test func startupErrorStateIsShownWhenBootstrapFails() throws {
+        let viewModel = WorkspaceViewModel(
+            dataSource: FailingDataSource(error: .transport("socket unavailable"))
+        )
+        #expect(viewModel.coreConnectionState == .attachFailed("socket unavailable"))
+    }
+
     private func localized(_ key: String, locale: String) -> String {
         let bundle = Bundle.main
         guard let path = bundle.path(forResource: locale, ofType: "lproj"),
@@ -60,4 +72,22 @@ struct BridgingIOTests {
         }
         return NSLocalizedString(key, tableName: "Localizable", bundle: localizedBundle, value: key, comment: "")
     }
+}
+
+private final class FailingDataSource: WorkspaceDataSource {
+    let error: WorkspaceDataSourceError
+
+    init(error: WorkspaceDataSourceError) {
+        self.error = error
+    }
+
+    func bootstrapSnapshot() throws -> WorkspaceSnapshot {
+        throw error
+    }
+
+    func refreshSnapshot() throws -> WorkspaceSnapshot {
+        throw error
+    }
+
+    func shutdown() {}
 }

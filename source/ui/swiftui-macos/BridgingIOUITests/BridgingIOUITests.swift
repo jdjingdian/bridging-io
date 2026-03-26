@@ -2,6 +2,12 @@ import XCTest
 
 final class BridgingIOUITests: XCTestCase {
 
+    private func makeApp() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments += ["--use-fixture-data"]
+        return app
+    }
+
     override func setUpWithError() throws {
         // Put setup code here. This method is called before the invocation of each test method in the class.
 
@@ -13,7 +19,7 @@ final class BridgingIOUITests: XCTestCase {
 
     @MainActor
     func testTargetSelectionAndSessionSummary() throws {
-        let app = XCUIApplication()
+        let app = makeApp()
         app.launch()
 
         let targetRow = app.buttons["target-row-ops-prod"]
@@ -26,7 +32,7 @@ final class BridgingIOUITests: XCTestCase {
 
     @MainActor
     func testCreateTargetProfileFlow() throws {
-        let app = XCUIApplication()
+        let app = makeApp()
         app.launch()
 
         app.buttons["toolbar-new-target"].click()
@@ -55,7 +61,7 @@ final class BridgingIOUITests: XCTestCase {
 
     @MainActor
     func testApprovalAndArtifactHashLookup() throws {
-        let app = XCUIApplication()
+        let app = makeApp()
         app.launch()
 
         let approveButton = app.buttons["approval-approve"]
@@ -74,13 +80,13 @@ final class BridgingIOUITests: XCTestCase {
     func testLaunchPerformance() throws {
         // This measures how long it takes to launch your application.
         measure(metrics: [XCTApplicationLaunchMetric()]) {
-            XCUIApplication().launch()
+            makeApp().launch()
         }
     }
 
     @MainActor
     func testChineseLocaleLocalizationAndProductNameConsistency() throws {
-        let app = XCUIApplication()
+        let app = makeApp()
         app.launchArguments += ["-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh-Hans"]
         app.launch()
 

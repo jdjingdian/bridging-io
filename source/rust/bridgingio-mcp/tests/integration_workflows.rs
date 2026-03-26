@@ -11,7 +11,7 @@ use bridgingio_connectors::{
 };
 use bridgingio_domain::{SessionReusePolicy, TargetKind};
 use bridgingio_mcp::{
-    ControlPlaneIpcClient, ControlPlaneIpcServer, CoreRuntimeError, McpToolHandler,
+    ControlPlaneIpcClient, ControlPlaneIpcServer, CoreHostMode, CoreRuntimeError, McpToolHandler,
     ModelPlaneHttpServer, StandaloneCoreRuntime, ToolRequest, ToolRequestContext, ToolResult,
 };
 use bridgingio_policy::OperationKind;
@@ -400,6 +400,86 @@ fn validates_headless_smoke_with_standalone_sample_config() {
         },
     });
     assert!(matches!(exec_response, ApiResponse::Execution { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn validates_ui_managed_mode_gates_mcp_until_attach() {
+    let root = temp_dir("ui-managed-gating");
+    let config_text =
+        bridgingio_engine::CoreSettings::minimal_example().replace("port = 19718", "port = 0");
+    let settings =
+        bridgingio_engine::CoreSettings::from_toml_str(&config_text).expect("parse config");
+    let runtime = StandaloneCoreRuntime::from_settings_with_mode(
+        settings.clone(),
+        toolchain_resolver(&root),
+        CoreHostMode::UiManagedEphemeral,
+    )
+    .expect("runtime")
+    .shared();
+
+    let socket_path = root.join("control-plane.sock");
+    let ipc_server = match ControlPlaneIpcServer::bind(runtime.clone(), &socket_path) {
+        Ok(server) => server,
+        Err(CoreRuntimeError::Io(message)) if message.contains("Operation not permitted") => {
+            return;
+        }
+        Err(err) => panic!("bind ipc failed: {err:?}"),
+    };
+    let http_server = ModelPlaneHttpServer::bind(runtime, &settings).expect("bind http");
+    let addr = http_server.local_addr().expect("http addr");
+
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": "pre-attach",
+        "method": "initialize",
+        "params": {}
+    });
+    let pre_client = thread::spawn(move || post_json(addr, "/mcp", &initialize));
+    http_server.serve_once().expect("serve pre-attach");
+    let (status, body) = parse_http_response(&pre_client.join().expect("join pre-attach"));
+    assert_eq!(status, 503, "expected not-ready status before attach");
+    assert!(
+        body.contains("not ready"),
+        "expected not-ready message before attach, got {body}"
+    );
+
+    let ipc_client = ControlPlaneIpcClient::new(&socket_path);
+    let attach_thread = thread::spawn(move || ipc_server.serve_once().expect("serve attach ipc"));
+    let attach_response = ipc_client
+        .send(&ApiRequest {
+            request_id: "attach-1".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::AttachUi {
+                ui_instance_id: "swiftui-main".into(),
+                ui_kind: "swiftui-macos".into(),
+            },
+        })
+        .expect("attach send");
+    assert!(matches!(attach_response, ApiResponse::Attached { .. }));
+    attach_thread.join().expect("join attach thread");
+
+    let addr = http_server.local_addr().expect("http addr");
+    let initialize_after = json!({
+        "jsonrpc": "2.0",
+        "id": "post-attach",
+        "method": "initialize",
+        "params": {}
+    });
+    let post_client = thread::spawn(move || post_json(addr, "/mcp", &initialize_after));
+    http_server.serve_once().expect("serve post-attach");
+    let (status, body) = parse_http_response(&post_client.join().expect("join post-attach"));
+    assert_eq!(status, 200, "expected ready after attach");
+    let payload: Value = serde_json::from_str(&body).expect("json payload");
+    assert_eq!(
+        payload["result"]["serverInfo"]["name"].as_str(),
+        Some("bridgingio-core")
+    );
 }
 
 #[test]

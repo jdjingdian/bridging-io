@@ -190,6 +190,15 @@
 "workspace.center.select_target_hint" = "Select a target to inspect its logical session.";
 "workspace.center.session_summary_format" = "Session: %@ • %@ • %@";
 "workspace.center.timeline" = "Timeline";
+"workspace.connection.connected" = "Connected to core";
+"workspace.connection.failed_format" = "Core connection failed: %@";
+"workspace.connection.failed_title" = "Core Connection Failed";
+"workspace.connection.starting" = "Starting core";
+"workspace.connection.starting_message" = "Launching managed core and reading bootstrap snapshot.";
+"workspace.connection.starting_title" = "Starting Core";
+"workspace.connection.waiting" = "Waiting for attach";
+"workspace.connection.waiting_message" = "Core is up, waiting for UI attach completion.";
+"workspace.connection.waiting_title" = "Waiting For Attach";
 
 "workspace.channel.closed_by_operator" = "Channel closed by operator.";
 "workspace.channel.default_target_name" = "target";

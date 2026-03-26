@@ -162,6 +162,46 @@ curl -s http://127.0.0.1:19718/mcp \
   }'
 ```
 
+## Core Launch Modes And Lifecycle
+
+`bridgingio-core` supports three operator-facing launch modes:
+
+- `run`: standalone foreground mode. Core stays attached to the current terminal.
+- `-d`: standalone detached mode. A launcher process spawns a background core child and returns immediately.
+- `ui-managed-ephemeral`: bundled mode for platform UI hosts (for example macOS SwiftUI) that own the core lifecycle.
+
+Examples:
+
+```bash
+cd source/rust
+
+# standalone foreground
+cargo run -p bridgingio-mcp --bin bridgingio-core -- run --config /absolute/path/to/standalone.toml
+
+# standalone detached
+cargo run -p bridgingio-mcp --bin bridgingio-core -- -d --config /absolute/path/to/standalone.toml
+
+# bundled UI-managed mode
+cargo run -p bridgingio-mcp --bin bridgingio-core -- ui-managed-ephemeral --config /absolute/path/to/standalone.toml
+```
+
+Bundled lifecycle contract (`ui-managed-ephemeral`):
+
+- Core opens local control-plane first.
+- UI must attach through control-plane (`attach_ui`) before model-plane is considered ready.
+- Before UI attach succeeds, `/mcp` and equivalent model-plane entrypoints return explicit not-ready semantics.
+- When UI exits normally, UI host should request shutdown (`request_shutdown`) so managed core exits with it.
+
+Standalone lifecycle contract (`run` and `-d`):
+
+- Model-plane is available immediately after core startup completes.
+- Attach gating is not enforced.
+- `run` and `-d` reuse the same runtime/configuration semantics.
+
+Future extension point:
+
+- Keep lifecycle ownership in a host adapter layer so we can later switch from UI child-process hosting to system service hosting (for example `SMAppService`/`SMJobBless`-style paths) without changing control-plane or MCP protocol boundaries.
+
 ## Archive Handoff Requirements
 
 After archive:

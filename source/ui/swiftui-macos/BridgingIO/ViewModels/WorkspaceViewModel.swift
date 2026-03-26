@@ -1,6 +1,694 @@
 import Foundation
 import SwiftUI
 import Combine
+import Darwin
+
+enum WorkspaceCoreConnectionState: Equatable {
+    case starting
+    case waitingForAttach
+    case attachFailed(String)
+    case connected
+}
+
+final class ManagedCoreWorkspaceDataSource: WorkspaceDataSource {
+    private let lock = NSLock()
+    private var process: Process?
+    private var coreLogHandle: FileHandle?
+    private var requestSequence: Int = 0
+    private var targetIDMap: [String: UUID] = [:]
+    private let uiInstanceID: String
+    private let socketPath: String
+    private let configPath: String
+    private let coreLogPath: String
+    private let runtimeRootPath: String
+
+    init() {
+        let shortID = String(UUID().uuidString.lowercased().prefix(8))
+        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? tmpDir
+        uiInstanceID = "swiftui-\(shortID)"
+        socketPath = tmpDir.appendingPathComponent("bridgingio-ui-\(shortID).sock").path
+        configPath = tmpDir.appendingPathComponent("bridgingio-ui-\(shortID).toml").path
+        coreLogPath = tmpDir.appendingPathComponent("bridgingio-core-\(shortID).log").path
+        runtimeRootPath = appSupportDir
+            .appendingPathComponent("BridgingIORuntime", isDirectory: true)
+            .path
+    }
+
+    func bootstrapSnapshot() throws -> WorkspaceSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureCoreStartedLocked()
+        try attachUILocked()
+        return try fetchBootstrapLocked()
+    }
+
+    func refreshSnapshot() throws -> WorkspaceSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureCoreStartedLocked()
+        return try fetchBootstrapLocked()
+    }
+
+    func shutdown() {
+        lock.lock()
+        defer { lock.unlock() }
+        _ = try? sendCommandLocked(command: "request_shutdown", fields: [:])
+        if let process {
+            if process.isRunning {
+                process.terminate()
+            }
+            self.process = nil
+        }
+        try? coreLogHandle?.close()
+        coreLogHandle = nil
+        try? FileManager.default.removeItem(atPath: socketPath)
+    }
+
+    private func ensureCoreStartedLocked() throws {
+        if let process, process.isRunning {
+            return
+        }
+        process = nil
+        try? coreLogHandle?.close()
+        coreLogHandle = nil
+        try? FileManager.default.removeItem(atPath: socketPath)
+        try writeConfigLocked()
+        let executable = try resolveCoreExecutablePath()
+        FileManager.default.createFile(atPath: coreLogPath, contents: nil)
+        let logHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: coreLogPath))
+        let coreProcess = Process()
+        coreProcess.executableURL = URL(fileURLWithPath: executable)
+        coreProcess.arguments = ["ui-managed-ephemeral", "--config", configPath]
+        coreProcess.standardOutput = logHandle
+        coreProcess.standardError = logHandle
+        do {
+            try coreProcess.run()
+        } catch {
+            try? logHandle.close()
+            throw WorkspaceDataSourceError.transport(
+                "start bridgingio-core failed: \(error.localizedDescription) (log: \(coreLogPath))"
+            )
+        }
+        coreLogHandle = logHandle
+        process = coreProcess
+        if !waitForSocketReady(timeoutSeconds: 6.0) {
+            let logTail = coreLogTailLocked()
+            if logTail.isEmpty {
+                throw WorkspaceDataSourceError.transport(
+                    "core control-plane socket not ready (socket: \(socketPath), log: \(coreLogPath))"
+                )
+            }
+            throw WorkspaceDataSourceError.transport(
+                "core control-plane socket not ready (socket: \(socketPath), log: \(coreLogPath))\n\(logTail)"
+            )
+        }
+    }
+
+    private func writeConfigLocked() throws {
+        let stateDir = "\(runtimeRootPath)/state"
+        let artifactsDir = "\(runtimeRootPath)/artifacts"
+        try FileManager.default.createDirectory(
+            atPath: stateDir,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            atPath: artifactsDir,
+            withIntermediateDirectories: true
+        )
+
+        let toml = """
+        schema_version = 1
+
+        [core]
+        instance_name = "bridgingio-ui"
+        data_dir = "\(runtimeRootPath)"
+        log_level = "info"
+
+        [storage]
+        metadata_backend = "sqlite"
+        metadata_path = "\(stateDir)/metadata.sqlite3"
+
+        [storage.artifacts]
+        backend = "memory"
+        root = "\(artifactsDir)"
+        max_bytes = 268435456
+        eviction_policy = "lru"
+
+        [vault]
+        backend = "os-native"
+        namespace = "io.bridgingio"
+
+        [control_plane]
+        enabled = true
+        transport = "platform-ipc"
+        endpoint = "\(socketPath)"
+
+        [model_plane.http]
+        enabled = true
+        host = "127.0.0.1"
+        port = 0
+        allow_non_loopback = false
+
+        [model_plane.http.auth]
+        mode = "none"
+        required_when_non_loopback = true
+
+        [policies.defaults]
+        reuse_policy = "resume_or_create"
+        approval_mode = "on-risk"
+        capture_env_fingerprint = true
+        """
+        try toml.write(toFile: configPath, atomically: true, encoding: .utf8)
+    }
+
+    private func resolveCoreExecutablePath() throws -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let configured = env["BRIDGINGIO_CORE_BIN"],
+           FileManager.default.isExecutableFile(atPath: configured) {
+            return configured
+        }
+        let candidates = [
+            Bundle.main.bundleURL
+                .appendingPathComponent("Contents")
+                .appendingPathComponent("MacOS")
+                .appendingPathComponent("bridgingio-core")
+                .path,
+            Bundle.main.bundleURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("bridgingio-core")
+                .path,
+        ]
+        if let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return path
+        }
+        throw WorkspaceDataSourceError.transport("cannot find bridgingio-core executable")
+    }
+
+    private func waitForSocketReady(timeoutSeconds: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if FileManager.default.fileExists(atPath: socketPath) {
+                return true
+            }
+            usleep(100_000)
+        }
+        return false
+    }
+
+    private func attachUILocked() throws {
+        let response = try sendCommandLocked(
+            command: "attach_ui",
+            fields: [
+                "ui_instance_id": uiInstanceID,
+                "ui_kind": "swiftui-macos"
+            ]
+        )
+        if let kind = response["kind"], kind == "attached" {
+            return
+        }
+        if let kind = response["kind"], kind == "not_ready" {
+            throw WorkspaceDataSourceError.waitingForAttach
+        }
+        throw WorkspaceDataSourceError.protocolViolation("attach_ui failed")
+    }
+
+    private func fetchBootstrapLocked() throws -> WorkspaceSnapshot {
+        let response = try sendCommandLocked(
+            command: "get_bootstrap_state",
+            fields: [
+                "timeline_limit": "120",
+                "artifact_limit": "120",
+                "transcript_limit": "120"
+            ]
+        )
+        let kind = response["kind"] ?? ""
+        if kind == "not_ready" {
+            throw WorkspaceDataSourceError.waitingForAttach
+        }
+        if kind == "error" {
+            throw WorkspaceDataSourceError.transport(unescape(response["message"] ?? "unknown error"))
+        }
+        guard kind == "bootstrap", let payload = response["payload"] else {
+            throw WorkspaceDataSourceError.protocolViolation("unexpected response kind: \(kind)")
+        }
+        return try decodeBootstrapPayload(unescape(payload))
+    }
+
+    private func sendCommandLocked(command: String, fields: [String: String]) throws -> [String: String] {
+        requestSequence += 1
+        let requestID = "ui-\(requestSequence)"
+        var pairs = [
+            "request_id=\(requestID)",
+            "agent_id=ui-agent",
+            "run_id=ui-run",
+            "client_session_id=ui-client",
+            "reuse_policy=reuse_if_alive",
+            "command=\(command)"
+        ]
+        for (key, value) in fields {
+            pairs.append("\(key)=\(escape(value))")
+        }
+        let line = pairs.joined(separator: "|") + "\n"
+        let responseLine = try sendLineToSocketLocked(line)
+        return parseKVPairs(responseLine)
+    }
+
+    private func sendLineToSocketLocked(_ line: String) throws -> String {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        if fd < 0 {
+            throw WorkspaceDataSourceError.transport("create unix socket failed")
+        }
+        defer { Darwin.close(fd) }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = socketPath.utf8CString
+        if pathBytes.count > MemoryLayout.size(ofValue: address.sun_path) {
+            throw WorkspaceDataSourceError.transport("socket path too long")
+        }
+        withUnsafeMutableBytes(of: &address.sun_path) { rawBuffer in
+            rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
+            pathBytes.withUnsafeBytes { srcBuffer in
+                rawBuffer.copyBytes(from: srcBuffer)
+            }
+        }
+        let length = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count)
+        let connectResult = withUnsafePointer(to: &address) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                Darwin.connect(fd, sockaddrPtr, length)
+            }
+        }
+        if connectResult != 0 {
+            let logTail = coreLogTailLocked()
+            if logTail.isEmpty {
+                throw WorkspaceDataSourceError.transport(
+                    "connect control-plane failed (socket: \(socketPath), log: \(coreLogPath))"
+                )
+            }
+            throw WorkspaceDataSourceError.transport(
+                "connect control-plane failed (socket: \(socketPath), log: \(coreLogPath))\n\(logTail)"
+            )
+        }
+
+        let requestData = Array(line.utf8)
+        let writeResult = requestData.withUnsafeBytes { bytes in
+            Darwin.write(fd, bytes.baseAddress, bytes.count)
+        }
+        if writeResult < 0 {
+            throw WorkspaceDataSourceError.transport("write control-plane request failed")
+        }
+
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        var responseData = Data()
+        while true {
+            let readCount = Darwin.read(fd, &buffer, buffer.count)
+            if readCount <= 0 {
+                break
+            }
+            responseData.append(buffer, count: Int(readCount))
+            if buffer[..<Int(readCount)].contains(10) {
+                break
+            }
+        }
+        guard let text = String(data: responseData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else {
+            throw WorkspaceDataSourceError.transport("empty control-plane response")
+        }
+        return text
+    }
+
+    private func coreLogTailLocked(maxBytes: Int = 4096) -> String {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: coreLogPath)),
+              !data.isEmpty else {
+            return ""
+        }
+        let tail = data.suffix(maxBytes)
+        return String(decoding: tail, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func parseKVPairs(_ line: String) -> [String: String] {
+        var map: [String: String] = [:]
+        for token in line.split(separator: "|", omittingEmptySubsequences: true) {
+            guard let idx = token.firstIndex(of: "=") else { continue }
+            let key = String(token[..<idx])
+            let value = String(token[token.index(after: idx)...])
+            map[key] = value
+        }
+        return map
+    }
+
+    private func escape(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "|", with: "\\p")
+            .replacingOccurrences(of: "\n", with: "\\n")
+    }
+
+    private func unescape(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\p", with: "|")
+            .replacingOccurrences(of: "\\\\", with: "\\")
+    }
+
+    private func decodeBootstrapPayload(_ payload: String) throws -> WorkspaceSnapshot {
+        guard let data = payload.data(using: .utf8),
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw WorkspaceDataSourceError.protocolViolation("invalid bootstrap payload")
+        }
+
+        let sessionRows = root["sessions"] as? [[String: Any]] ?? []
+        var sessionStateByID: [String: String] = [:]
+        var targetBySessionID: [String: String] = [:]
+        for row in sessionRows {
+            if let sessionID = row["id"] as? String {
+                sessionStateByID[sessionID] = row["state"] as? String ?? "waiting"
+                targetBySessionID[sessionID] = row["target_id"] as? String ?? ""
+            }
+        }
+
+        let transcriptRows = root["transcripts"] as? [[String: Any]] ?? []
+        var transcriptByShellID: [String: [String]] = [:]
+        for row in transcriptRows {
+            let shellID = row["shell_id"] as? String ?? ""
+            let lines = row["lines"] as? [String] ?? []
+            transcriptByShellID[shellID] = lines
+        }
+
+        let shellRows = root["shell_channels"] as? [[String: Any]] ?? []
+        var shellChannels: [ShellChannel] = []
+        for row in shellRows {
+            let coreTargetID = row["target_id"] as? String ?? ""
+            guard !coreTargetID.isEmpty else { continue }
+            let targetID = uuid(forCoreTargetID: coreTargetID)
+            let shellID = row["shell_id"] as? String ?? UUID().uuidString
+            let prompt = row["prompt"] as? String ?? "shell:$"
+            let lines = (transcriptByShellID[shellID] ?? []).map { line in
+                ShellLine(id: UUID(), role: .output, content: line, timestamp: .now)
+            }
+            let channel = ShellChannel(
+                id: row["channel_id"] as? String ?? shellID,
+                targetID: targetID,
+                title: L10n.t("workspace.channel.title.interactive_shell"),
+                prompt: prompt,
+                isClosed: row["closed"] as? Bool ?? false,
+                lines: lines
+            )
+            shellChannels.append(channel)
+        }
+
+        let diagnosticsRows = root["diagnostics"] as? [[String: Any]] ?? []
+        let toolDiagnostics: [ToolSourceDiagnostic] = diagnosticsRows.map { row in
+            let command = row["command"] as? String ?? "tool"
+            let selectedSource = (row["selected_source"] as? String ?? "system").lowercased()
+            let sourceType: ToolSourceType = selectedSource.contains("bundled")
+                ? .bundledFallback
+                : (selectedSource.contains("override") ? .userOverride : .systemPath)
+            let path = row["selected_path"] as? String ?? ""
+            return ToolSourceDiagnostic(
+                id: command,
+                connectorName: command,
+                sourceType: sourceType,
+                effectivePath: path,
+                overridePath: "",
+                lastChecked: .now
+            )
+        }
+
+        let targetRows = root["targets"] as? [[String: Any]] ?? []
+        let targets: [TargetProfile] = targetRows.map { row in
+            let coreID = row["id"] as? String ?? UUID().uuidString
+            let targetID = uuid(forCoreTargetID: coreID)
+            let sessionID = row["session_id"] as? String ?? ""
+            let stateRaw = row["session_state"] as? String ?? sessionStateByID[sessionID] ?? "waiting"
+            let sessionState = mapSessionState(stateRaw)
+            let connectionState = mapConnectionState(stateRaw)
+            let channelID = shellChannels.first(where: { $0.targetID == targetID })?.id ?? "channel-main"
+            let capabilities = (row["capability_ids"] as? [String] ?? []).map { capabilityID in
+                CapabilitySummary(id: capabilityID, title: capabilityTitle(for: capabilityID))
+            }
+            return TargetProfile(
+                id: targetID,
+                name: row["name"] as? String ?? coreID,
+                kind: mapTargetKind(row["kind"] as? String),
+                aliasForModel: coreID,
+                notes: row["notes"] as? String ?? "",
+                credentialReference: "vault://\(coreID)",
+                policyDefaults: .default,
+                sshConfig: .empty,
+                adbConfig: .empty,
+                serialConfig: .empty,
+                dockerConfig: .empty,
+                httpDebugConfig: .empty,
+                openGrokConfig: .empty,
+                connectionState: connectionState,
+                lastActivity: .now,
+                sessionSummary: SessionSummary(
+                    logicalSessionID: sessionID.isEmpty ? "session-none" : sessionID,
+                    channelID: channelID,
+                    state: sessionState,
+                    lastHeartbeat: .now,
+                    fingerprint: EnvironmentFingerprint(
+                        osVersion: "unknown",
+                        architecture: "unknown",
+                        shell: "sh",
+                        detectedTools: []
+                    )
+                ),
+                capabilities: capabilities,
+                toolDiagnostics: toolDiagnostics
+            )
+        }
+
+        let artifactRows = root["artifacts"] as? [[String: Any]] ?? []
+        let artifacts: [ArtifactRecord] = artifactRows.map { row in
+            let hash = row["id"] as? String ?? UUID().uuidString
+            return ArtifactRecord(
+                hash: hash,
+                contentDigest: row["content_digest"] as? String ?? "",
+                sourceCommand: row["source_command"] as? String ?? "",
+                summary: row["summary"] as? String ?? "",
+                sessionID: row["session_id"] as? String ?? "",
+                channelID: row["channel_id"] as? String ?? "",
+                parentHashes: (row["parent_id"] as? String).map { [$0] } ?? [],
+                derivedHashes: [],
+                textContent: row["summary"] as? String ?? ""
+            )
+        }
+
+        let timelineRows = root["timeline"] as? [[String: Any]] ?? []
+        let timeline: [CommandTimelineItem] = timelineRows.compactMap { row in
+            let coreTargetID = row["target_id"] as? String ?? ""
+            let targetID = targetIDMap[coreTargetID] ?? targets.first?.id
+            guard let targetID else { return nil }
+            let artifactID = row["artifact_id"] as? String
+            let references: [ArtifactReference] = artifactID.map { artifact in
+                [ArtifactReference(id: artifact, hash: artifact, label: artifact)]
+            } ?? []
+            let timestamp = dateFromMillis(row["created_at_ms"])
+            return CommandTimelineItem(
+                id: UUID(),
+                targetID: targetID,
+                sessionID: row["session_id"] as? String ?? "",
+                channelID: "",
+                timestamp: timestamp,
+                command: row["command_preview"] as? String ?? "",
+                summary: row["status"] as? String ?? "",
+                state: mapCommandState(row["status"] as? String),
+                stdoutPreview: "",
+                stderrPreview: "",
+                exitStatus: 0,
+                artifacts: references
+            )
+        }
+
+        let approvalRows = root["approvals"] as? [[String: Any]] ?? []
+        let approvals: [ApprovalRequestItem] = approvalRows.compactMap { row in
+            let sessionID = row["session_id"] as? String ?? ""
+            let targetCoreID = targetBySessionID[sessionID] ?? ""
+            let targetID = targetIDMap[targetCoreID] ?? targets.first?.id
+            guard let targetID else { return nil }
+            return ApprovalRequestItem(
+                id: UUID(),
+                targetID: targetID,
+                commandSummary: row["command_preview"] as? String ?? "",
+                reason: row["reason"] as? String ?? "",
+                createdAt: dateFromMillis(row["requested_at_ms"]),
+                status: mapApprovalStatus(row["status"] as? String)
+            )
+        }
+
+        let cacheSettings = decodeCacheSettings(root["settings"] as? [String: Any])
+
+        return WorkspaceSnapshot(
+            targets: targets,
+            timeline: timeline,
+            artifacts: artifacts,
+            approvals: approvals,
+            shellChannels: shellChannels,
+            cacheSettings: cacheSettings
+        )
+    }
+
+    private func decodeCacheSettings(_ settings: [String: Any]?) -> ArtifactCacheSettings {
+        let artifactCache = settings?["artifact_cache"] as? [String: Any]
+        let backendRaw = (artifactCache?["backend"] as? String ?? "filesystem").lowercased()
+        let backend: ArtifactCacheBackend = backendRaw == "memory" ? .memory : .filesystem
+        let evictionRaw = (artifactCache?["eviction_policy"] as? String ?? "lru").lowercased()
+        let eviction: ArtifactEvictionPolicy = evictionRaw == "fifo" ? .fifo : .lru
+        let usedBytes = artifactCache?["used_bytes"] as? Double ?? 0
+        let maxBytes = artifactCache?["max_bytes"] as? Double ?? 0
+        return ArtifactCacheSettings(
+            backend: backend,
+            rootPath: artifactCache?["root"] as? String ?? ArtifactCacheSettings.default.rootPath,
+            maxCacheMB: max(256, Int(maxBytes / 1024 / 1024)),
+            evictionPolicy: eviction,
+            usedCacheMB: max(0, Int(usedBytes / 1024 / 1024))
+        )
+    }
+
+    private func uuid(forCoreTargetID coreID: String) -> UUID {
+        if let existing = targetIDMap[coreID] {
+            return existing
+        }
+        let created = UUID(uuidString: coreID) ?? UUID()
+        targetIDMap[coreID] = created
+        return created
+    }
+
+    private func dateFromMillis(_ value: Any?) -> Date {
+        if let millis = value as? Double {
+            return Date(timeIntervalSince1970: millis / 1000.0)
+        }
+        if let millis = value as? Int {
+            return Date(timeIntervalSince1970: Double(millis) / 1000.0)
+        }
+        return .now
+    }
+
+    private func mapTargetKind(_ raw: String?) -> TargetKind {
+        switch (raw ?? "").lowercased() {
+        case "ssh":
+            return .ssh
+        case "adb":
+            return .adb
+        case "serial":
+            return .serial
+        case "docker":
+            return .docker
+        default:
+            return .ssh
+        }
+    }
+
+    private func mapSessionState(_ raw: String) -> SessionState {
+        switch raw.lowercased() {
+        case "connected", "active":
+            return .active
+        case "degraded":
+            return .degraded
+        case "closed":
+            return .closed
+        default:
+            return .waiting
+        }
+    }
+
+    private func mapConnectionState(_ raw: String) -> TargetConnectionState {
+        switch raw.lowercased() {
+        case "connected", "active":
+            return .connected
+        case "degraded":
+            return .degraded
+        case "closed":
+            return .disconnected
+        default:
+            return .idle
+        }
+    }
+
+    private func mapCommandState(_ raw: String?) -> CommandExecutionState {
+        switch (raw ?? "").lowercased() {
+        case "success", "connected", "active":
+            return .success
+        case "waiting_approval":
+            return .waitingApproval
+        case "streaming":
+            return .streaming
+        default:
+            return .failed
+        }
+    }
+
+    private func mapApprovalStatus(_ raw: String?) -> ApprovalStatus {
+        switch (raw ?? "").lowercased() {
+        case "approved":
+            return .approved
+        case "denied", "rejected":
+            return .rejected
+        case "expired":
+            return .failed
+        default:
+            return .pending
+        }
+    }
+
+    private func capabilityTitle(for capabilityID: String) -> String {
+        switch capabilityID {
+        case "terminal.exec":
+            return L10n.t("capability.terminal")
+        case "artifact.reanalysis":
+            return L10n.t("capability.artifacts")
+        case "git.query":
+            return L10n.t("capability.git")
+        default:
+            return capabilityID
+        }
+    }
+}
+
+enum WorkspaceDataSourceError: Error {
+    case waitingForAttach
+    case transport(String)
+    case protocolViolation(String)
+}
+
+struct WorkspaceSnapshot {
+    var targets: [TargetProfile]
+    var timeline: [CommandTimelineItem]
+    var artifacts: [ArtifactRecord]
+    var approvals: [ApprovalRequestItem]
+    var shellChannels: [ShellChannel]
+    var cacheSettings: ArtifactCacheSettings
+}
+
+protocol WorkspaceDataSource: AnyObject {
+    func bootstrapSnapshot() throws -> WorkspaceSnapshot
+    func refreshSnapshot() throws -> WorkspaceSnapshot
+    func shutdown()
+}
+
+final class FixtureWorkspaceDataSource: WorkspaceDataSource {
+    private let snapshot: WorkspaceSnapshot
+
+    init(snapshot: WorkspaceSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func bootstrapSnapshot() throws -> WorkspaceSnapshot {
+        snapshot
+    }
+
+    func refreshSnapshot() throws -> WorkspaceSnapshot {
+        snapshot
+    }
+
+    func shutdown() {}
+}
 
 @MainActor
 final class WorkspaceViewModel: ObservableObject {
@@ -21,6 +709,7 @@ final class WorkspaceViewModel: ObservableObject {
     @Published var cacheSettingsNeedRestart: Bool = false
     @Published var targetEditorContext: TargetEditorContext?
     @Published var isShowingSettingsSheet: Bool = false
+    @Published private(set) var coreConnectionState: WorkspaceCoreConnectionState = .starting
 
     @Published private(set) var targets: [TargetProfile]
     @Published private(set) var timeline: [CommandTimelineItem]
@@ -28,23 +717,173 @@ final class WorkspaceViewModel: ObservableObject {
     @Published private(set) var approvals: [ApprovalRequestItem]
     @Published private(set) var shellChannels: [ShellChannel]
 
+    private let dataSource: WorkspaceDataSource
+    private let isFixtureDataSource: Bool
+    private var refreshTimer: Timer?
+    private var refreshInFlight = false
     private var appliedCacheBackend: ArtifactCacheBackend
 
-    init() {
-        let seed = WorkspaceViewModel.makeSeed()
-        targets = seed.targets
-        timeline = seed.timeline
-        artifacts = seed.artifacts
-        approvals = seed.approvals
-        shellChannels = seed.shellChannels
-        cacheSettings = seed.cacheSettings
-        appliedCacheBackend = seed.cacheSettings.backend
-        selectedTargetID = seed.targets.first?.id
-        if let firstHash = seed.artifacts.first?.hash {
-            selectedArtifactHash = firstHash
-            artifactLookupHash = firstHash
-            artifactLookupResult = seed.artifacts.first
+    convenience init() {
+        self.init(dataSource: ManagedCoreWorkspaceDataSource())
+    }
+
+    init(dataSource: WorkspaceDataSource) {
+        self.dataSource = dataSource
+        isFixtureDataSource = dataSource is FixtureWorkspaceDataSource
+        targets = []
+        timeline = []
+        artifacts = []
+        approvals = []
+        shellChannels = []
+        appliedCacheBackend = .filesystem
+        loadInitialSnapshot()
+    }
+
+    deinit {
+        refreshTimer?.invalidate()
+        dataSource.shutdown()
+    }
+
+    var connectionStatusText: String {
+        switch coreConnectionState {
+        case .starting:
+            return L10n.t("workspace.connection.starting")
+        case .waitingForAttach:
+            return L10n.t("workspace.connection.waiting")
+        case .connected:
+            return L10n.t("workspace.connection.connected")
+        case .attachFailed(let message):
+            return L10n.f("workspace.connection.failed_format", message)
         }
+    }
+
+    private func loadInitialSnapshot() {
+        coreConnectionState = .starting
+        if !(dataSource is ManagedCoreWorkspaceDataSource) {
+            do {
+                let snapshot = try dataSource.bootstrapSnapshot()
+                applySnapshot(snapshot)
+                coreConnectionState = .connected
+            } catch {
+                coreConnectionState = .attachFailed(message(for: error))
+            }
+            return
+        }
+        let source = dataSource
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            do {
+                let snapshot = try source.bootstrapSnapshot()
+                await MainActor.run {
+                    self.applySnapshot(snapshot)
+                    self.coreConnectionState = .connected
+                    self.startRefreshTimer()
+                }
+            } catch WorkspaceDataSourceError.waitingForAttach {
+                await MainActor.run {
+                    self.coreConnectionState = .waitingForAttach
+                    self.startRefreshTimer()
+                }
+            } catch {
+                await MainActor.run {
+                    self.coreConnectionState = .attachFailed(self.message(for: error))
+                    self.startRefreshTimer()
+                }
+            }
+        }
+    }
+
+    private func startRefreshTimer() {
+        guard refreshTimer == nil else { return }
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshFromCore()
+            }
+        }
+    }
+
+    private func refreshFromCore() {
+        guard !refreshInFlight else { return }
+        refreshInFlight = true
+        let source = dataSource
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            defer {
+                Task { @MainActor in
+                    self.refreshInFlight = false
+                }
+            }
+            do {
+                let snapshot = try source.refreshSnapshot()
+                await MainActor.run {
+                    self.applySnapshot(snapshot)
+                    self.coreConnectionState = .connected
+                }
+            } catch WorkspaceDataSourceError.waitingForAttach {
+                await MainActor.run {
+                    self.coreConnectionState = .waitingForAttach
+                }
+            } catch {
+                await MainActor.run {
+                    self.coreConnectionState = .attachFailed(self.message(for: error))
+                }
+            }
+        }
+    }
+
+    private func applySnapshot(_ snapshot: WorkspaceSnapshot) {
+        targets = snapshot.targets
+        timeline = snapshot.timeline
+        artifacts = snapshot.artifacts
+        approvals = snapshot.approvals
+        shellChannels = snapshot.shellChannels
+        cacheSettings = snapshot.cacheSettings
+        appliedCacheBackend = cacheSettings.backend
+
+        if let selectedTargetID,
+           !targets.contains(where: { $0.id == selectedTargetID }) {
+            self.selectedTargetID = targets.first?.id
+        } else if self.selectedTargetID == nil {
+            self.selectedTargetID = targets.first?.id
+        }
+
+        if let selectedArtifactHash,
+           !artifacts.contains(where: { $0.hash == selectedArtifactHash }) {
+            self.selectedArtifactHash = artifacts.first?.hash
+        } else if self.selectedArtifactHash == nil {
+            self.selectedArtifactHash = artifacts.first?.hash
+        }
+
+        if let hash = selectedArtifactHash {
+            artifactLookupHash = hash
+        } else {
+            artifactLookupHash = ""
+        }
+        artifactLookupResult = selectedArtifactHash.flatMap { hash in
+            artifacts.first(where: { $0.hash == hash })
+        }
+    }
+
+    private func message(for error: WorkspaceDataSourceError) -> String {
+        switch error {
+        case .waitingForAttach:
+            return L10n.t("workspace.connection.waiting")
+        case .transport(let message):
+            return message
+        case .protocolViolation(let message):
+            return message
+        }
+    }
+
+    private func message(for error: Error) -> String {
+        if let dataSourceError = error as? WorkspaceDataSourceError {
+            return message(for: dataSourceError)
+        }
+        let nsError = error as NSError
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? WorkspaceDataSourceError {
+            return message(for: underlying)
+        }
+        return error.localizedDescription
     }
 
     var filteredTargets: [TargetProfile] {
@@ -119,14 +958,17 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func openCreateTargetSheet() {
+        guard isFixtureDataSource else { return }
         targetEditorContext = TargetEditorContext(mode: .create, draft: TargetProfileDraft())
     }
 
     func openEditTargetSheet(for target: TargetProfile) {
+        guard isFixtureDataSource else { return }
         targetEditorContext = TargetEditorContext(mode: .edit, draft: TargetProfileDraft(profile: target))
     }
 
     func saveTarget(draft: TargetProfileDraft) {
+        guard isFixtureDataSource else { return }
         let now = Date()
         if let existingID = draft.existingID,
            let index = targets.firstIndex(where: { $0.id == existingID }) {
@@ -142,6 +984,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func updateToolOverride(connectorID: String, newPath: String) {
+        guard isFixtureDataSource else { return }
         guard let selectedTargetID,
               let targetIndex = targets.firstIndex(where: { $0.id == selectedTargetID }),
               let diagIndex = targets[targetIndex].toolDiagnostics.firstIndex(where: { $0.id == connectorID }) else {
@@ -180,6 +1023,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func approve(_ request: ApprovalRequestItem) {
+        guard isFixtureDataSource else { return }
         guard let index = approvals.firstIndex(where: { $0.id == request.id }) else { return }
         approvals[index].status = .approved
 
@@ -193,6 +1037,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func reject(_ request: ApprovalRequestItem) {
+        guard isFixtureDataSource else { return }
         guard let index = approvals.firstIndex(where: { $0.id == request.id }) else { return }
         approvals[index].status = .rejected
 
@@ -206,6 +1051,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func openChannel() {
+        guard isFixtureDataSource else { return }
         guard let selectedTargetID else { return }
         let newChannel = ShellChannel(
             id: "ch-\(Int.random(in: 100...999))",
@@ -222,6 +1068,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func sendShellInput() {
+        guard isFixtureDataSource else { return }
         guard let targetID = selectedTargetID,
               let channelIndex = shellChannels.firstIndex(where: { $0.targetID == targetID }),
               !shellInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -250,6 +1097,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func interruptChannel() {
+        guard isFixtureDataSource else { return }
         guard let targetID = selectedTargetID,
               let index = shellChannels.firstIndex(where: { $0.targetID == targetID }),
               !shellChannels[index].isClosed else {
@@ -262,6 +1110,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     func closeChannel() {
+        guard isFixtureDataSource else { return }
         guard let targetID = selectedTargetID,
               let index = shellChannels.firstIndex(where: { $0.targetID == targetID }),
               !shellChannels[index].isClosed else {
@@ -323,6 +1172,22 @@ final class WorkspaceViewModel: ObservableObject {
                 CapabilitySummary(id: "approvals", title: L10n.t("capability.approvals"))
             ],
             toolDiagnostics: draft.toolDiagnostics
+        )
+    }
+
+    static func fixtureDataSource() -> WorkspaceDataSource {
+        FixtureWorkspaceDataSource(snapshot: fixtureSnapshot())
+    }
+
+    static func fixtureSnapshot() -> WorkspaceSnapshot {
+        let seed = makeSeed()
+        return WorkspaceSnapshot(
+            targets: seed.targets,
+            timeline: seed.timeline,
+            artifacts: seed.artifacts,
+            approvals: seed.approvals,
+            shellChannels: seed.shellChannels,
+            cacheSettings: seed.cacheSettings
         )
     }
 

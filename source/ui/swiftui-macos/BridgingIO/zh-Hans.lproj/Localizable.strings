@@ -190,6 +190,15 @@
 "workspace.center.select_target_hint" = "选择一个目标以查看其逻辑会话。";
 "workspace.center.session_summary_format" = "Session: %@ • %@ • %@";
 "workspace.center.timeline" = "时间线";
+"workspace.connection.connected" = "已连接到 core";
+"workspace.connection.failed_format" = "core 连接失败: %@";
+"workspace.connection.failed_title" = "core 连接失败";
+"workspace.connection.starting" = "正在启动 core";
+"workspace.connection.starting_message" = "正在拉起受托管 core 并读取启动快照。";
+"workspace.connection.starting_title" = "正在启动 core";
+"workspace.connection.waiting" = "等待 attach";
+"workspace.connection.waiting_message" = "core 已启动，正在等待 UI attach 完成。";
+"workspace.connection.waiting_title" = "等待 attach 完成";
 
 "workspace.channel.closed_by_operator" = "通道已由操作员关闭。";
 "workspace.channel.default_target_name" = "target";

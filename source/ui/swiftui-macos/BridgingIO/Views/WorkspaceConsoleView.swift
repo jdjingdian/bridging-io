@@ -58,6 +58,10 @@ struct WorkspaceConsoleView: View {
                 Text(L10n.f("workspace.toolbar.workspace_format", "local-operator"))
                     .font(ConsoleTypography.body(12))
                     .foregroundStyle(theme.muted)
+                Text(viewModel.connectionStatusText)
+                    .font(ConsoleTypography.body(11))
+                    .foregroundStyle(connectionStatusColor)
+                    .accessibilityIdentifier("workspace-connection-status")
             }
 
             Spacer(minLength: 12)
@@ -203,10 +207,14 @@ struct WorkspaceConsoleView: View {
             }
 
             Group {
-                if viewModel.centerPanel == .timeline {
-                    timelineView
+                if viewModel.coreConnectionState == .connected {
+                    if viewModel.centerPanel == .timeline {
+                        timelineView
+                    } else {
+                        shellTranscriptView
+                    }
                 } else {
-                    shellTranscriptView
+                    connectionStateView
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -616,6 +624,51 @@ struct WorkspaceConsoleView: View {
             return theme.textSecondary
         case .info:
             return theme.muted
+        }
+    }
+
+    private var connectionStatusColor: Color {
+        switch viewModel.coreConnectionState {
+        case .connected:
+            return theme.success
+        case .starting, .waitingForAttach:
+            return theme.warning
+        case .attachFailed:
+            return theme.danger
+        }
+    }
+
+    private var connectionStateView: some View {
+        EmptyStateView(
+            title: connectionStateTitle,
+            message: connectionStateMessage,
+            theme: theme
+        )
+    }
+
+    private var connectionStateTitle: String {
+        switch viewModel.coreConnectionState {
+        case .starting:
+            return L10n.t("workspace.connection.starting_title")
+        case .waitingForAttach:
+            return L10n.t("workspace.connection.waiting_title")
+        case .attachFailed:
+            return L10n.t("workspace.connection.failed_title")
+        case .connected:
+            return ""
+        }
+    }
+
+    private var connectionStateMessage: String {
+        switch viewModel.coreConnectionState {
+        case .starting:
+            return L10n.t("workspace.connection.starting_message")
+        case .waitingForAttach:
+            return L10n.t("workspace.connection.waiting_message")
+        case .attachFailed(let message):
+            return L10n.f("workspace.connection.failed_format", message)
+        case .connected:
+            return ""
         }
     }
 }

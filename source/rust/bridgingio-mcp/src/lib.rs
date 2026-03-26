@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use bridgingio_app_api::{
     ApiError, ApiErrorCode, ApiRequest, ApiResponse, AppApiLineCodec, AppCommand,
     ArtifactCacheSettingsView, ArtifactReadView, ControlPlaneView, CoreSettingsView,
-    ModelPlaneHttpView, ToolchainDiagnosticView,
+    ModelPlaneHttpView, TimelineEntry, ToolchainDiagnosticView,
 };
 use bridgingio_artifacts::{
     ArtifactCacheBackend, ArtifactEvictionPolicy, ArtifactReadResult, ArtifactRefineMode,
@@ -565,6 +565,54 @@ pub enum CoreRuntimeError {
     LockPoisoned,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreHostMode {
+    UiManagedEphemeral,
+    StandaloneRun,
+    StandaloneDetached,
+}
+
+impl CoreHostMode {
+    fn as_label(self) -> &'static str {
+        match self {
+            CoreHostMode::UiManagedEphemeral => "ui-managed-ephemeral",
+            CoreHostMode::StandaloneRun => "standalone-run",
+            CoreHostMode::StandaloneDetached => "standalone-detached",
+        }
+    }
+
+    fn requires_ui_attach(self) -> bool {
+        matches!(self, CoreHostMode::UiManagedEphemeral)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreReadinessState {
+    Starting,
+    WaitingForUiAttach,
+    Ready,
+    ShuttingDown,
+}
+
+impl CoreReadinessState {
+    fn as_label(self) -> &'static str {
+        match self {
+            CoreReadinessState::Starting => "starting",
+            CoreReadinessState::WaitingForUiAttach => "waiting_for_ui_attach",
+            CoreReadinessState::Ready => "ready",
+            CoreReadinessState::ShuttingDown => "shutting_down",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UiAttachment {
+    ui_instance_id: String,
+    ui_kind: String,
+    scope_id: String,
+    attached_at: SystemTime,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TargetCommandExecution {
     requested_target_ref: String,
@@ -637,22 +685,59 @@ struct InteractiveShellOwner {
 pub type SharedRuntime = Arc<Mutex<StandaloneCoreRuntime>>;
 
 pub struct StandaloneCoreRuntime {
+    host_mode: CoreHostMode,
+    readiness_state: CoreReadinessState,
+    attached_ui: Option<UiAttachment>,
+    shutdown_requested: bool,
     pub settings_store: CoreSettingsStore,
     pub tool_handler: McpToolHandler,
     profiles: HashMap<String, TargetProfile>,
     target_refs: HashMap<String, String>,
     sessions: HashMap<String, SessionRecord>,
     interactive_shell_owners: HashMap<String, InteractiveShellOwner>,
+    timeline: Vec<TimelineEntry>,
     next_session_seq: u64,
+    next_timeline_seq: u64,
     next_internal_artifact_seq: u64,
     toolchain_diagnostics: Vec<ToolchainDiagnosticView>,
     _vault_router: SecretVaultRouter,
 }
 
 impl StandaloneCoreRuntime {
+    pub fn from_settings_with_mode(
+        settings: CoreSettings,
+        toolchain_resolver: ToolchainResolver,
+        host_mode: CoreHostMode,
+    ) -> Result<Self, CoreRuntimeError> {
+        let initial_state = if host_mode.requires_ui_attach() {
+            CoreReadinessState::WaitingForUiAttach
+        } else {
+            CoreReadinessState::Ready
+        };
+        Self::from_settings_with_mode_and_state(
+            settings,
+            toolchain_resolver,
+            host_mode,
+            initial_state,
+        )
+    }
+
     pub fn from_settings(
         settings: CoreSettings,
         toolchain_resolver: ToolchainResolver,
+    ) -> Result<Self, CoreRuntimeError> {
+        Self::from_settings_with_mode(
+            settings,
+            toolchain_resolver,
+            CoreHostMode::StandaloneRun,
+        )
+    }
+
+    fn from_settings_with_mode_and_state(
+        settings: CoreSettings,
+        toolchain_resolver: ToolchainResolver,
+        host_mode: CoreHostMode,
+        readiness_state: CoreReadinessState,
     ) -> Result<Self, CoreRuntimeError> {
         let mut profiles = HashMap::new();
         let mut target_refs = HashMap::new();
@@ -697,13 +782,19 @@ impl StandaloneCoreRuntime {
             .map_err(|err| CoreRuntimeError::Config(err.message))?;
 
         Ok(Self {
+            host_mode,
+            readiness_state,
+            attached_ui: None,
+            shutdown_requested: false,
             settings_store: CoreSettingsStore::from_settings(settings, None),
             tool_handler: McpToolHandler::with_artifact_store(artifact_store),
             profiles,
             target_refs,
             sessions: HashMap::new(),
             interactive_shell_owners: HashMap::new(),
+            timeline: Vec::new(),
             next_session_seq: 0,
+            next_timeline_seq: 0,
             next_internal_artifact_seq: 0,
             toolchain_diagnostics: diagnostics,
             _vault_router: vault_router,
@@ -716,7 +807,11 @@ impl StandaloneCoreRuntime {
     ) -> Result<Self, CoreRuntimeError> {
         let settings = CoreSettings::load_from_file(path.as_ref())
             .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?;
-        let mut runtime = Self::from_settings(settings, toolchain_resolver)?;
+        let mut runtime = Self::from_settings_with_mode(
+            settings,
+            toolchain_resolver,
+            CoreHostMode::StandaloneRun,
+        )?;
         runtime.settings_store.runtime_metadata.config_path =
             Some(path.as_ref().to_string_lossy().to_string());
         Ok(runtime)
@@ -732,6 +827,61 @@ impl StandaloneCoreRuntime {
 
     pub fn logical_session_count(&self) -> usize {
         self.tool_handler.metadata().logical_sessions.len()
+    }
+
+    pub fn host_mode(&self) -> CoreHostMode {
+        self.host_mode
+    }
+
+    pub fn readiness_state(&self) -> CoreReadinessState {
+        self.readiness_state
+    }
+
+    pub fn readiness_state_label(&self) -> &'static str {
+        self.readiness_state.as_label()
+    }
+
+    pub fn model_plane_ready(&self) -> bool {
+        self.readiness_state == CoreReadinessState::Ready
+    }
+
+    pub fn requires_ui_attach_before_model_plane(&self) -> bool {
+        self.host_mode.requires_ui_attach()
+    }
+
+    pub fn model_plane_not_ready_reason(&self) -> Option<String> {
+        if self.requires_ui_attach_before_model_plane() && !self.model_plane_ready() {
+            return Some(self.readiness_state_label().to_string());
+        }
+        None
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    fn request_shutdown(&mut self) {
+        self.readiness_state = CoreReadinessState::ShuttingDown;
+        self.shutdown_requested = true;
+    }
+
+    fn push_timeline_entry(
+        &mut self,
+        session_id: String,
+        command_preview: String,
+        status: &str,
+        artifact_id: Option<String>,
+    ) {
+        self.next_timeline_seq += 1;
+        let entry = TimelineEntry {
+            id: format!("timeline-{:06}", self.next_timeline_seq),
+            session_id,
+            command_preview,
+            status: status.to_string(),
+            artifact_id,
+            created_at: SystemTime::now(),
+        };
+        self.timeline.push(entry);
     }
 
     fn resolve_target_profile_by_ref(&self, target_ref: &str) -> Option<TargetProfile> {
@@ -793,6 +943,13 @@ impl StandaloneCoreRuntime {
             ToolResult::ArtifactRead { view } => view.chunks,
             _ => Vec::new(),
         };
+
+        self.push_timeline_entry(
+            logical_session_id.clone(),
+            command.to_string(),
+            "success",
+            Some(artifact_id.clone()),
+        );
 
         Ok(TargetCommandExecution {
             requested_target_ref,
@@ -1095,8 +1252,401 @@ impl StandaloneCoreRuntime {
         }
     }
 
+    fn timeline_entries(&self, limit: usize) -> Vec<TimelineEntry> {
+        let mut items = self.timeline.clone();
+        items.sort_by_key(|item| std::cmp::Reverse(system_time_to_unix_millis(item.created_at)));
+        items.into_iter().take(limit).collect()
+    }
+
+    fn artifact_records(&self, limit: usize) -> Vec<ArtifactRecord> {
+        let mut items = self
+            .tool_handler
+            .metadata()
+            .artifacts
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by_key(|item| std::cmp::Reverse(system_time_to_unix_millis(item.created_at)));
+        items.into_iter().take(limit).collect()
+    }
+
+    fn interactive_shell_views(&self) -> Vec<Value> {
+        let mut views = self
+            .interactive_shell_owners
+            .iter()
+            .filter_map(|(shell_id, owner)| {
+                let state = self
+                    .tool_handler
+                    .terminal_provider
+                    .get_interactive_shell(shell_id)
+                    .ok()?;
+                Some(json!({
+                    "shell_id": state.shell_id,
+                    "target_id": owner.target_id,
+                    "logical_session_id": owner.logical_session_id,
+                    "channel_id": owner.channel_id,
+                    "prompt": state.prompt,
+                    "cwd": state.cwd,
+                    "closed": state.closed,
+                    "running": state.running,
+                }))
+            })
+            .collect::<Vec<_>>();
+        views.sort_by(|a, b| {
+            a["shell_id"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["shell_id"].as_str().unwrap_or_default())
+        });
+        views
+    }
+
+    fn timeline_payload_json(&self, limit: usize) -> String {
+        let timeline = self.timeline_json_items(limit);
+        json!({
+            "readiness_state": self.readiness_state_label(),
+            "items": timeline,
+        })
+        .to_string()
+    }
+
+    fn artifacts_payload_json(&self, limit: usize) -> String {
+        let artifacts = self.artifact_json_items(limit);
+        json!({
+            "readiness_state": self.readiness_state_label(),
+            "items": artifacts,
+        })
+        .to_string()
+    }
+
+    fn interactive_shells_payload_json(&self) -> String {
+        json!({
+            "readiness_state": self.readiness_state_label(),
+            "items": self.interactive_shell_views(),
+        })
+        .to_string()
+    }
+
+    fn bootstrap_payload_json(
+        &mut self,
+        timeline_limit: usize,
+        artifact_limit: usize,
+        transcript_limit: usize,
+    ) -> String {
+        let settings = self.settings_view();
+
+        let mut targets = self.profiles.values().cloned().collect::<Vec<_>>();
+        targets.sort_by(|a, b| a.id.cmp(&b.id));
+        let targets_json = targets
+            .into_iter()
+            .map(|target| {
+                let session = self
+                    .sessions
+                    .values()
+                    .find(|session| session.target_id == target.id);
+                let capabilities = infer_capabilities(&target.kind)
+                    .into_iter()
+                    .map(|capability| capability.id)
+                    .collect::<Vec<_>>();
+                json!({
+                    "id": target.id,
+                    "name": target.name,
+                    "kind": target_kind_label(&target.kind),
+                    "notes": target.notes,
+                    "session_id": session.as_ref().map(|s| s.id.clone()),
+                    "session_state": session.as_ref().map(|s| session_state_label(&s.state)),
+                    "capability_ids": capabilities,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut sessions = self.sessions.values().cloned().collect::<Vec<_>>();
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        let sessions_json = sessions
+            .into_iter()
+            .map(|session| {
+                json!({
+                    "id": session.id,
+                    "target_id": session.target_id,
+                    "state": session_state_label(&session.state),
+                    "started_at_ms": system_time_to_unix_millis(session.started_at),
+                    "last_activity_at_ms": system_time_to_unix_millis(session.last_activity_at),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut approvals = self
+            .tool_handler
+            .metadata()
+            .approvals
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        approvals.sort_by(|a, b| a.id.cmp(&b.id));
+        let approvals_json = approvals
+            .into_iter()
+            .map(|approval| {
+                json!({
+                    "id": approval.id,
+                    "logical_session_id": approval.logical_session_id,
+                    "channel_id": approval.channel_id,
+                    "session_id": approval.session_id,
+                    "command_preview": approval.command_preview,
+                    "reason": approval.reason,
+                    "status": approval_status_label(&approval.status),
+                    "requested_at_ms": system_time_to_unix_millis(approval.requested_at),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let diagnostics = self
+            .toolchain_diagnostics
+            .iter()
+            .map(|diag| {
+                json!({
+                    "command": diag.command,
+                    "selected_source": diag.selected_source,
+                    "selected_path": diag.selected_path,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let shell_channels = self.interactive_shell_views();
+        let transcripts = shell_channels
+            .iter()
+            .filter_map(|shell| shell["shell_id"].as_str())
+            .filter_map(|shell_id| {
+                self.tool_handler
+                    .terminal_provider
+                    .read_interactive_transcript(shell_id, 0, transcript_limit)
+                    .ok()
+                    .map(|lines| {
+                        json!({
+                            "shell_id": shell_id,
+                            "offset": 0,
+                            "limit": transcript_limit,
+                            "lines": lines,
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "host_mode": self.host_mode.as_label(),
+            "readiness_state": self.readiness_state_label(),
+            "model_plane_ready": self.model_plane_ready(),
+            "targets": targets_json,
+            "sessions": sessions_json,
+            "approvals": approvals_json,
+            "settings": {
+                "schema_version": settings.schema_version,
+                "instance_name": settings.instance_name,
+                "data_dir": settings.data_dir,
+                "model_plane_http": {
+                    "host": settings.model_plane_http.host,
+                    "port": settings.model_plane_http.port,
+                    "allow_non_loopback": settings.model_plane_http.allow_non_loopback,
+                    "auth_mode": settings.model_plane_http.auth_mode,
+                },
+                "control_plane": {
+                    "enabled": settings.control_plane.enabled,
+                    "transport": settings.control_plane.transport,
+                    "endpoint": settings.control_plane.endpoint,
+                },
+                "artifact_cache": {
+                    "backend": settings.artifact_cache.backend,
+                    "root": settings.artifact_cache.root,
+                    "max_bytes": settings.artifact_cache.max_bytes,
+                    "eviction_policy": settings.artifact_cache.eviction_policy,
+                    "used_bytes": settings.artifact_cache.used_bytes,
+                    "artifact_count": settings.artifact_cache.artifact_count,
+                }
+            },
+            "diagnostics": diagnostics,
+            "timeline": self.timeline_json_items(timeline_limit),
+            "artifacts": self.artifact_json_items(artifact_limit),
+            "shell_channels": shell_channels,
+            "transcripts": transcripts,
+        })
+        .to_string()
+    }
+
+    fn timeline_json_items(&self, limit: usize) -> Vec<Value> {
+        self.timeline_entries(limit)
+            .into_iter()
+            .map(|entry| {
+                let target_id = self
+                    .sessions
+                    .get(&entry.session_id)
+                    .map(|session| session.target_id.clone());
+                json!({
+                    "id": entry.id,
+                    "session_id": entry.session_id,
+                    "target_id": target_id,
+                    "command_preview": entry.command_preview,
+                    "status": entry.status,
+                    "artifact_id": entry.artifact_id,
+                    "created_at_ms": system_time_to_unix_millis(entry.created_at),
+                })
+            })
+            .collect()
+    }
+
+    fn artifact_json_items(&self, limit: usize) -> Vec<Value> {
+        self.artifact_records(limit)
+            .into_iter()
+            .map(|record| {
+                json!({
+                    "id": record.id,
+                    "content_digest": record.content_digest,
+                    "logical_session_id": record.logical_session_id,
+                    "channel_id": record.channel_id,
+                    "session_id": record.session_id,
+                    "parent_id": record.parent_id,
+                    "source_command": record.source_command,
+                    "summary": record.summary,
+                    "line_count": record.line_count,
+                    "created_at_ms": system_time_to_unix_millis(record.created_at),
+                })
+            })
+            .collect()
+    }
+
     pub fn handle_app_request(&mut self, request: ApiRequest) -> ApiResponse {
         match request.command {
+            AppCommand::AttachUi {
+                ui_instance_id,
+                ui_kind,
+            } => {
+                if !self.host_mode.requires_ui_attach() {
+                    return ApiResponse::Attached {
+                        request_id: request.request_id,
+                        readiness_state: self.readiness_state_label().to_string(),
+                        model_plane_ready: self.model_plane_ready(),
+                    };
+                }
+
+                let scope_id = format!(
+                    "scope:{}:{}:{}",
+                    request.context.agent_id,
+                    request.context.run_id,
+                    request.context.client_session_id
+                );
+                if let Some(existing) = self.attached_ui.as_ref() {
+                    if existing.ui_instance_id != ui_instance_id {
+                        return error_response(
+                            request.request_id,
+                            ApiErrorCode::ValidationFailed,
+                            "another ui instance already attached",
+                        );
+                    }
+                }
+
+                self.attached_ui = Some(UiAttachment {
+                    ui_instance_id,
+                    ui_kind,
+                    scope_id,
+                    attached_at: SystemTime::now(),
+                });
+                self.readiness_state = CoreReadinessState::Ready;
+                ApiResponse::Attached {
+                    request_id: request.request_id,
+                    readiness_state: self.readiness_state_label().to_string(),
+                    model_plane_ready: self.model_plane_ready(),
+                }
+            }
+            AppCommand::GetBootstrapState {
+                timeline_limit,
+                artifact_limit,
+                transcript_limit,
+            } => ApiResponse::Bootstrap {
+                request_id: request.request_id,
+                payload_json: self.bootstrap_payload_json(
+                    timeline_limit,
+                    artifact_limit,
+                    transcript_limit,
+                ),
+            },
+            AppCommand::GetTimeline { limit } => ApiResponse::Timeline {
+                request_id: request.request_id,
+                payload_json: self.timeline_payload_json(limit),
+            },
+            AppCommand::GetArtifacts { limit } => ApiResponse::ArtifactsSnapshot {
+                request_id: request.request_id,
+                payload_json: self.artifacts_payload_json(limit),
+            },
+            AppCommand::ListInteractiveShells => ApiResponse::InteractiveShells {
+                request_id: request.request_id,
+                payload_json: self.interactive_shells_payload_json(),
+            },
+            AppCommand::ReadInteractiveTranscript {
+                shell_id,
+                offset,
+                limit,
+            } => {
+                let context = ToolRequestContext {
+                    agent_id: request.context.agent_id,
+                    run_id: request.context.run_id,
+                    client_session_id: request.context.client_session_id,
+                    reuse_policy: request.context.reuse_policy,
+                };
+                let owner = match self.ensure_interactive_shell_access(&shell_id, &context) {
+                    Ok(owner) => owner,
+                    Err(CoreRuntimeError::Config(message)) => {
+                        return error_response(
+                            request.request_id,
+                            ApiErrorCode::PermissionDenied,
+                            &message,
+                        );
+                    }
+                    Err(err) => {
+                        return error_response(
+                            request.request_id,
+                            ApiErrorCode::Internal,
+                            &format!("{err:?}"),
+                        );
+                    }
+                };
+                let lines = match self
+                    .tool_handler
+                    .terminal_provider
+                    .read_interactive_transcript(&shell_id, offset, limit)
+                {
+                    Ok(lines) => lines,
+                    Err(err) => {
+                        return error_response(
+                            request.request_id,
+                            ApiErrorCode::NotFound,
+                            &err.message,
+                        );
+                    }
+                };
+                ApiResponse::InteractiveTranscript {
+                    request_id: request.request_id,
+                    shell_id,
+                    offset,
+                    limit,
+                    payload_json: json!({
+                        "logical_session_id": owner.logical_session_id,
+                        "channel_id": owner.channel_id,
+                        "lines": lines,
+                    })
+                    .to_string(),
+                }
+            }
+            AppCommand::RequestShutdown => {
+                if !self.host_mode.requires_ui_attach() {
+                    return error_response(
+                        request.request_id,
+                        ApiErrorCode::ValidationFailed,
+                        "shutdown command is reserved for ui-managed mode",
+                    );
+                }
+                self.request_shutdown();
+                ApiResponse::ShutdownAccepted {
+                    request_id: request.request_id,
+                }
+            }
             AppCommand::ListTargets | AppCommand::ListProfiles => {
                 let mut items = self.profiles.values().cloned().collect::<Vec<_>>();
                 items.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1202,6 +1752,7 @@ impl StandaloneCoreRuntime {
                     }
                 };
                 let artifact_id = format!("ipc-artifact-{}", request.request_id);
+                let command_preview = command.clone();
                 let result = self.tool_handler.handle(ToolRequest::TerminalExec {
                     target_id: target.id.clone(),
                     target_kind: target.kind.clone(),
@@ -1215,7 +1766,17 @@ impl StandaloneCoreRuntime {
                     artifact_id,
                 });
                 match result {
-                    ToolResult::Execution { artifact_id, .. } => {
+                    ToolResult::Execution {
+                        artifact_id,
+                        logical_session_id,
+                        ..
+                    } => {
+                        self.push_timeline_entry(
+                            logical_session_id,
+                            command_preview.clone(),
+                            "success",
+                            Some(artifact_id.clone()),
+                        );
                         match self.tool_handler.metadata().artifacts.get(&artifact_id) {
                             Some(artifact) => ApiResponse::Execution {
                                 request_id: request.request_id,
@@ -1229,9 +1790,16 @@ impl StandaloneCoreRuntime {
                         }
                     }
                     ToolResult::ApprovalRequired { reason } => {
+                        self.push_timeline_entry(
+                            session_id,
+                            command_preview.clone(),
+                            "waiting_approval",
+                            None,
+                        );
                         error_response(request.request_id, ApiErrorCode::PermissionDenied, &reason)
                     }
                     ToolResult::Error { message } => {
+                        self.push_timeline_entry(session_id, command_preview, "failed", None);
                         error_response(request.request_id, ApiErrorCode::Internal, &message)
                     }
                     _ => error_response(
@@ -1330,6 +1898,31 @@ fn target_kind_label(kind: &TargetKind) -> String {
         TargetKind::Docker => "docker".to_string(),
         TargetKind::Other(value) => value.clone(),
     }
+}
+
+fn session_state_label(state: &SessionState) -> &'static str {
+    match state {
+        SessionState::Connecting => "connecting",
+        SessionState::Connected => "connected",
+        SessionState::Degraded => "degraded",
+        SessionState::Failed => "failed",
+        SessionState::Closed => "closed",
+    }
+}
+
+fn approval_status_label(status: &bridgingio_domain::ApprovalStatus) -> &'static str {
+    match status {
+        bridgingio_domain::ApprovalStatus::Pending => "pending",
+        bridgingio_domain::ApprovalStatus::Approved => "approved",
+        bridgingio_domain::ApprovalStatus::Denied => "denied",
+        bridgingio_domain::ApprovalStatus::Expired => "expired",
+    }
+}
+
+fn system_time_to_unix_millis(ts: SystemTime) -> u128 {
+    ts.duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn build_connector_command(target: &TargetProfile, command: &str) -> String {
@@ -1681,6 +2274,16 @@ fn handle_http_connection(
         }
         ("POST", "/mcp") => handle_mcp_http_request(runtime, &body)?,
         ("POST", "/tool/terminal.exec") => {
+            if let Some(reason) = {
+                let runtime = runtime.lock().map_err(|_| CoreRuntimeError::LockPoisoned)?;
+                runtime.model_plane_not_ready_reason()
+            } {
+                (
+                    503,
+                    "text/plain",
+                    format!("result=not_ready|reason={reason}"),
+                )
+            } else {
             let params = parse_kv_body(&body);
             let mut runtime = runtime.lock().map_err(|_| CoreRuntimeError::LockPoisoned)?;
             let target_ref = optional_param(&params, "target_ref")
@@ -1728,6 +2331,7 @@ fn handle_http_connection(
                     format!("result=error|message={err:?}"),
                 ),
             }
+            }
         }
         _ => (404, "text/plain", "not found".to_string()),
     };
@@ -1746,6 +2350,22 @@ fn handle_mcp_http_request(
     runtime: &SharedRuntime,
     body: &str,
 ) -> Result<(u16, &'static str, String), CoreRuntimeError> {
+    let not_ready_reason = {
+        let runtime = runtime.lock().map_err(|_| CoreRuntimeError::LockPoisoned)?;
+        runtime.model_plane_not_ready_reason()
+    };
+    if let Some(reason) = not_ready_reason {
+        let id = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| value.get("id").cloned())
+            .unwrap_or(Value::Null);
+        return Ok((
+            503,
+            "application/json",
+            jsonrpc_error(id, -32001, &format!("model plane not ready: {reason}")),
+        ));
+    }
+
     let request_value: Value = match serde_json::from_str(body) {
         Ok(value) => value,
         Err(err) => {
@@ -3024,6 +3644,7 @@ fn write_http_response(
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     let response = format!(

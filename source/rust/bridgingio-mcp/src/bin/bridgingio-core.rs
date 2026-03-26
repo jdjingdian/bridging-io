@@ -1,5 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -7,13 +8,24 @@ use bridgingio_connectors::{
     BuiltInBinarySpec, BuiltInDistributionKind, ExecutableResolver, ToolchainResolver,
 };
 use bridgingio_engine::CoreSettings;
-use bridgingio_mcp::{control_plane_socket_path, ModelPlaneHttpServer, StandaloneCoreRuntime};
+use bridgingio_mcp::{
+    control_plane_socket_path, CoreHostMode, ModelPlaneHttpServer, StandaloneCoreRuntime,
+};
 
 #[cfg(unix)]
 use bridgingio_mcp::ControlPlaneIpcServer;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchMode {
+    UiManagedEphemeral,
+    StandaloneRun,
+    StandaloneDetachedLauncher,
+    StandaloneDetachedChild,
+}
+
 struct CliArgs {
     config_path: PathBuf,
+    mode: LaunchMode,
 }
 
 fn main() {
@@ -33,12 +45,22 @@ fn main() {
 }
 
 fn run(args: CliArgs) -> Result<(), String> {
+    match args.mode {
+        LaunchMode::StandaloneDetachedLauncher => spawn_detached_child(&args.config_path),
+        LaunchMode::UiManagedEphemeral => run_core(args, CoreHostMode::UiManagedEphemeral),
+        LaunchMode::StandaloneRun => run_core(args, CoreHostMode::StandaloneRun),
+        LaunchMode::StandaloneDetachedChild => run_core(args, CoreHostMode::StandaloneDetached),
+    }
+}
+
+fn run_core(args: CliArgs, host_mode: CoreHostMode) -> Result<(), String> {
     let settings = CoreSettings::load_from_file(&args.config_path)
         .map_err(|err| format!("invalid config: {err:?}"))?;
     let toolchain_resolver = default_toolchain_resolver(&settings, &args.config_path);
-    let runtime = StandaloneCoreRuntime::from_settings(settings.clone(), toolchain_resolver)
-        .map_err(|err| format!("{err:?}"))?
-        .shared();
+    let runtime =
+        StandaloneCoreRuntime::from_settings_with_mode(settings.clone(), toolchain_resolver, host_mode)
+            .map_err(|err| format!("{err:?}"))?
+            .shared();
 
     let mut handles = Vec::new();
     if mcp_trace_enabled() {
@@ -96,10 +118,55 @@ fn run(args: CliArgs) -> Result<(), String> {
         return Err("no endpoint enabled (both control-plane and model-plane are disabled)".into());
     }
 
-    println!("bridgingio-core started. press Ctrl+C to stop.");
-    loop {
-        thread::sleep(Duration::from_secs(60));
+    let startup_state = {
+        let runtime = runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned at startup".to_string())?;
+        runtime.readiness_state_label().to_string()
+    };
+    println!(
+        "bridgingio-core started in mode={:?} (host_mode={:?}, readiness={})",
+        args.mode, host_mode, startup_state
+    );
+    if host_mode == CoreHostMode::UiManagedEphemeral {
+        println!("waiting for ui attach before model-plane becomes ready");
+    } else {
+        println!("model-plane is ready immediately in standalone mode");
     }
+
+    loop {
+        thread::sleep(Duration::from_millis(300));
+        let shutdown_requested = {
+            let runtime = runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned while polling shutdown".to_string())?;
+            runtime.shutdown_requested()
+        };
+        if shutdown_requested {
+            println!("shutdown requested from control-plane, exiting core process");
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn spawn_detached_child(config_path: &Path) -> Result<(), String> {
+    let exe = env::current_exe().map_err(|err| format!("resolve current_exe failed: {err}"))?;
+    let child = Command::new(exe)
+        .arg("run")
+        .arg("--config")
+        .arg(config_path)
+        .arg("--detached-child")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("spawn detached child failed: {err}"))?;
+    println!(
+        "bridgingio-core detached in background (pid={})",
+        child.id()
+    );
+    Ok(())
 }
 
 fn mcp_trace_enabled() -> bool {
@@ -135,13 +202,25 @@ fn default_toolchain_resolver(settings: &CoreSettings, config_path: &Path) -> To
 }
 
 fn parse_args() -> Result<CliArgs, String> {
-    let mut args = env::args().skip(1);
-    let mut config_path = None::<PathBuf>;
+    parse_args_from(env::args().skip(1))
+}
 
-    while let Some(arg) = args.next() {
+fn parse_args_from<I>(args: I) -> Result<CliArgs, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut mode = LaunchMode::StandaloneRun;
+    let mut config_path = None::<PathBuf>;
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "run" => mode = LaunchMode::StandaloneRun,
+            "ui-managed-ephemeral" => mode = LaunchMode::UiManagedEphemeral,
+            "-d" => mode = LaunchMode::StandaloneDetachedLauncher,
+            "--detached-child" => mode = LaunchMode::StandaloneDetachedChild,
             "--config" => {
-                let path = args
+                let path = iter
                     .next()
                     .ok_or_else(|| "--config requires a path".to_string())?;
                 config_path = Some(PathBuf::from(path));
@@ -158,9 +237,46 @@ fn parse_args() -> Result<CliArgs, String> {
 
     let config_path =
         config_path.ok_or_else(|| "missing required argument: --config <path>".to_string())?;
-    Ok(CliArgs { config_path })
+    Ok(CliArgs { config_path, mode })
 }
 
 fn print_usage() {
-    eprintln!("usage: bridgingio-core --config <path-to-standalone.toml>");
+    eprintln!("usage:");
+    eprintln!("  bridgingio-core run --config <path-to-standalone.toml>");
+    eprintln!("  bridgingio-core -d --config <path-to-standalone.toml>");
+    eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-standalone.toml>");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_args_from, LaunchMode};
+
+    fn parse(items: &[&str]) -> LaunchMode {
+        let args = items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        parse_args_from(args).expect("parse").mode
+    }
+
+    #[test]
+    fn parses_default_as_standalone_run() {
+        assert_eq!(
+            parse(&["--config", "/tmp/standalone.toml"]),
+            LaunchMode::StandaloneRun
+        );
+    }
+
+    #[test]
+    fn parses_detached_mode() {
+        assert_eq!(
+            parse(&["-d", "--config", "/tmp/standalone.toml"]),
+            LaunchMode::StandaloneDetachedLauncher
+        );
+    }
+
+    #[test]
+    fn parses_ui_managed_mode() {
+        assert_eq!(
+            parse(&["ui-managed-ephemeral", "--config", "/tmp/standalone.toml"]),
+            LaunchMode::UiManagedEphemeral
+        );
+    }
 }
