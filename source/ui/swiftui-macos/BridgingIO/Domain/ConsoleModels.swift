@@ -13,17 +13,17 @@ enum TargetKind: String, CaseIterable, Identifiable, Codable {
     var title: String {
         switch self {
         case .ssh:
-            return "SSH"
+            return L10n.t("target_kind.ssh")
         case .adb:
-            return "ADB"
+            return L10n.t("target_kind.adb")
         case .serial:
-            return "Serial"
+            return L10n.t("target_kind.serial")
         case .docker:
-            return "Docker"
+            return L10n.t("target_kind.docker")
         case .httpDebug:
-            return "HTTP"
+            return L10n.t("target_kind.http")
         case .openGrok:
-            return "OpenGrok"
+            return L10n.t("target_kind.opengrok")
         }
     }
 
@@ -52,7 +52,16 @@ enum TargetConnectionState: String, CaseIterable, Codable {
     case disconnected
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .connected:
+            return L10n.t("target_connection_state.connected")
+        case .idle:
+            return L10n.t("target_connection_state.idle")
+        case .degraded:
+            return L10n.t("target_connection_state.degraded")
+        case .disconnected:
+            return L10n.t("target_connection_state.disconnected")
+        }
     }
 }
 
@@ -63,7 +72,16 @@ enum SessionState: String, CaseIterable, Codable {
     case closed
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .active:
+            return L10n.t("session_state.active")
+        case .waiting:
+            return L10n.t("session_state.waiting")
+        case .degraded:
+            return L10n.t("session_state.degraded")
+        case .closed:
+            return L10n.t("session_state.closed")
+        }
     }
 }
 
@@ -75,10 +93,14 @@ enum CommandExecutionState: String, CaseIterable, Codable {
 
     var title: String {
         switch self {
+        case .success:
+            return L10n.t("command_execution_state.success")
+        case .streaming:
+            return L10n.t("command_execution_state.streaming")
         case .waitingApproval:
-            return "Approval"
-        default:
-            return rawValue.capitalized
+            return L10n.t("command_execution_state.approval")
+        case .failed:
+            return L10n.t("command_execution_state.failed")
         }
     }
 }
@@ -90,7 +112,16 @@ enum ApprovalStatus: String, CaseIterable, Codable {
     case failed
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .pending:
+            return L10n.t("approval_status.pending")
+        case .approved:
+            return L10n.t("approval_status.approved")
+        case .rejected:
+            return L10n.t("approval_status.rejected")
+        case .failed:
+            return L10n.t("approval_status.failed")
+        }
     }
 }
 
@@ -102,11 +133,11 @@ enum ToolSourceType: String, CaseIterable, Codable {
     var title: String {
         switch self {
         case .userOverride:
-            return "User Override"
+            return L10n.t("tool_source_type.user_override")
         case .systemPath:
-            return "System PATH"
+            return L10n.t("tool_source_type.system_path")
         case .bundledFallback:
-            return "Bundled Fallback"
+            return L10n.t("tool_source_type.bundled_fallback")
         }
     }
 }
@@ -118,7 +149,12 @@ enum ArtifactCacheBackend: String, CaseIterable, Identifiable, Codable {
     var id: String { rawValue }
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .memory:
+            return L10n.t("artifact_cache_backend.memory")
+        case .filesystem:
+            return L10n.t("artifact_cache_backend.filesystem")
+        }
     }
 }
 
@@ -129,7 +165,12 @@ enum ArtifactEvictionPolicy: String, CaseIterable, Identifiable, Codable {
     var id: String { rawValue }
 
     var title: String {
-        rawValue.uppercased()
+        switch self {
+        case .lru:
+            return L10n.t("artifact_eviction_policy.lru")
+        case .fifo:
+            return L10n.t("artifact_eviction_policy.fifo")
+        }
     }
 }
 
@@ -143,11 +184,11 @@ enum TargetFilter: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .all:
-            return "All"
+            return L10n.t("target_filter.all")
         case .ssh:
-            return "SSH"
+            return L10n.t("target_filter.ssh")
         case .adb:
-            return "ADB"
+            return L10n.t("target_filter.adb")
         }
     }
 
@@ -170,7 +211,12 @@ enum WorkspaceCenterPanel: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .timeline:
+            return L10n.t("workspace_center_panel.timeline")
+        case .transcript:
+            return L10n.t("workspace_center_panel.transcript")
+        }
     }
 }
 
@@ -419,7 +465,7 @@ struct TargetProfileDraft: Equatable {
                 id: "adb",
                 connectorName: "adb",
                 sourceType: .bundledFallback,
-                effectivePath: "BridgingIO bundle",
+                effectivePath: L10n.t("seed.tool.effective_path.bridgingio_bundle"),
                 overridePath: "",
                 lastChecked: .now
             )
@@ -434,9 +480,9 @@ enum TargetEditorMode {
     var title: String {
         switch self {
         case .create:
-            return "New Target"
+            return L10n.t("target_editor.mode.create")
         case .edit:
-            return "Edit Target"
+            return L10n.t("target_editor.mode.edit")
         }
     }
 }

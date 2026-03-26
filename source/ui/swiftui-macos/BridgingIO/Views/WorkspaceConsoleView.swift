@@ -52,10 +52,10 @@ struct WorkspaceConsoleView: View {
     private var workspaceToolbar: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("BridgingIO")
+                Text(L10n.t("branding.product_name"))
                     .font(ConsoleTypography.heading(17, weight: .bold))
                     .foregroundStyle(theme.textPrimary)
-                Text("Workspace: local-operator")
+                Text(L10n.f("workspace.toolbar.workspace_format", "local-operator"))
                     .font(ConsoleTypography.body(12))
                     .foregroundStyle(theme.muted)
             }
@@ -63,7 +63,7 @@ struct WorkspaceConsoleView: View {
             Spacer(minLength: 12)
 
             ConsoleIconTextInput(
-                placeholder: "Search targets / commands",
+                placeholder: L10n.t("workspace.search.placeholder"),
                 text: $viewModel.searchQuery,
                 icon: "magnifyingglass",
                 theme: theme,
@@ -83,7 +83,7 @@ struct WorkspaceConsoleView: View {
             Button {
                 viewModel.openCreateTargetSheet()
             } label: {
-                Label("New Target", systemImage: "plus")
+                Label(L10n.t("workspace.toolbar.new_target"), systemImage: "plus")
             }
             .consoleButton(theme: theme, tone: .primary)
             .accessibilityIdentifier("toolbar-new-target")
@@ -91,7 +91,7 @@ struct WorkspaceConsoleView: View {
             Button {
                 viewModel.openChannel()
             } label: {
-                Label("Open Session", systemImage: "terminal")
+                Label(L10n.t("workspace.toolbar.open_session"), systemImage: "terminal")
             }
             .consoleButton(theme: theme, tone: .secondary)
             .accessibilityIdentifier("toolbar-open-session")
@@ -99,7 +99,7 @@ struct WorkspaceConsoleView: View {
             Button {
                 viewModel.isShowingSettingsSheet = true
             } label: {
-                Label("Settings", systemImage: "gearshape")
+                Label(L10n.t("workspace.toolbar.settings"), systemImage: "gearshape")
             }
             .consoleButton(theme: theme, tone: .subtle)
             .accessibilityIdentifier("toolbar-open-settings")
@@ -111,7 +111,7 @@ struct WorkspaceConsoleView: View {
 
     private var targetSidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Targets")
+            Text(L10n.t("workspace.sidebar.targets"))
                 .font(ConsoleTypography.heading(14, weight: .semibold))
                 .foregroundStyle(theme.textPrimary)
 
@@ -141,7 +141,7 @@ struct WorkspaceConsoleView: View {
             Button {
                 viewModel.openCreateTargetSheet()
             } label: {
-                Label("Create Target", systemImage: "plus.circle")
+                Label(L10n.t("workspace.sidebar.create_target"), systemImage: "plus.circle")
                     .frame(maxWidth: .infinity)
             }
             .consoleButton(theme: theme, tone: .primary)
@@ -152,7 +152,7 @@ struct WorkspaceConsoleView: View {
                     viewModel.openEditTargetSheet(for: target)
                 }
             } label: {
-                Label("Edit Selected", systemImage: "square.and.pencil")
+                Label(L10n.t("workspace.sidebar.edit_selected"), systemImage: "square.and.pencil")
                     .frame(maxWidth: .infinity)
             }
             .consoleButton(theme: theme, tone: .secondary)
@@ -162,7 +162,7 @@ struct WorkspaceConsoleView: View {
             Button {
                 viewModel.isShowingSettingsSheet = true
             } label: {
-                Label("Open Settings", systemImage: "slider.horizontal.3")
+                Label(L10n.t("workspace.sidebar.open_settings"), systemImage: "slider.horizontal.3")
                     .frame(maxWidth: .infinity)
             }
             .consoleButton(theme: theme, tone: .subtle)
@@ -175,16 +175,16 @@ struct WorkspaceConsoleView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Timeline")
+                    Text(L10n.t("workspace.center.timeline"))
                         .font(ConsoleTypography.heading(14, weight: .semibold))
                         .foregroundStyle(theme.textPrimary)
                     if let target = viewModel.selectedTarget {
-                        Text("Session: \(target.sessionSummary.logicalSessionID) • \(target.name) • \(target.sessionSummary.state.title)")
+                        Text(L10n.f("workspace.center.session_summary_format", target.sessionSummary.logicalSessionID, target.name, target.sessionSummary.state.title))
                             .font(ConsoleTypography.body(12))
                             .foregroundStyle(theme.muted)
                             .accessibilityIdentifier("center-session-summary")
                     } else {
-                        Text("Select a target to inspect its logical session.")
+                        Text(L10n.t("workspace.center.select_target_hint"))
                             .font(ConsoleTypography.body(12))
                             .foregroundStyle(theme.muted)
                     }
@@ -220,8 +220,8 @@ struct WorkspaceConsoleView: View {
             VStack(spacing: 10) {
                 if viewModel.selectedTimelineItems.isEmpty {
                     EmptyStateView(
-                        title: "No Timeline Events",
-                        message: "Select a target to inspect command cards and linked artifacts.",
+                        title: L10n.t("workspace.empty.timeline.title"),
+                        message: L10n.t("workspace.empty.timeline.message"),
                         theme: theme
                     )
                 } else {
@@ -243,14 +243,14 @@ struct WorkspaceConsoleView: View {
     private var shellTranscriptView: some View {
         VStack(spacing: 10) {
             HStack {
-                Text("Transcript")
+                Text(L10n.t("workspace.transcript.title"))
                     .font(ConsoleTypography.heading(13, weight: .semibold))
                     .foregroundStyle(theme.textPrimary)
                 Spacer()
                 Button {
                     viewModel.openChannel()
                 } label: {
-                    Label("Open Channel", systemImage: "plus")
+                    Label(L10n.t("workspace.transcript.open_channel"), systemImage: "plus")
                 }
                 .consoleButton(theme: theme, tone: .secondary)
                 .accessibilityIdentifier("transcript-open-channel")
@@ -277,23 +277,23 @@ struct WorkspaceConsoleView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10))
 
                 HStack(spacing: 8) {
-                    TextField("Send input to channel", text: $viewModel.shellInput)
+                    TextField(L10n.t("workspace.transcript.input_placeholder"), text: $viewModel.shellInput)
                         .consoleInput(theme: theme, surface: .panel)
                         .accessibilityIdentifier("transcript-input")
 
-                    Button("Send") {
+                    Button(L10n.t("workspace.transcript.send")) {
                         viewModel.sendShellInput()
                     }
                     .consoleButton(theme: theme, tone: .primary)
                     .accessibilityIdentifier("transcript-send")
 
-                    Button("Interrupt") {
+                    Button(L10n.t("workspace.transcript.interrupt")) {
                         viewModel.interruptChannel()
                     }
                     .consoleButton(theme: theme, tone: .subtle)
                     .accessibilityIdentifier("transcript-interrupt")
 
-                    Button("Close") {
+                    Button(L10n.t("workspace.transcript.close")) {
                         viewModel.closeChannel()
                     }
                     .consoleButton(theme: theme, tone: .secondary)
@@ -301,8 +301,8 @@ struct WorkspaceConsoleView: View {
                 }
             } else {
                 EmptyStateView(
-                    title: "No Channel",
-                    message: "Open a shell channel to review prompt/output and send input.",
+                    title: L10n.t("workspace.empty.channel.title"),
+                    message: L10n.t("workspace.empty.channel.message"),
                     theme: theme
                 )
             }
@@ -326,7 +326,7 @@ struct WorkspaceConsoleView: View {
     }
 
     private var sessionCard: some View {
-        ConsoleCard(title: "Session State", theme: theme) {
+        ConsoleCard(title: L10n.t("workspace.card.session_state"), theme: theme) {
             if let target = viewModel.selectedTarget {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -340,27 +340,27 @@ struct WorkspaceConsoleView: View {
                         )
                     }
 
-                    Text("\(target.sessionSummary.fingerprint.osVersion) • \(target.sessionSummary.fingerprint.architecture)")
+                    Text(L10n.f("workspace.session.os_arch_format", target.sessionSummary.fingerprint.osVersion, target.sessionSummary.fingerprint.architecture))
                         .font(ConsoleTypography.body(12))
                         .foregroundStyle(theme.textSecondary)
 
-                    Text("shell: \(target.sessionSummary.fingerprint.shell)")
+                    Text(L10n.f("workspace.session.shell_format", target.sessionSummary.fingerprint.shell))
                         .font(ConsoleTypography.body(12))
                         .foregroundStyle(theme.muted)
 
-                    Text("last active: \(target.lastActivity.formatted(date: .omitted, time: .shortened))")
+                    Text(L10n.f("workspace.session.last_active_format", target.lastActivity.formatted(date: .omitted, time: .shortened)))
                         .font(ConsoleTypography.body(12))
                         .foregroundStyle(theme.muted)
                         .accessibilityIdentifier("session-last-active")
                 }
             } else {
-                EmptyStateInline(theme: theme, message: "Select target")
+                EmptyStateInline(theme: theme, message: L10n.t("workspace.empty.select_target"))
             }
         }
     }
 
     private var capabilitiesCard: some View {
-        ConsoleCard(title: "Capabilities", theme: theme) {
+        ConsoleCard(title: L10n.t("workspace.card.capabilities"), theme: theme) {
             if let target = viewModel.selectedTarget {
                 FlowLayout(spacing: 8, lineSpacing: 8) {
                     ForEach(target.capabilities) { capability in
@@ -368,15 +368,15 @@ struct WorkspaceConsoleView: View {
                     }
                 }
             } else {
-                EmptyStateInline(theme: theme, message: "No capability data")
+                EmptyStateInline(theme: theme, message: L10n.t("workspace.empty.no_capability_data"))
             }
         }
     }
 
     private var approvalQueueCard: some View {
-        ConsoleCard(title: "Approval Queue", theme: theme) {
+        ConsoleCard(title: L10n.t("workspace.card.approval_queue"), theme: theme) {
             if viewModel.selectedApprovals.isEmpty {
-                EmptyStateInline(theme: theme, message: "No pending approvals")
+                EmptyStateInline(theme: theme, message: L10n.t("workspace.empty.no_pending_approvals"))
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(viewModel.selectedApprovals) { approval in
@@ -399,13 +399,13 @@ struct WorkspaceConsoleView: View {
 
                             if approval.status == .pending {
                                 HStack(spacing: 8) {
-                                    Button("Approve") {
+                                    Button(L10n.t("workspace.approval.approve")) {
                                         viewModel.approve(approval)
                                     }
                                     .consoleButton(theme: theme, tone: .primary)
                                     .accessibilityIdentifier("approval-approve")
 
-                                    Button("Reject") {
+                                    Button(L10n.t("workspace.approval.reject")) {
                                         viewModel.reject(approval)
                                     }
                                     .consoleButton(theme: theme, tone: .danger)
@@ -427,7 +427,7 @@ struct WorkspaceConsoleView: View {
     }
 
     private var toolSourceCard: some View {
-        ConsoleCard(title: "Tool Sources", theme: theme) {
+        ConsoleCard(title: L10n.t("workspace.card.tool_sources"), theme: theme) {
             if let target = viewModel.selectedTarget {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(target.toolDiagnostics) { diagnostic in
@@ -442,12 +442,12 @@ struct WorkspaceConsoleView: View {
                                     .foregroundStyle(theme.muted)
                             }
 
-                            Text("effective: \(diagnostic.effectivePath)")
+                            Text(L10n.f("workspace.tool.effective_path_format", diagnostic.effectivePath))
                                 .font(ConsoleTypography.body(12))
                                 .foregroundStyle(theme.textSecondary)
 
                             TextField(
-                                "Override path",
+                                L10n.t("workspace.tool.override_path_placeholder"),
                                 text: Binding(
                                     get: { diagnostic.overridePath },
                                     set: { viewModel.updateToolOverride(connectorID: diagnostic.id, newPath: $0) }
@@ -466,20 +466,20 @@ struct WorkspaceConsoleView: View {
                     }
                 }
             } else {
-                EmptyStateInline(theme: theme, message: "No diagnostics")
+                EmptyStateInline(theme: theme, message: L10n.t("workspace.empty.no_diagnostics"))
             }
         }
     }
 
     private var artifactHashLookupCard: some View {
-        ConsoleCard(title: "Artifact Hash Lookup", theme: theme) {
+        ConsoleCard(title: L10n.t("workspace.card.artifact_hash_lookup"), theme: theme) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    TextField("artifact hash prefix", text: $viewModel.artifactLookupHash)
+                    TextField(L10n.t("workspace.artifact.lookup_placeholder"), text: $viewModel.artifactLookupHash)
                         .consoleInput(theme: theme, surface: .panel)
                         .accessibilityIdentifier("artifact-hash-input")
 
-                    Button("Lookup") {
+                    Button(L10n.t("workspace.artifact.lookup_action")) {
                         viewModel.lookupArtifactByHash()
                     }
                     .consoleButton(theme: theme, tone: .primary)
@@ -488,15 +488,15 @@ struct WorkspaceConsoleView: View {
 
                 if let result = viewModel.artifactLookupResult {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("hash: \(result.hash)")
+                        Text(L10n.f("workspace.artifact.hash_format", result.hash))
                             .accessibilityIdentifier("artifact-hash-result")
-                        Text("session: \(result.sessionID) • channel: \(result.channelID)")
-                        Text("source: \(result.sourceCommand)")
+                        Text(L10n.f("workspace.artifact.session_channel_format", result.sessionID, result.channelID))
+                        Text(L10n.f("workspace.artifact.source_format", result.sourceCommand))
                     }
                     .font(ConsoleTypography.body(11))
                     .foregroundStyle(theme.textSecondary)
                 } else {
-                    Text("No match")
+                    Text(L10n.t("workspace.artifact.no_match"))
                         .font(ConsoleTypography.body(11))
                         .foregroundStyle(theme.muted)
                 }
@@ -505,7 +505,7 @@ struct WorkspaceConsoleView: View {
     }
 
     private var cacheSettingsCard: some View {
-        ConsoleCard(title: "Artifact Cache", theme: theme) {
+        ConsoleCard(title: L10n.t("workspace.card.artifact_cache"), theme: theme) {
             VStack(alignment: .leading, spacing: 10) {
                 ConsoleSegmentedControl(
                     selection: Binding(
@@ -518,11 +518,11 @@ struct WorkspaceConsoleView: View {
                 )
                 .accessibilityIdentifier("cache-backend-picker")
 
-                TextField("Root path", text: $viewModel.cacheSettings.rootPath)
+                TextField(L10n.t("workspace.cache.root_path_placeholder"), text: $viewModel.cacheSettings.rootPath)
                     .consoleInput(theme: theme, surface: .panel)
 
                 HStack {
-                    Text("Max cache")
+                    Text(L10n.t("workspace.cache.max_cache"))
                         .font(ConsoleTypography.body(12))
                         .foregroundStyle(theme.textSecondary)
                     Spacer()
@@ -531,7 +531,7 @@ struct WorkspaceConsoleView: View {
                         in: 256...8192,
                         step: 128
                     ) {
-                        Text("\(viewModel.cacheSettings.maxCacheMB) MB")
+                        Text(L10n.f("workspace.cache.max_cache_value_format", viewModel.cacheSettings.maxCacheMB))
                             .font(ConsoleTypography.body(12))
                             .foregroundStyle(theme.textPrimary)
                     }
@@ -550,25 +550,25 @@ struct WorkspaceConsoleView: View {
                 )
                 .tint(theme.info)
 
-                Text("Used: \(viewModel.cacheSettings.usedCacheMB) MB")
+                Text(L10n.f("workspace.cache.used_value_format", viewModel.cacheSettings.usedCacheMB))
                     .font(ConsoleTypography.body(11))
                     .foregroundStyle(theme.muted)
 
                 if viewModel.cacheSettingsNeedRestart {
-                    Text("Restart core required to apply backend switch.")
+                    Text(L10n.t("workspace.cache.restart_required"))
                         .font(ConsoleTypography.body(11))
                         .foregroundStyle(theme.warning)
                         .accessibilityIdentifier("cache-restart-warning")
                 }
 
                 HStack(spacing: 8) {
-                    Button("Apply") {
+                    Button(L10n.t("workspace.cache.apply")) {
                         viewModel.applyCacheSettings()
                     }
                     .consoleButton(theme: theme, tone: .primary)
                     .accessibilityIdentifier("cache-apply")
 
-                    Button("Clear") {
+                    Button(L10n.t("workspace.cache.clear")) {
                         viewModel.clearArtifactCache()
                     }
                     .consoleButton(theme: theme, tone: .secondary)
@@ -650,7 +650,7 @@ private struct TargetRowView: View {
                         .font(ConsoleTypography.body(11))
                         .foregroundStyle(theme.textSecondary)
                     Spacer()
-                    Text("alias: \(target.aliasForModel)")
+                    Text(L10n.f("workspace.target.alias_format", target.aliasForModel))
                         .font(ConsoleTypography.body(11))
                         .foregroundStyle(theme.muted)
                 }
@@ -671,7 +671,7 @@ private struct TargetRowView: View {
         .buttonStyle(.plain)
         .accessibilityIdentifier(target.accessibilityID)
         .contextMenu {
-            Button("Edit Target") {
+            Button(L10n.t("workspace.target.context.edit_target")) {
                 onEdit()
             }
         }
@@ -723,7 +723,7 @@ private struct TimelineCardView: View {
             if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {
                     if !item.stdoutPreview.isEmpty {
-                        Text("stdout")
+                        Text(L10n.t("workspace.timeline.stdout"))
                             .font(ConsoleTypography.heading(11))
                             .foregroundStyle(theme.muted)
                         Text(item.stdoutPreview)
@@ -732,7 +732,7 @@ private struct TimelineCardView: View {
                     }
 
                     if !item.stderrPreview.isEmpty {
-                        Text("stderr")
+                        Text(L10n.t("workspace.timeline.stderr"))
                             .font(ConsoleTypography.heading(11))
                             .foregroundStyle(theme.warning)
                         Text(item.stderrPreview)
@@ -743,7 +743,7 @@ private struct TimelineCardView: View {
             }
 
             HStack(spacing: 8) {
-                Text("exit: \(item.exitStatus)")
+                Text(L10n.f("workspace.timeline.exit_format", item.exitStatus))
                     .font(ConsoleTypography.body(11))
                     .foregroundStyle(theme.muted)
 
@@ -756,7 +756,7 @@ private struct TimelineCardView: View {
 
                 Spacer()
 
-                Button(isExpanded ? "Collapse" : "Expand") {
+                Button(isExpanded ? L10n.t("workspace.action.collapse") : L10n.t("workspace.action.expand")) {
                     withAnimation(.easeInOut(duration: 0.18)) {
                         isExpanded.toggle()
                     }
@@ -793,8 +793,8 @@ private struct ArtifactDrawerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("Artifact Drawer")
+                HStack {
+                Text(L10n.t("workspace.drawer.title"))
                     .font(ConsoleTypography.heading(13, weight: .semibold))
                     .foregroundStyle(theme.textPrimary)
 
@@ -806,7 +806,7 @@ private struct ArtifactDrawerView: View {
                         .foregroundStyle(theme.info)
                 }
 
-                Button(viewModel.artifactDrawerExpanded ? "Collapse" : "Expand") {
+                Button(viewModel.artifactDrawerExpanded ? L10n.t("workspace.action.collapse") : L10n.t("workspace.action.expand")) {
                     withAnimation(.easeInOut(duration: 0.18)) {
                         viewModel.artifactDrawerExpanded.toggle()
                     }
@@ -823,12 +823,12 @@ private struct ArtifactDrawerView: View {
 
                 HStack(alignment: .top, spacing: 14) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Preview")
+                        Text(L10n.t("workspace.drawer.preview"))
                             .font(ConsoleTypography.heading(12, weight: .semibold))
                             .foregroundStyle(theme.textPrimary)
 
                         ScrollView {
-                            Text(viewModel.refinedArtifactText.isEmpty ? "Select an artifact to preview." : viewModel.refinedArtifactText)
+                            Text(viewModel.refinedArtifactText.isEmpty ? L10n.t("workspace.drawer.preview_empty") : viewModel.refinedArtifactText)
                                 .font(ConsoleTypography.heading(11, weight: .regular))
                                 .foregroundStyle(theme.textSecondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -845,29 +845,29 @@ private struct ArtifactDrawerView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Refine")
+                        Text(L10n.t("workspace.drawer.refine"))
                             .font(ConsoleTypography.heading(12, weight: .semibold))
                             .foregroundStyle(theme.textPrimary)
 
-                        TextField("keyword", text: $viewModel.refineKeyword)
+                        TextField(L10n.t("workspace.drawer.keyword_placeholder"), text: $viewModel.refineKeyword)
                             .consoleInput(theme: theme, surface: .elevated)
 
                         HStack {
-                            Stepper("from \(viewModel.refineRangeStart)", value: $viewModel.refineRangeStart, in: 1...9999)
-                            Stepper("to \(viewModel.refineRangeEnd)", value: $viewModel.refineRangeEnd, in: 1...9999)
+                            Stepper(L10n.f("workspace.drawer.range_from_format", viewModel.refineRangeStart), value: $viewModel.refineRangeStart, in: 1...9999)
+                            Stepper(L10n.f("workspace.drawer.range_to_format", viewModel.refineRangeEnd), value: $viewModel.refineRangeEnd, in: 1...9999)
                         }
                         .font(ConsoleTypography.body(11))
                         .foregroundStyle(theme.textSecondary)
 
                         if let artifact = viewModel.selectedArtifact {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("source: \(artifact.sourceCommand)")
-                                Text("session: \(artifact.sessionID) / channel: \(artifact.channelID)")
+                                Text(L10n.f("workspace.drawer.source_format", artifact.sourceCommand))
+                                Text(L10n.f("workspace.drawer.session_channel_format", artifact.sessionID, artifact.channelID))
                                 if !artifact.parentHashes.isEmpty {
-                                    Text("parents: \(artifact.parentHashes.joined(separator: ", "))")
+                                    Text(L10n.f("workspace.drawer.parents_format", artifact.parentHashes.joined(separator: ", ")))
                                 }
                                 if !artifact.derivedHashes.isEmpty {
-                                    Text("derived: \(artifact.derivedHashes.joined(separator: ", "))")
+                                    Text(L10n.f("workspace.drawer.derived_format", artifact.derivedHashes.joined(separator: ", ")))
                                 }
                             }
                             .font(ConsoleTypography.body(11))

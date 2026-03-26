@@ -19,7 +19,7 @@ final class TargetEditorViewModel: ObservableObject {
     }
 
     var actionTitle: String {
-        mode == .create ? "Create Target" : "Save Changes"
+        mode == .create ? L10n.t("target_editor.action.create") : L10n.t("target_editor.action.save")
     }
 
     func applyConnectorOverride(for diagnosticID: String, path: String) {
@@ -43,49 +43,49 @@ final class TargetEditorViewModel: ObservableObject {
     func validate() -> Bool {
         let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
         if name.isEmpty {
-            validationMessage = "Target name is required."
+            validationMessage = L10n.t("validation.target_name_required")
             return false
         }
 
         let alias = draft.aliasForModel.trimmingCharacters(in: .whitespacesAndNewlines)
         if alias.isEmpty {
-            validationMessage = "Alias for model is required."
+            validationMessage = L10n.t("validation.target_alias_required")
             return false
         }
 
         switch draft.kind {
         case .ssh:
             if draft.sshConfig.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                validationMessage = "SSH host is required."
+                validationMessage = L10n.t("validation.ssh_host_required")
                 return false
             }
             if draft.sshConfig.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                validationMessage = "SSH username is required."
+                validationMessage = L10n.t("validation.ssh_username_required")
                 return false
             }
         case .adb:
             if draft.adbConfig.serial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                validationMessage = "ADB serial is required."
+                validationMessage = L10n.t("validation.adb_serial_required")
                 return false
             }
         case .serial:
             if draft.serialConfig.devicePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                validationMessage = "Serial device path is required."
+                validationMessage = L10n.t("validation.serial_device_path_required")
                 return false
             }
         case .docker:
             if draft.dockerConfig.containerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                validationMessage = "Docker container name is required."
+                validationMessage = L10n.t("validation.docker_container_required")
                 return false
             }
         case .httpDebug:
             if draft.httpDebugConfig.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                validationMessage = "HTTP base URL is required."
+                validationMessage = L10n.t("validation.http_base_url_required")
                 return false
             }
         case .openGrok:
             if draft.openGrokConfig.endpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                validationMessage = "OpenGrok endpoint is required."
+                validationMessage = L10n.t("validation.opengrok_endpoint_required")
                 return false
             }
         }

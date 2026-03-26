@@ -1,0 +1,257 @@
+"appearance.mode.system" = "Auto";
+"appearance.mode.light" = "Light";
+"appearance.mode.dark" = "Dark";
+
+"approval_status.pending" = "Pending";
+"approval_status.approved" = "Approved";
+"approval_status.rejected" = "Rejected";
+"approval_status.failed" = "Failed";
+
+"artifact_cache_backend.memory" = "Memory";
+"artifact_cache_backend.filesystem" = "Filesystem";
+"artifact_eviction_policy.lru" = "LRU";
+"artifact_eviction_policy.fifo" = "FIFO";
+
+"branding.product_name" = "Bridging IO";
+
+"capability.terminal" = "Terminal";
+"capability.artifacts" = "Artifacts";
+"capability.approvals" = "Approvals";
+"capability.git" = "Git";
+
+"command_execution_state.success" = "Success";
+"command_execution_state.streaming" = "Streaming";
+"command_execution_state.approval" = "Approval";
+"command_execution_state.failed" = "Failed";
+
+"seed.approval.delete_on_prod.reason" = "Delete on production target requires operator confirmation.";
+"seed.artifact.adb_fingerprint.summary" = "ADB fingerprint output";
+"seed.artifact.approval_context.summary" = "Approval context for delete command";
+"seed.artifact.log_slice.summary" = "Log slice with warnings";
+"seed.artifact.status.summary" = "Status output snapshot";
+"seed.channel.title.adb_shell" = "ADB shell";
+"seed.target.lab.notes" = "Staging runner host";
+"seed.target.ops.notes" = "Production bastion host";
+"seed.target.pixel.notes" = "QA device";
+"seed.timeline.adb_fingerprint.summary" = "Collected environment fingerprint for Android device.";
+"seed.timeline.git_status.summary" = "Repository clean with one local change in docs/.";
+"seed.timeline.rm_release.stderr" = "Operation classified as delete + production target.";
+"seed.timeline.rm_release.summary" = "Waiting operator approval for delete operation.";
+"seed.timeline.tail_log.summary" = "Streaming logs with warnings around payment sync.";
+"seed.tool.effective_path.bridgingio_bundle" = "Bridging IO bundle";
+
+"session_state.active" = "Active";
+"session_state.waiting" = "Waiting";
+"session_state.degraded" = "Degraded";
+"session_state.closed" = "Closed";
+
+"settings.title" = "Settings";
+"settings.done" = "Done";
+"settings.appearance" = "Appearance";
+"settings.artifact_cache" = "Artifact Cache";
+"settings.cache.root_path_placeholder" = "Root path";
+"settings.cache.max_value_format" = "Max %d MB";
+"settings.cache.used_value_format" = "Used %d MB";
+"settings.apply" = "Apply";
+"settings.clear_cache" = "Clear Cache";
+"settings.cache.restart_hint" = "Backend switch requires core restart to fully apply.";
+
+"target_connection_state.connected" = "Connected";
+"target_connection_state.idle" = "Idle";
+"target_connection_state.degraded" = "Degraded";
+"target_connection_state.disconnected" = "Disconnected";
+
+"target_editor.action.create" = "Create Target";
+"target_editor.action.save" = "Save Changes";
+"target_editor.mode.create" = "New Target";
+"target_editor.mode.edit" = "Edit Target";
+
+"target_filter.all" = "All";
+"target_filter.ssh" = "SSH";
+"target_filter.adb" = "ADB";
+
+"target_kind.ssh" = "SSH";
+"target_kind.adb" = "ADB";
+"target_kind.serial" = "Serial";
+"target_kind.docker" = "Docker";
+"target_kind.http" = "HTTP";
+"target_kind.opengrok" = "OpenGrok";
+
+"target_sheet.cancel" = "Cancel";
+"target_sheet.subtitle.structured_editor" = "Structured target profile editor";
+"target_sheet.target_types" = "Target Types";
+
+"target_sheet.section.general" = "General";
+"target_sheet.section.connection" = "Connection";
+"target_sheet.section.credential" = "Credential";
+"target_sheet.section.tooling" = "Tooling";
+"target_sheet.section.policy" = "Policy";
+
+"target_sheet.field.name" = "Name";
+"target_sheet.field.alias_for_model" = "Alias for model";
+"target_sheet.field.notes" = "Notes";
+"target_sheet.field.host" = "Host";
+"target_sheet.field.port" = "Port";
+"target_sheet.field.username" = "Username";
+"target_sheet.field.serial" = "Serial";
+"target_sheet.field.transport" = "Transport";
+"target_sheet.field.device_path" = "Device path";
+"target_sheet.field.baud_rate" = "Baud rate";
+"target_sheet.field.container" = "Container";
+"target_sheet.field.context" = "Context";
+"target_sheet.field.shell_preference" = "Shell preference";
+"target_sheet.field.base_url" = "Base URL";
+"target_sheet.field.auth_reference" = "Auth reference";
+"target_sheet.field.environment" = "Environment";
+"target_sheet.field.headers_preset" = "Headers preset";
+"target_sheet.field.endpoint" = "Endpoint";
+"target_sheet.field.repository_scope" = "Repository scope";
+"target_sheet.field.token_reference" = "Token reference";
+"target_sheet.field.query_scope" = "Query scope";
+"target_sheet.field.credential_reference" = "Credential reference";
+
+"target_sheet.placeholder.name" = "ops-prod";
+"target_sheet.placeholder.alias_for_model" = "prod-bastion";
+"target_sheet.placeholder.notes" = "production jump host";
+"target_sheet.placeholder.host" = "10.0.0.8";
+"target_sheet.placeholder.username" = "ops";
+"target_sheet.placeholder.serial" = "ABC12345";
+"target_sheet.placeholder.transport" = "usb";
+"target_sheet.placeholder.device_path" = "/dev/tty.usbmodem0";
+"target_sheet.placeholder.container" = "bridge-agent";
+"target_sheet.placeholder.context" = "default";
+"target_sheet.placeholder.shell_preference" = "/bin/sh";
+"target_sheet.placeholder.base_url" = "https://api.example.com";
+"target_sheet.placeholder.auth_reference" = "vault:http-auth:dev";
+"target_sheet.placeholder.environment" = "dev";
+"target_sheet.placeholder.headers_preset" = "json";
+"target_sheet.placeholder.endpoint" = "https://grok.example.com";
+"target_sheet.placeholder.repository_scope" = "bridgingio/*";
+"target_sheet.placeholder.token_reference" = "vault:grok-token:default";
+"target_sheet.placeholder.query_scope" = "default";
+"target_sheet.placeholder.credential_reference" = "vault:ssh-key:ops-prod";
+
+"target_sheet.import" = "Import";
+"target_sheet.reveal_in_vault" = "Reveal in Vault";
+
+"target_sheet.policy.approve_write" = "Approve write";
+"target_sheet.policy.approve_delete" = "Approve delete";
+"target_sheet.policy.approve_sudo" = "Approve sudo";
+"target_sheet.policy.approve_sensitive_read" = "Approve sensitive read";
+
+"target_sheet.helper.ssh" = "Host key and tool source diagnostics stay visible for SSH.";
+"target_sheet.helper.adb" = "Use serial and transport to avoid device routing ambiguity.";
+"target_sheet.helper.serial" = "Validate path and baud-rate before opening channels.";
+"target_sheet.helper.docker" = "Container and context should resolve before opening a shell.";
+"target_sheet.helper.http" = "Auth uses references only; no secret values shown here.";
+"target_sheet.helper.opengrok" = "Endpoint and repo scope define searchable index boundaries.";
+
+"tool_source_type.user_override" = "User Override";
+"tool_source_type.system_path" = "System PATH";
+"tool_source_type.bundled_fallback" = "Bundled Fallback";
+
+"validation.target_name_required" = "Target name is required.";
+"validation.target_alias_required" = "Alias for model is required.";
+"validation.ssh_host_required" = "SSH host is required.";
+"validation.ssh_username_required" = "SSH username is required.";
+"validation.adb_serial_required" = "ADB serial is required.";
+"validation.serial_device_path_required" = "Serial device path is required.";
+"validation.docker_container_required" = "Docker container name is required.";
+"validation.http_base_url_required" = "HTTP base URL is required.";
+"validation.opengrok_endpoint_required" = "OpenGrok endpoint is required.";
+
+"workspace.action.collapse" = "Collapse";
+"workspace.action.expand" = "Expand";
+"workspace.approval.approve" = "Approve";
+"workspace.approval.reject" = "Reject";
+
+"workspace.artifact.hash_format" = "hash: %@";
+"workspace.artifact.lookup_action" = "Lookup";
+"workspace.artifact.lookup_placeholder" = "artifact hash prefix";
+"workspace.artifact.no_match" = "No match";
+"workspace.artifact.session_channel_format" = "session: %@ • channel: %@";
+"workspace.artifact.source_format" = "source: %@";
+
+"workspace.cache.apply" = "Apply";
+"workspace.cache.clear" = "Clear";
+"workspace.cache.max_cache" = "Max cache";
+"workspace.cache.max_cache_value_format" = "%d MB";
+"workspace.cache.restart_required" = "Restart core required to apply backend switch.";
+"workspace.cache.root_path_placeholder" = "Root path";
+"workspace.cache.used_value_format" = "Used: %d MB";
+
+"workspace.card.approval_queue" = "Approval Queue";
+"workspace.card.artifact_cache" = "Artifact Cache";
+"workspace.card.artifact_hash_lookup" = "Artifact Hash Lookup";
+"workspace.card.capabilities" = "Capabilities";
+"workspace.card.session_state" = "Session State";
+"workspace.card.tool_sources" = "Tool Sources";
+
+"workspace.center.select_target_hint" = "Select a target to inspect its logical session.";
+"workspace.center.session_summary_format" = "Session: %@ • %@ • %@";
+"workspace.center.timeline" = "Timeline";
+
+"workspace.channel.closed_by_operator" = "Channel closed by operator.";
+"workspace.channel.default_target_name" = "target";
+"workspace.channel.executed_on_format" = "Executed \"%@\" on %@";
+"workspace.channel.opened_attached" = "Channel opened and attached to logical session.";
+"workspace.channel.sigint_sent" = "SIGINT sent to active process.";
+"workspace.channel.title.interactive_shell" = "Interactive shell";
+
+"workspace.drawer.derived_format" = "derived: %@";
+"workspace.drawer.keyword_placeholder" = "keyword";
+"workspace.drawer.parents_format" = "parents: %@";
+"workspace.drawer.preview" = "Preview";
+"workspace.drawer.preview_empty" = "Select an artifact to preview.";
+"workspace.drawer.range_from_format" = "from %d";
+"workspace.drawer.range_to_format" = "to %d";
+"workspace.drawer.refine" = "Refine";
+"workspace.drawer.session_channel_format" = "session: %@ / channel: %@";
+"workspace.drawer.source_format" = "source: %@";
+"workspace.drawer.title" = "Artifact Drawer";
+
+"workspace.empty.channel.message" = "Open a shell channel to review prompt/output and send input.";
+"workspace.empty.channel.title" = "No Channel";
+"workspace.empty.no_capability_data" = "No capability data";
+"workspace.empty.no_diagnostics" = "No diagnostics";
+"workspace.empty.no_pending_approvals" = "No pending approvals";
+"workspace.empty.select_target" = "Select target";
+"workspace.empty.timeline.message" = "Select a target to inspect command cards and linked artifacts.";
+"workspace.empty.timeline.title" = "No Timeline Events";
+
+"workspace.search.placeholder" = "Search targets / commands";
+"workspace.session.last_active_format" = "last active: %@";
+"workspace.session.os_arch_format" = "%@ • %@";
+"workspace.session.shell_format" = "shell: %@";
+
+"workspace.sidebar.create_target" = "Create Target";
+"workspace.sidebar.edit_selected" = "Edit Selected";
+"workspace.sidebar.open_settings" = "Open Settings";
+"workspace.sidebar.targets" = "Targets";
+
+"workspace.target.alias_format" = "alias: %@";
+"workspace.target.context.edit_target" = "Edit Target";
+
+"workspace.timeline.exit_format" = "exit: %d";
+"workspace.timeline.stderr" = "stderr";
+"workspace.timeline.stdout" = "stdout";
+"workspace.timeline.summary.operator_approved" = "Operator approved, command completed successfully.";
+"workspace.timeline.summary.operator_rejected" = "Operator rejected request, execution was blocked.";
+
+"workspace.tool.effective_path_format" = "effective: %@";
+"workspace.tool.override_path_placeholder" = "Override path";
+
+"workspace.toolbar.new_target" = "New Target";
+"workspace.toolbar.open_session" = "Open Session";
+"workspace.toolbar.settings" = "Settings";
+"workspace.toolbar.workspace_format" = "Workspace: %@";
+
+"workspace.transcript.close" = "Close";
+"workspace.transcript.input_placeholder" = "Send input to channel";
+"workspace.transcript.interrupt" = "Interrupt";
+"workspace.transcript.open_channel" = "Open Channel";
+"workspace.transcript.send" = "Send";
+"workspace.transcript.title" = "Transcript";
+
+"workspace_center_panel.timeline" = "Timeline";
+"workspace_center_panel.transcript" = "Transcript";

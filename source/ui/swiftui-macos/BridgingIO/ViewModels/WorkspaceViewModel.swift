@@ -187,7 +187,7 @@ final class WorkspaceViewModel: ObservableObject {
             $0.targetID == request.targetID && $0.command.contains(request.commandSummary)
         }) {
             timeline[timelineIndex].state = .success
-            timeline[timelineIndex].summary = "Operator approved, command completed successfully."
+            timeline[timelineIndex].summary = L10n.t("workspace.timeline.summary.operator_approved")
             timeline[timelineIndex].exitStatus = 0
         }
     }
@@ -200,7 +200,7 @@ final class WorkspaceViewModel: ObservableObject {
             $0.targetID == request.targetID && $0.command.contains(request.commandSummary)
         }) {
             timeline[timelineIndex].state = .failed
-            timeline[timelineIndex].summary = "Operator rejected request, execution was blocked."
+            timeline[timelineIndex].summary = L10n.t("workspace.timeline.summary.operator_rejected")
             timeline[timelineIndex].exitStatus = 126
         }
     }
@@ -210,11 +210,11 @@ final class WorkspaceViewModel: ObservableObject {
         let newChannel = ShellChannel(
             id: "ch-\(Int.random(in: 100...999))",
             targetID: selectedTargetID,
-            title: "Interactive shell",
+            title: L10n.t("workspace.channel.title.interactive_shell"),
             prompt: "ops@host$",
             isClosed: false,
             lines: [
-                ShellLine(id: UUID(), role: .info, content: "Channel opened and attached to logical session.", timestamp: .now)
+                ShellLine(id: UUID(), role: .info, content: L10n.t("workspace.channel.opened_attached"), timestamp: .now)
             ]
         )
         shellChannels.insert(newChannel, at: 0)
@@ -238,7 +238,11 @@ final class WorkspaceViewModel: ObservableObject {
             ShellLine(
                 id: UUID(),
                 role: .output,
-                content: "Executed \"\(input)\" on \(targets.first(where: { $0.id == targetID })?.name ?? "target")",
+                content: L10n.f(
+                    "workspace.channel.executed_on_format",
+                    input,
+                    targets.first(where: { $0.id == targetID })?.name ?? L10n.t("workspace.channel.default_target_name")
+                ),
                 timestamp: .now
             )
         )
@@ -253,7 +257,7 @@ final class WorkspaceViewModel: ObservableObject {
         }
 
         shellChannels[index].lines.append(
-            ShellLine(id: UUID(), role: .info, content: "SIGINT sent to active process.", timestamp: .now)
+            ShellLine(id: UUID(), role: .info, content: L10n.t("workspace.channel.sigint_sent"), timestamp: .now)
         )
     }
 
@@ -266,7 +270,7 @@ final class WorkspaceViewModel: ObservableObject {
 
         shellChannels[index].isClosed = true
         shellChannels[index].lines.append(
-            ShellLine(id: UUID(), role: .info, content: "Channel closed by operator.", timestamp: .now)
+            ShellLine(id: UUID(), role: .info, content: L10n.t("workspace.channel.closed_by_operator"), timestamp: .now)
         )
     }
 
@@ -314,9 +318,9 @@ final class WorkspaceViewModel: ObservableObject {
                 )
             ),
             capabilities: [
-                CapabilitySummary(id: "terminal", title: "terminal"),
-                CapabilitySummary(id: "artifacts", title: "artifacts"),
-                CapabilitySummary(id: "approvals", title: "approvals")
+                CapabilitySummary(id: "terminal", title: L10n.t("capability.terminal")),
+                CapabilitySummary(id: "artifacts", title: L10n.t("capability.artifacts")),
+                CapabilitySummary(id: "approvals", title: L10n.t("capability.approvals"))
             ],
             toolDiagnostics: draft.toolDiagnostics
         )
@@ -341,7 +345,7 @@ final class WorkspaceViewModel: ObservableObject {
                 name: "ops-prod",
                 kind: .ssh,
                 aliasForModel: "prod",
-                notes: "Production bastion host",
+                notes: L10n.t("seed.target.ops.notes"),
                 credentialReference: "vault:ssh-key:ops-prod",
                 policyDefaults: .default,
                 sshConfig: SSHConnectionConfig(host: "10.0.0.8", port: 22, username: "ops"),
@@ -365,10 +369,10 @@ final class WorkspaceViewModel: ObservableObject {
                     )
                 ),
                 capabilities: [
-                    CapabilitySummary(id: "terminal", title: "terminal"),
-                    CapabilitySummary(id: "git", title: "git"),
-                    CapabilitySummary(id: "artifacts", title: "artifacts"),
-                    CapabilitySummary(id: "approvals", title: "approvals")
+                    CapabilitySummary(id: "terminal", title: L10n.t("capability.terminal")),
+                    CapabilitySummary(id: "git", title: L10n.t("capability.git")),
+                    CapabilitySummary(id: "artifacts", title: L10n.t("capability.artifacts")),
+                    CapabilitySummary(id: "approvals", title: L10n.t("capability.approvals"))
                 ],
                 toolDiagnostics: [
                     ToolSourceDiagnostic(
@@ -383,7 +387,7 @@ final class WorkspaceViewModel: ObservableObject {
                         id: "adb",
                         connectorName: "adb",
                         sourceType: .bundledFallback,
-                        effectivePath: "BridgingIO bundle",
+                        effectivePath: L10n.t("seed.tool.effective_path.bridgingio_bundle"),
                         overridePath: "",
                         lastChecked: now.addingTimeInterval(-30)
                     )
@@ -394,7 +398,7 @@ final class WorkspaceViewModel: ObservableObject {
                 name: "pixel-8",
                 kind: .adb,
                 aliasForModel: "android-main",
-                notes: "QA device",
+                notes: L10n.t("seed.target.pixel.notes"),
                 credentialReference: "vault:adb-key:pixel8",
                 policyDefaults: .default,
                 sshConfig: .empty,
@@ -418,15 +422,15 @@ final class WorkspaceViewModel: ObservableObject {
                     )
                 ),
                 capabilities: [
-                    CapabilitySummary(id: "terminal", title: "terminal"),
-                    CapabilitySummary(id: "artifacts", title: "artifacts")
+                    CapabilitySummary(id: "terminal", title: L10n.t("capability.terminal")),
+                    CapabilitySummary(id: "artifacts", title: L10n.t("capability.artifacts"))
                 ],
                 toolDiagnostics: [
                     ToolSourceDiagnostic(
                         id: "adb",
                         connectorName: "adb",
                         sourceType: .bundledFallback,
-                        effectivePath: "BridgingIO bundle",
+                        effectivePath: L10n.t("seed.tool.effective_path.bridgingio_bundle"),
                         overridePath: "",
                         lastChecked: now.addingTimeInterval(-90)
                     )
@@ -437,7 +441,7 @@ final class WorkspaceViewModel: ObservableObject {
                 name: "lab-host",
                 kind: .ssh,
                 aliasForModel: "lab",
-                notes: "Staging runner host",
+                notes: L10n.t("seed.target.lab.notes"),
                 credentialReference: "vault:ssh-key:lab-host",
                 policyDefaults: .default,
                 sshConfig: SSHConnectionConfig(host: "10.0.1.12", port: 22, username: "bridge"),
@@ -461,8 +465,8 @@ final class WorkspaceViewModel: ObservableObject {
                     )
                 ),
                 capabilities: [
-                    CapabilitySummary(id: "terminal", title: "terminal"),
-                    CapabilitySummary(id: "artifacts", title: "artifacts")
+                    CapabilitySummary(id: "terminal", title: L10n.t("capability.terminal")),
+                    CapabilitySummary(id: "artifacts", title: L10n.t("capability.artifacts"))
                 ],
                 toolDiagnostics: [
                     ToolSourceDiagnostic(
@@ -485,7 +489,7 @@ final class WorkspaceViewModel: ObservableObject {
                 channelID: "ch-main",
                 timestamp: now.addingTimeInterval(-120),
                 command: "git status",
-                summary: "Repository clean with one local change in docs/.",
+                summary: L10n.t("seed.timeline.git_status.summary"),
                 state: .success,
                 stdoutPreview: "On branch main\\nnothing to commit, working tree clean",
                 stderrPreview: "",
@@ -501,7 +505,7 @@ final class WorkspaceViewModel: ObservableObject {
                 channelID: "ch-main",
                 timestamp: now.addingTimeInterval(-70),
                 command: "tail -n 200 /var/log/app.log",
-                summary: "Streaming logs with warnings around payment sync.",
+                summary: L10n.t("seed.timeline.tail_log.summary"),
                 state: .streaming,
                 stdoutPreview: "[warn] payment sync retry in 3s...",
                 stderrPreview: "",
@@ -517,10 +521,10 @@ final class WorkspaceViewModel: ObservableObject {
                 channelID: "ch-main",
                 timestamp: now.addingTimeInterval(-32),
                 command: "rm release.apk",
-                summary: "Waiting operator approval for delete operation.",
+                summary: L10n.t("seed.timeline.rm_release.summary"),
                 state: .waitingApproval,
                 stdoutPreview: "",
-                stderrPreview: "Operation classified as delete + production target.",
+                stderrPreview: L10n.t("seed.timeline.rm_release.stderr"),
                 exitStatus: 0,
                 artifacts: [
                     ArtifactReference(id: "art-b7d332", hash: "b7d33219afc0", label: "art-b7d332")
@@ -533,7 +537,7 @@ final class WorkspaceViewModel: ObservableObject {
                 channelID: "ch-adb",
                 timestamp: now.addingTimeInterval(-160),
                 command: "adb shell getprop ro.build.fingerprint",
-                summary: "Collected environment fingerprint for Android device.",
+                summary: L10n.t("seed.timeline.adb_fingerprint.summary"),
                 state: .success,
                 stdoutPreview: "google/pixel/pixel8:15/...",
                 stderrPreview: "",
@@ -549,7 +553,7 @@ final class WorkspaceViewModel: ObservableObject {
                 hash: "8cf4e2a1d7b2",
                 contentDigest: "sha256:5de6f9...",
                 sourceCommand: "git status",
-                summary: "Status output snapshot",
+                summary: L10n.t("seed.artifact.status.summary"),
                 sessionID: "ls-ops-prod",
                 channelID: "ch-main",
                 parentHashes: [],
@@ -560,7 +564,7 @@ final class WorkspaceViewModel: ObservableObject {
                 hash: "0af9219be2d1",
                 contentDigest: "sha256:ba9122...",
                 sourceCommand: "tail -n 200 /var/log/app.log",
-                summary: "Log slice with warnings",
+                summary: L10n.t("seed.artifact.log_slice.summary"),
                 sessionID: "ls-ops-prod",
                 channelID: "ch-main",
                 parentHashes: ["8cf4e2a1d7b2"],
@@ -571,7 +575,7 @@ final class WorkspaceViewModel: ObservableObject {
                 hash: "b7d33219afc0",
                 contentDigest: "sha256:9f1ac3...",
                 sourceCommand: "rm release.apk",
-                summary: "Approval context for delete command",
+                summary: L10n.t("seed.artifact.approval_context.summary"),
                 sessionID: "ls-ops-prod",
                 channelID: "ch-main",
                 parentHashes: ["0af9219be2d1"],
@@ -582,7 +586,7 @@ final class WorkspaceViewModel: ObservableObject {
                 hash: "4d0a4457237a",
                 contentDigest: "sha256:4b06d0...",
                 sourceCommand: "adb shell getprop ro.build.fingerprint",
-                summary: "ADB fingerprint output",
+                summary: L10n.t("seed.artifact.adb_fingerprint.summary"),
                 sessionID: "ls-pixel-8",
                 channelID: "ch-adb",
                 parentHashes: [],
@@ -596,7 +600,7 @@ final class WorkspaceViewModel: ObservableObject {
                 id: UUID(),
                 targetID: opsID,
                 commandSummary: "rm release.apk",
-                reason: "Delete on production target requires operator confirmation.",
+                reason: L10n.t("seed.approval.delete_on_prod.reason"),
                 createdAt: now.addingTimeInterval(-31),
                 status: .pending
             )
@@ -606,7 +610,7 @@ final class WorkspaceViewModel: ObservableObject {
             ShellChannel(
                 id: "ch-main",
                 targetID: opsID,
-                title: "Interactive shell",
+                title: L10n.t("workspace.channel.title.interactive_shell"),
                 prompt: "ops@ops-prod$",
                 isClosed: false,
                 lines: [
@@ -619,7 +623,7 @@ final class WorkspaceViewModel: ObservableObject {
             ShellChannel(
                 id: "ch-adb",
                 targetID: pixelID,
-                title: "ADB shell",
+                title: L10n.t("seed.channel.title.adb_shell"),
                 prompt: "oriole:/ $",
                 isClosed: false,
                 lines: [

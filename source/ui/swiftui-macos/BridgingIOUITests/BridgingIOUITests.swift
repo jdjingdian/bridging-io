@@ -77,4 +77,14 @@ final class BridgingIOUITests: XCTestCase {
             XCUIApplication().launch()
         }
     }
+
+    @MainActor
+    func testChineseLocaleLocalizationAndProductNameConsistency() throws {
+        let app = XCUIApplication()
+        app.launchArguments += ["-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh-Hans"]
+        app.launch()
+
+        XCTAssertTrue(app.staticTexts["Bridging IO"].waitForExistence(timeout: 2))
+        XCTAssertTrue(app.buttons["设置"].waitForExistence(timeout: 2))
+    }
 }

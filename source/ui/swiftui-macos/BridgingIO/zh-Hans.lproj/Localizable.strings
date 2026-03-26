@@ -1,0 +1,257 @@
+"appearance.mode.system" = "自动";
+"appearance.mode.light" = "浅色";
+"appearance.mode.dark" = "深色";
+
+"approval_status.pending" = "待处理";
+"approval_status.approved" = "已批准";
+"approval_status.rejected" = "已拒绝";
+"approval_status.failed" = "失败";
+
+"artifact_cache_backend.memory" = "内存";
+"artifact_cache_backend.filesystem" = "文件系统";
+"artifact_eviction_policy.lru" = "LRU";
+"artifact_eviction_policy.fifo" = "FIFO";
+
+"branding.product_name" = "Bridging IO";
+
+"capability.terminal" = "终端";
+"capability.artifacts" = "Artifact";
+"capability.approvals" = "审批";
+"capability.git" = "Git";
+
+"command_execution_state.success" = "成功";
+"command_execution_state.streaming" = "流式中";
+"command_execution_state.approval" = "审批中";
+"command_execution_state.failed" = "失败";
+
+"seed.approval.delete_on_prod.reason" = "生产目标上的删除操作需要操作员确认。";
+"seed.artifact.adb_fingerprint.summary" = "ADB 指纹输出";
+"seed.artifact.approval_context.summary" = "删除命令的审批上下文";
+"seed.artifact.log_slice.summary" = "包含告警的日志切片";
+"seed.artifact.status.summary" = "状态输出快照";
+"seed.channel.title.adb_shell" = "ADB shell";
+"seed.target.lab.notes" = "预发 runner 主机";
+"seed.target.ops.notes" = "生产堡垒机";
+"seed.target.pixel.notes" = "QA 设备";
+"seed.timeline.adb_fingerprint.summary" = "已采集 Android 设备环境指纹。";
+"seed.timeline.git_status.summary" = "仓库干净，仅 docs/ 有一处本地变更。";
+"seed.timeline.rm_release.stderr" = "操作被归类为删除 + 生产目标。";
+"seed.timeline.rm_release.summary" = "删除操作等待操作员审批。";
+"seed.timeline.tail_log.summary" = "日志流中出现与支付同步相关的告警。";
+"seed.tool.effective_path.bridgingio_bundle" = "Bridging IO 内置包";
+
+"session_state.active" = "活跃";
+"session_state.waiting" = "等待中";
+"session_state.degraded" = "降级";
+"session_state.closed" = "已关闭";
+
+"settings.title" = "设置";
+"settings.done" = "完成";
+"settings.appearance" = "外观";
+"settings.artifact_cache" = "Artifact 缓存";
+"settings.cache.root_path_placeholder" = "根路径";
+"settings.cache.max_value_format" = "最大 %d MB";
+"settings.cache.used_value_format" = "已用 %d MB";
+"settings.apply" = "应用";
+"settings.clear_cache" = "清理缓存";
+"settings.cache.restart_hint" = "切换后端需要重启 core 才能完全生效。";
+
+"target_connection_state.connected" = "已连接";
+"target_connection_state.idle" = "空闲";
+"target_connection_state.degraded" = "降级";
+"target_connection_state.disconnected" = "未连接";
+
+"target_editor.action.create" = "创建目标";
+"target_editor.action.save" = "保存修改";
+"target_editor.mode.create" = "新建目标";
+"target_editor.mode.edit" = "编辑目标";
+
+"target_filter.all" = "全部";
+"target_filter.ssh" = "SSH";
+"target_filter.adb" = "ADB";
+
+"target_kind.ssh" = "SSH";
+"target_kind.adb" = "ADB";
+"target_kind.serial" = "串口";
+"target_kind.docker" = "Docker";
+"target_kind.http" = "HTTP";
+"target_kind.opengrok" = "OpenGrok";
+
+"target_sheet.cancel" = "取消";
+"target_sheet.subtitle.structured_editor" = "结构化目标配置编辑器";
+"target_sheet.target_types" = "目标类型";
+
+"target_sheet.section.general" = "通用";
+"target_sheet.section.connection" = "连接";
+"target_sheet.section.credential" = "凭据";
+"target_sheet.section.tooling" = "工具来源";
+"target_sheet.section.policy" = "策略";
+
+"target_sheet.field.name" = "名称";
+"target_sheet.field.alias_for_model" = "模型别名";
+"target_sheet.field.notes" = "备注";
+"target_sheet.field.host" = "主机";
+"target_sheet.field.port" = "端口";
+"target_sheet.field.username" = "用户名";
+"target_sheet.field.serial" = "序列号";
+"target_sheet.field.transport" = "传输方式";
+"target_sheet.field.device_path" = "设备路径";
+"target_sheet.field.baud_rate" = "波特率";
+"target_sheet.field.container" = "容器";
+"target_sheet.field.context" = "上下文";
+"target_sheet.field.shell_preference" = "Shell 偏好";
+"target_sheet.field.base_url" = "基础 URL";
+"target_sheet.field.auth_reference" = "认证引用";
+"target_sheet.field.environment" = "环境";
+"target_sheet.field.headers_preset" = "请求头预设";
+"target_sheet.field.endpoint" = "端点";
+"target_sheet.field.repository_scope" = "仓库范围";
+"target_sheet.field.token_reference" = "Token 引用";
+"target_sheet.field.query_scope" = "查询范围";
+"target_sheet.field.credential_reference" = "凭据引用";
+
+"target_sheet.placeholder.name" = "ops-prod";
+"target_sheet.placeholder.alias_for_model" = "prod-bastion";
+"target_sheet.placeholder.notes" = "production jump host";
+"target_sheet.placeholder.host" = "10.0.0.8";
+"target_sheet.placeholder.username" = "ops";
+"target_sheet.placeholder.serial" = "ABC12345";
+"target_sheet.placeholder.transport" = "usb";
+"target_sheet.placeholder.device_path" = "/dev/tty.usbmodem0";
+"target_sheet.placeholder.container" = "bridge-agent";
+"target_sheet.placeholder.context" = "default";
+"target_sheet.placeholder.shell_preference" = "/bin/sh";
+"target_sheet.placeholder.base_url" = "https://api.example.com";
+"target_sheet.placeholder.auth_reference" = "vault:http-auth:dev";
+"target_sheet.placeholder.environment" = "dev";
+"target_sheet.placeholder.headers_preset" = "json";
+"target_sheet.placeholder.endpoint" = "https://grok.example.com";
+"target_sheet.placeholder.repository_scope" = "bridgingio/*";
+"target_sheet.placeholder.token_reference" = "vault:grok-token:default";
+"target_sheet.placeholder.query_scope" = "default";
+"target_sheet.placeholder.credential_reference" = "vault:ssh-key:ops-prod";
+
+"target_sheet.import" = "导入";
+"target_sheet.reveal_in_vault" = "在保险库中查看";
+
+"target_sheet.policy.approve_write" = "写操作需审批";
+"target_sheet.policy.approve_delete" = "删除操作需审批";
+"target_sheet.policy.approve_sudo" = "sudo 需审批";
+"target_sheet.policy.approve_sensitive_read" = "敏感读取需审批";
+
+"target_sheet.helper.ssh" = "SSH 下会持续展示 Host key 与工具来源诊断。";
+"target_sheet.helper.adb" = "请使用 serial 与 transport 避免设备路由歧义。";
+"target_sheet.helper.serial" = "开启通道前请先校验设备路径与波特率。";
+"target_sheet.helper.docker" = "开启 shell 前请确保容器与 context 可解析。";
+"target_sheet.helper.http" = "仅使用引用，不在此展示任何密钥明文。";
+"target_sheet.helper.opengrok" = "端点与仓库范围决定可检索索引边界。";
+
+"tool_source_type.user_override" = "用户覆盖";
+"tool_source_type.system_path" = "系统 PATH";
+"tool_source_type.bundled_fallback" = "内置后备";
+
+"validation.target_name_required" = "目标名称不能为空。";
+"validation.target_alias_required" = "模型别名不能为空。";
+"validation.ssh_host_required" = "SSH 主机不能为空。";
+"validation.ssh_username_required" = "SSH 用户名不能为空。";
+"validation.adb_serial_required" = "ADB 序列号不能为空。";
+"validation.serial_device_path_required" = "串口设备路径不能为空。";
+"validation.docker_container_required" = "Docker 容器名不能为空。";
+"validation.http_base_url_required" = "HTTP 基础 URL 不能为空。";
+"validation.opengrok_endpoint_required" = "OpenGrok 端点不能为空。";
+
+"workspace.action.collapse" = "收起";
+"workspace.action.expand" = "展开";
+"workspace.approval.approve" = "批准";
+"workspace.approval.reject" = "拒绝";
+
+"workspace.artifact.hash_format" = "hash: %@";
+"workspace.artifact.lookup_action" = "查询";
+"workspace.artifact.lookup_placeholder" = "artifact hash 前缀";
+"workspace.artifact.no_match" = "未匹配";
+"workspace.artifact.session_channel_format" = "session: %@ • channel: %@";
+"workspace.artifact.source_format" = "source: %@";
+
+"workspace.cache.apply" = "应用";
+"workspace.cache.clear" = "清理";
+"workspace.cache.max_cache" = "最大缓存";
+"workspace.cache.max_cache_value_format" = "%d MB";
+"workspace.cache.restart_required" = "切换后端需要重启 core 才能生效。";
+"workspace.cache.root_path_placeholder" = "根路径";
+"workspace.cache.used_value_format" = "已用: %d MB";
+
+"workspace.card.approval_queue" = "审批队列";
+"workspace.card.artifact_cache" = "Artifact 缓存";
+"workspace.card.artifact_hash_lookup" = "Artifact Hash 查询";
+"workspace.card.capabilities" = "能力";
+"workspace.card.session_state" = "会话状态";
+"workspace.card.tool_sources" = "工具来源";
+
+"workspace.center.select_target_hint" = "选择一个目标以查看其逻辑会话。";
+"workspace.center.session_summary_format" = "Session: %@ • %@ • %@";
+"workspace.center.timeline" = "时间线";
+
+"workspace.channel.closed_by_operator" = "通道已由操作员关闭。";
+"workspace.channel.default_target_name" = "target";
+"workspace.channel.executed_on_format" = "已执行 \"%@\" 于 %@";
+"workspace.channel.opened_attached" = "通道已打开并挂载到逻辑会话。";
+"workspace.channel.sigint_sent" = "已向活动进程发送 SIGINT。";
+"workspace.channel.title.interactive_shell" = "交互式 Shell";
+
+"workspace.drawer.derived_format" = "derived: %@";
+"workspace.drawer.keyword_placeholder" = "关键字";
+"workspace.drawer.parents_format" = "parents: %@";
+"workspace.drawer.preview" = "预览";
+"workspace.drawer.preview_empty" = "请选择一个 artifact 进行预览。";
+"workspace.drawer.range_from_format" = "从 %d";
+"workspace.drawer.range_to_format" = "到 %d";
+"workspace.drawer.refine" = "二次过滤";
+"workspace.drawer.session_channel_format" = "session: %@ / channel: %@";
+"workspace.drawer.source_format" = "source: %@";
+"workspace.drawer.title" = "Artifact 抽屉";
+
+"workspace.empty.channel.message" = "打开一个 shell 通道后即可查看 prompt/output 并发送输入。";
+"workspace.empty.channel.title" = "暂无通道";
+"workspace.empty.no_capability_data" = "暂无能力数据";
+"workspace.empty.no_diagnostics" = "暂无诊断信息";
+"workspace.empty.no_pending_approvals" = "暂无待审批项";
+"workspace.empty.select_target" = "请选择目标";
+"workspace.empty.timeline.message" = "请选择目标以查看命令卡片与关联 artifact。";
+"workspace.empty.timeline.title" = "暂无时间线事件";
+
+"workspace.search.placeholder" = "搜索目标 / 命令";
+"workspace.session.last_active_format" = "最近活跃: %@";
+"workspace.session.os_arch_format" = "%@ • %@";
+"workspace.session.shell_format" = "shell: %@";
+
+"workspace.sidebar.create_target" = "创建目标";
+"workspace.sidebar.edit_selected" = "编辑当前选中";
+"workspace.sidebar.open_settings" = "打开设置";
+"workspace.sidebar.targets" = "目标";
+
+"workspace.target.alias_format" = "别名: %@";
+"workspace.target.context.edit_target" = "编辑目标";
+
+"workspace.timeline.exit_format" = "exit: %d";
+"workspace.timeline.stderr" = "stderr";
+"workspace.timeline.stdout" = "stdout";
+"workspace.timeline.summary.operator_approved" = "操作员已批准，命令执行成功。";
+"workspace.timeline.summary.operator_rejected" = "操作员已拒绝，请求被阻断。";
+
+"workspace.tool.effective_path_format" = "effective: %@";
+"workspace.tool.override_path_placeholder" = "覆盖路径";
+
+"workspace.toolbar.new_target" = "新建目标";
+"workspace.toolbar.open_session" = "打开会话";
+"workspace.toolbar.settings" = "设置";
+"workspace.toolbar.workspace_format" = "工作区: %@";
+
+"workspace.transcript.close" = "关闭";
+"workspace.transcript.input_placeholder" = "向通道发送输入";
+"workspace.transcript.interrupt" = "中断";
+"workspace.transcript.open_channel" = "打开通道";
+"workspace.transcript.send" = "发送";
+"workspace.transcript.title" = "转录";
+
+"workspace_center_panel.timeline" = "时间线";
+"workspace_center_panel.transcript" = "转录";

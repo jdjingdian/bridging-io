@@ -57,7 +57,7 @@ struct TargetProfileSheetView: View {
                     .font(ConsoleTypography.heading(17, weight: .bold))
                     .foregroundStyle(theme.textPrimary)
 
-                Text("Structured target profile editor")
+                Text(L10n.t("target_sheet.subtitle.structured_editor"))
                     .font(ConsoleTypography.body(12))
                     .foregroundStyle(theme.muted)
             }
@@ -71,7 +71,7 @@ struct TargetProfileSheetView: View {
                     .lineLimit(1)
             }
 
-            Button("Cancel") {
+            Button(L10n.t("target_sheet.cancel")) {
                 onCancel()
             }
             .consoleButton(theme: theme, tone: .secondary)
@@ -90,8 +90,8 @@ struct TargetProfileSheetView: View {
     }
 
     private var kindTabs: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Target Types")
+            VStack(alignment: .leading, spacing: 8) {
+            Text(L10n.t("target_sheet.target_types"))
                 .font(ConsoleTypography.heading(12, weight: .semibold))
                 .foregroundStyle(theme.textSecondary)
 
@@ -118,76 +118,76 @@ struct TargetProfileSheetView: View {
     }
 
     private var generalSection: some View {
-        SheetCard(title: "General", theme: theme) {
+        SheetCard(title: L10n.t("target_sheet.section.general"), theme: theme) {
             VStack(spacing: 10) {
-                EditorField(title: "Name", text: $viewModel.draft.name, placeholder: "ops-prod", theme: theme)
+                EditorField(title: L10n.t("target_sheet.field.name"), text: $viewModel.draft.name, placeholder: L10n.t("target_sheet.placeholder.name"), theme: theme)
                     .accessibilityIdentifier("field-target-name")
 
-                EditorField(title: "Alias for model", text: $viewModel.draft.aliasForModel, placeholder: "prod-bastion", theme: theme)
+                EditorField(title: L10n.t("target_sheet.field.alias_for_model"), text: $viewModel.draft.aliasForModel, placeholder: L10n.t("target_sheet.placeholder.alias_for_model"), theme: theme)
                     .accessibilityIdentifier("field-target-alias")
 
-                EditorField(title: "Notes", text: $viewModel.draft.notes, placeholder: "production jump host", theme: theme)
+                EditorField(title: L10n.t("target_sheet.field.notes"), text: $viewModel.draft.notes, placeholder: L10n.t("target_sheet.placeholder.notes"), theme: theme)
                     .accessibilityIdentifier("field-target-notes")
             }
         }
     }
 
     private var connectionSection: some View {
-        SheetCard(title: "Connection", subtitle: helperTextForKind(viewModel.draft.kind), theme: theme) {
+        SheetCard(title: L10n.t("target_sheet.section.connection"), subtitle: helperTextForKind(viewModel.draft.kind), theme: theme) {
             switch viewModel.draft.kind {
             case .ssh:
                 VStack(spacing: 10) {
-                    EditorField(title: "Host", text: $viewModel.draft.sshConfig.host, placeholder: "10.0.0.8", theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.host"), text: $viewModel.draft.sshConfig.host, placeholder: L10n.t("target_sheet.placeholder.host"), theme: theme)
                         .accessibilityIdentifier("field-ssh-host")
-                    NumericField(title: "Port", value: $viewModel.draft.sshConfig.port, theme: theme)
-                    EditorField(title: "Username", text: $viewModel.draft.sshConfig.username, placeholder: "ops", theme: theme)
+                    NumericField(title: L10n.t("target_sheet.field.port"), value: $viewModel.draft.sshConfig.port, theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.username"), text: $viewModel.draft.sshConfig.username, placeholder: L10n.t("target_sheet.placeholder.username"), theme: theme)
                         .accessibilityIdentifier("field-ssh-username")
                 }
             case .adb:
                 VStack(spacing: 10) {
-                    EditorField(title: "Serial", text: $viewModel.draft.adbConfig.serial, placeholder: "ABC12345", theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.serial"), text: $viewModel.draft.adbConfig.serial, placeholder: L10n.t("target_sheet.placeholder.serial"), theme: theme)
                         .accessibilityIdentifier("field-adb-serial")
-                    EditorField(title: "Transport", text: $viewModel.draft.adbConfig.transport, placeholder: "usb", theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.transport"), text: $viewModel.draft.adbConfig.transport, placeholder: L10n.t("target_sheet.placeholder.transport"), theme: theme)
                 }
             case .serial:
                 VStack(spacing: 10) {
-                    EditorField(title: "Device path", text: $viewModel.draft.serialConfig.devicePath, placeholder: "/dev/tty.usbmodem0", theme: theme)
-                    NumericField(title: "Baud rate", value: $viewModel.draft.serialConfig.baudRate, theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.device_path"), text: $viewModel.draft.serialConfig.devicePath, placeholder: L10n.t("target_sheet.placeholder.device_path"), theme: theme)
+                    NumericField(title: L10n.t("target_sheet.field.baud_rate"), value: $viewModel.draft.serialConfig.baudRate, theme: theme)
                 }
             case .docker:
                 VStack(spacing: 10) {
-                    EditorField(title: "Container", text: $viewModel.draft.dockerConfig.containerName, placeholder: "bridge-agent", theme: theme)
-                    EditorField(title: "Context", text: $viewModel.draft.dockerConfig.context, placeholder: "default", theme: theme)
-                    EditorField(title: "Shell preference", text: $viewModel.draft.dockerConfig.shellPreference, placeholder: "/bin/sh", theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.container"), text: $viewModel.draft.dockerConfig.containerName, placeholder: L10n.t("target_sheet.placeholder.container"), theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.context"), text: $viewModel.draft.dockerConfig.context, placeholder: L10n.t("target_sheet.placeholder.context"), theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.shell_preference"), text: $viewModel.draft.dockerConfig.shellPreference, placeholder: L10n.t("target_sheet.placeholder.shell_preference"), theme: theme)
                 }
             case .httpDebug:
                 VStack(spacing: 10) {
-                    EditorField(title: "Base URL", text: $viewModel.draft.httpDebugConfig.baseURL, placeholder: "https://api.example.com", theme: theme)
-                    EditorField(title: "Auth reference", text: $viewModel.draft.httpDebugConfig.authReference, placeholder: "vault:http-auth:dev", theme: theme)
-                    EditorField(title: "Environment", text: $viewModel.draft.httpDebugConfig.environmentPreset, placeholder: "dev", theme: theme)
-                    EditorField(title: "Headers preset", text: $viewModel.draft.httpDebugConfig.headerPreset, placeholder: "json", theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.base_url"), text: $viewModel.draft.httpDebugConfig.baseURL, placeholder: L10n.t("target_sheet.placeholder.base_url"), theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.auth_reference"), text: $viewModel.draft.httpDebugConfig.authReference, placeholder: L10n.t("target_sheet.placeholder.auth_reference"), theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.environment"), text: $viewModel.draft.httpDebugConfig.environmentPreset, placeholder: L10n.t("target_sheet.placeholder.environment"), theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.headers_preset"), text: $viewModel.draft.httpDebugConfig.headerPreset, placeholder: L10n.t("target_sheet.placeholder.headers_preset"), theme: theme)
                 }
             case .openGrok:
                 VStack(spacing: 10) {
-                    EditorField(title: "Endpoint", text: $viewModel.draft.openGrokConfig.endpoint, placeholder: "https://grok.example.com", theme: theme)
-                    EditorField(title: "Repository scope", text: $viewModel.draft.openGrokConfig.repositoryScope, placeholder: "bridgingio/*", theme: theme)
-                    EditorField(title: "Token reference", text: $viewModel.draft.openGrokConfig.tokenReference, placeholder: "vault:grok-token:default", theme: theme)
-                    EditorField(title: "Query scope", text: $viewModel.draft.openGrokConfig.queryScope, placeholder: "default", theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.endpoint"), text: $viewModel.draft.openGrokConfig.endpoint, placeholder: L10n.t("target_sheet.placeholder.endpoint"), theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.repository_scope"), text: $viewModel.draft.openGrokConfig.repositoryScope, placeholder: L10n.t("target_sheet.placeholder.repository_scope"), theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.token_reference"), text: $viewModel.draft.openGrokConfig.tokenReference, placeholder: L10n.t("target_sheet.placeholder.token_reference"), theme: theme)
+                    EditorField(title: L10n.t("target_sheet.field.query_scope"), text: $viewModel.draft.openGrokConfig.queryScope, placeholder: L10n.t("target_sheet.placeholder.query_scope"), theme: theme)
                 }
             }
         }
     }
 
     private var credentialSection: some View {
-        SheetCard(title: "Credential", theme: theme) {
+        SheetCard(title: L10n.t("target_sheet.section.credential"), theme: theme) {
             VStack(spacing: 10) {
-                EditorField(title: "Credential reference", text: $viewModel.draft.credentialReference, placeholder: "vault:ssh-key:ops-prod", theme: theme)
+                EditorField(title: L10n.t("target_sheet.field.credential_reference"), text: $viewModel.draft.credentialReference, placeholder: L10n.t("target_sheet.placeholder.credential_reference"), theme: theme)
                     .accessibilityIdentifier("field-credential-ref")
 
                 HStack(spacing: 10) {
-                    Button("Import") {}
+                    Button(L10n.t("target_sheet.import")) {}
                         .consoleButton(theme: theme, tone: .secondary)
-                    Button("Reveal in Vault") {}
+                    Button(L10n.t("target_sheet.reveal_in_vault")) {}
                         .consoleButton(theme: theme, tone: .subtle)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -196,7 +196,7 @@ struct TargetProfileSheetView: View {
     }
 
     private var toolingSection: some View {
-        SheetCard(title: "Tooling", theme: theme) {
+        SheetCard(title: L10n.t("target_sheet.section.tooling"), theme: theme) {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(Array(viewModel.draft.toolDiagnostics.enumerated()), id: \.element.id) { index, diagnostic in
                     VStack(alignment: .leading, spacing: 6) {
@@ -210,12 +210,12 @@ struct TargetProfileSheetView: View {
                                 .foregroundStyle(theme.muted)
                         }
 
-                        Text("effective: \(diagnostic.effectivePath)")
+                        Text(L10n.f("workspace.tool.effective_path_format", diagnostic.effectivePath))
                             .font(ConsoleTypography.body(12))
                             .foregroundStyle(theme.textSecondary)
 
                         TextField(
-                            "Override path",
+                            L10n.t("workspace.tool.override_path_placeholder"),
                             text: Binding(
                                 get: { viewModel.draft.toolDiagnostics[index].overridePath },
                                 set: { viewModel.applyConnectorOverride(for: diagnostic.id, path: $0) }
@@ -236,12 +236,12 @@ struct TargetProfileSheetView: View {
     }
 
     private var policySection: some View {
-        SheetCard(title: "Policy", theme: theme) {
+        SheetCard(title: L10n.t("target_sheet.section.policy"), theme: theme) {
             VStack(alignment: .leading, spacing: 8) {
-                Toggle("Approve write", isOn: $viewModel.draft.policyDefaults.approveWrite)
-                Toggle("Approve delete", isOn: $viewModel.draft.policyDefaults.approveDelete)
-                Toggle("Approve sudo", isOn: $viewModel.draft.policyDefaults.approveSudo)
-                Toggle("Approve sensitive read", isOn: $viewModel.draft.policyDefaults.approveSensitiveRead)
+                Toggle(L10n.t("target_sheet.policy.approve_write"), isOn: $viewModel.draft.policyDefaults.approveWrite)
+                Toggle(L10n.t("target_sheet.policy.approve_delete"), isOn: $viewModel.draft.policyDefaults.approveDelete)
+                Toggle(L10n.t("target_sheet.policy.approve_sudo"), isOn: $viewModel.draft.policyDefaults.approveSudo)
+                Toggle(L10n.t("target_sheet.policy.approve_sensitive_read"), isOn: $viewModel.draft.policyDefaults.approveSensitiveRead)
             }
             .toggleStyle(.checkbox)
             .font(ConsoleTypography.body(12))
@@ -252,17 +252,17 @@ struct TargetProfileSheetView: View {
     private func helperTextForKind(_ kind: TargetKind) -> String {
         switch kind {
         case .ssh:
-            return "Host key and tool source diagnostics stay visible for SSH." 
+            return L10n.t("target_sheet.helper.ssh")
         case .adb:
-            return "Use serial and transport to avoid device routing ambiguity."
+            return L10n.t("target_sheet.helper.adb")
         case .serial:
-            return "Validate path and baud-rate before opening channels."
+            return L10n.t("target_sheet.helper.serial")
         case .docker:
-            return "Container and context should resolve before opening a shell."
+            return L10n.t("target_sheet.helper.docker")
         case .httpDebug:
-            return "Auth uses references only; no secret values shown here."
+            return L10n.t("target_sheet.helper.http")
         case .openGrok:
-            return "Endpoint and repo scope define searchable index boundaries."
+            return L10n.t("target_sheet.helper.opengrok")
         }
     }
 }

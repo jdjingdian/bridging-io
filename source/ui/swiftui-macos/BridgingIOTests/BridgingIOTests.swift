@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import BridgingIO
 
@@ -39,5 +40,24 @@ struct BridgingIOTests {
         viewModel.lookupArtifactByHash()
 
         #expect(viewModel.artifactLookupResult?.hash == "8cf4e2a1d7b2")
+    }
+
+    @Test func productNameIsConsistentAcrossEnglishAndChinese() throws {
+        #expect(localized("branding.product_name", locale: "en") == "Bridging IO")
+        #expect(localized("branding.product_name", locale: "zh-Hans") == "Bridging IO")
+    }
+
+    @Test func chineseCoreUiStringsExist() throws {
+        #expect(localized("settings.title", locale: "zh-Hans") == "设置")
+        #expect(localized("workspace.toolbar.new_target", locale: "zh-Hans") == "新建目标")
+    }
+
+    private func localized(_ key: String, locale: String) -> String {
+        let bundle = Bundle.main
+        guard let path = bundle.path(forResource: locale, ofType: "lproj"),
+              let localizedBundle = Bundle(path: path) else {
+            return key
+        }
+        return NSLocalizedString(key, tableName: "Localizable", bundle: localizedBundle, value: key, comment: "")
     }
 }

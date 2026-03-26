@@ -12,11 +12,11 @@ struct SettingsSheetView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("Settings")
+                Text(L10n.t("settings.title"))
                     .font(ConsoleTypography.heading(18, weight: .bold))
                     .foregroundStyle(theme.textPrimary)
                 Spacer()
-                Button("Done") {
+                Button(L10n.t("settings.done")) {
                     dismiss()
                 }
                 .consoleButton(theme: theme, tone: .primary)
@@ -24,7 +24,7 @@ struct SettingsSheetView: View {
             }
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("Appearance")
+                Text(L10n.t("settings.appearance"))
                     .font(ConsoleTypography.heading(13, weight: .semibold))
                     .foregroundStyle(theme.textPrimary)
 
@@ -44,7 +44,7 @@ struct SettingsSheetView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("Artifact Cache")
+                Text(L10n.t("settings.artifact_cache"))
                     .font(ConsoleTypography.heading(13, weight: .semibold))
                     .foregroundStyle(theme.textPrimary)
 
@@ -58,31 +58,31 @@ struct SettingsSheetView: View {
                     title: { $0.title }
                 )
 
-                TextField("Root path", text: $viewModel.cacheSettings.rootPath)
+                TextField(L10n.t("settings.cache.root_path_placeholder"), text: $viewModel.cacheSettings.rootPath)
                     .consoleInput(theme: theme, surface: .panel)
 
                 HStack {
-                    Stepper("Max \(viewModel.cacheSettings.maxCacheMB) MB", value: $viewModel.cacheSettings.maxCacheMB, in: 256...8192, step: 128)
+                    Stepper(L10n.f("settings.cache.max_value_format", viewModel.cacheSettings.maxCacheMB), value: $viewModel.cacheSettings.maxCacheMB, in: 256...8192, step: 128)
                     Spacer()
-                    Text("Used \(viewModel.cacheSettings.usedCacheMB) MB")
+                    Text(L10n.f("settings.cache.used_value_format", viewModel.cacheSettings.usedCacheMB))
                         .font(ConsoleTypography.body(12))
                         .foregroundStyle(theme.muted)
                 }
 
                 HStack(spacing: 8) {
-                    Button("Apply") {
+                    Button(L10n.t("settings.apply")) {
                         viewModel.applyCacheSettings()
                     }
                     .consoleButton(theme: theme, tone: .primary)
 
-                    Button("Clear Cache") {
+                    Button(L10n.t("settings.clear_cache")) {
                         viewModel.clearArtifactCache()
                     }
                     .consoleButton(theme: theme, tone: .secondary)
                 }
 
                 if viewModel.cacheSettingsNeedRestart {
-                    Text("Backend switch requires core restart to fully apply.")
+                    Text(L10n.t("settings.cache.restart_hint"))
                         .font(ConsoleTypography.body(12))
                         .foregroundStyle(theme.warning)
                 }
