@@ -62,16 +62,16 @@
 - [x] 5.1 使用 `ui-ux-pro-max` 为 BridgingIO 生成 macOS 控制台设计系统建议，并补充 SwiftUI 栈约束、信息架构与可访问性要点
 - [x] 5.2 与项目负责人确认设计方向，定稿目标列表、会话详情、命令时间线、artifact 详情和审批流程的界面结构
 - [x] 5.3 将确认后的设计系统持久化到 `design/macos-console/design-system/MASTER.md`，并按页面需要创建 `design/macos-console/design-system/pages/` 下的可编辑覆盖文件
-- [ ] 5.4 基于已确认的设计系统构建目标列表、会话详情和设置入口，展示连接状态、环境指纹、能力摘要与 profile 基本信息
-- [ ] 5.5 构建目标 profile 创建/编辑流程，覆盖 SSH/ADB 连接参数、调用别名、用户备注、凭据引用和默认策略
-- [ ] 5.6 构建连接器/Provider 诊断与工具来源界面，覆盖用户覆盖路径、系统 PATH 命中和内置后备来源回显
-- [ ] 5.7 构建可折叠命令时间线，展示命令摘要、stdout/stderr 入口、exit status 和 artifact 关联
-- [ ] 5.8 构建 artifact 详情与二次过滤交互，使用户能够重新查看或扩大过滤范围
-- [ ] 5.9 构建审批界面和状态反馈，覆盖等待审批、批准、拒绝和失败结果
-- [ ] 5.10 为 macOS 控制台补充 UI Test，覆盖目标选择、配置编辑、会话查看、命令时间线、artifact 详情和审批流程
-- [ ] 5.11 为交互式 shell channel 设计并实现 transcript 视图，支持查看 prompt、发送输入、切换 channel，以及执行关闭/中断操作
-- [ ] 5.12 构建 artifact cache 设置界面，覆盖 backend 选择、持久化根目录、最大缓存限制、淘汰策略、已使用空间与清理入口
-- [ ] 5.13 在命令时间线与 artifact 详情中显示 artifact hash，并支持基于 hash 反查来源命令、所属会话/通道与派生关系
+- [x] 5.4 基于已确认的设计系统构建目标列表、会话详情和设置入口，展示连接状态、环境指纹、能力摘要与 profile 基本信息
+- [x] 5.5 构建目标 profile 创建/编辑流程，覆盖 SSH/ADB 连接参数、调用别名、用户备注、凭据引用和默认策略
+- [x] 5.6 构建连接器/Provider 诊断与工具来源界面，覆盖用户覆盖路径、系统 PATH 命中和内置后备来源回显
+- [x] 5.7 构建可折叠命令时间线，展示命令摘要、stdout/stderr 入口、exit status 和 artifact 关联
+- [x] 5.8 构建 artifact 详情与二次过滤交互，使用户能够重新查看或扩大过滤范围
+- [x] 5.9 构建审批界面和状态反馈，覆盖等待审批、批准、拒绝和失败结果
+- [x] 5.10 为 macOS 控制台补充 UI Test，覆盖目标选择、配置编辑、会话查看、命令时间线、artifact 详情和审批流程
+- [x] 5.11 为交互式 shell channel 设计并实现 transcript 视图，支持查看 prompt、发送输入、切换 channel，以及执行关闭/中断操作
+- [x] 5.12 构建 artifact cache 设置界面，覆盖 backend 选择、持久化根目录、最大缓存限制、淘汰策略、已使用空间与清理入口
+- [x] 5.13 在命令时间线与 artifact 详情中显示 artifact hash，并支持基于 hash 反查来源命令、所属会话/通道与派生关系
 
 ## 6. 验证与收敛
 
