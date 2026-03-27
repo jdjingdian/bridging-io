@@ -6,7 +6,7 @@ use std::os::fd::{FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -113,13 +113,7 @@ impl TerminalProvider {
             });
         }
 
-        let output = Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(command)
-            .output()
-            .map_err(|e| ProviderError {
-                message: format!("failed to run shell command: {e}"),
-            })?;
+        let output = run_shell_command(command)?;
 
         let created = self.artifacts.create_raw(
             artifact_id.to_string(),
@@ -446,12 +440,7 @@ fn spawn_interactive_process(
 fn spawn_interactive_pipe_process(
     launch_command: Option<&str>,
 ) -> Result<InteractiveShellProcess, ProviderError> {
-    let mut command = Command::new("/bin/sh");
-    if let Some(launch_command) = launch_command {
-        command.arg("-lc").arg(launch_command);
-    } else {
-        command.arg("-s");
-    }
+    let mut command = platform_interactive_shell_command(launch_command);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -541,12 +530,23 @@ fn execute_on_interactive_process(
 ) -> Result<(), ProviderError> {
     write_bytes_to_interactive_process(process, format!("{command}\n").as_bytes())?;
     if let Some(marker) = marker {
-        let marker_command = format!("printf '%s\\n' {}", shell_single_quote(marker));
+        let marker_command = marker_command_for_shell(marker);
         write_bytes_to_interactive_process(process, marker_command.as_bytes())?;
         write_bytes_to_interactive_process(process, b"\n")?;
     }
     flush_interactive_process_writer(process)?;
     Ok(())
+}
+
+fn marker_command_for_shell(marker: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("echo {marker}")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("printf '%s\\n' {}", shell_single_quote(marker))
+    }
 }
 
 fn harvest_interactive_output(
@@ -863,21 +863,38 @@ fn execute_with_shell_state(
         return Ok(String::new());
     }
 
-    let mut shell_script = String::new();
-    shell_script.push_str("set -e\n");
-    shell_script.push_str(&format!("cd {}\n", shell_single_quote(&state.cwd)));
-    for (key, value) in &state.env {
-        shell_script.push_str(&format!("export {}={}\n", key, shell_single_quote(value)));
-    }
-    shell_script.push_str(command);
+    #[cfg(windows)]
+    let shell_script = {
+        let mut script = String::new();
+        if !state.cwd.is_empty() && state.cwd != "/" {
+            script.push_str("cd /d ");
+            script.push_str(&shell_double_quote(&state.cwd));
+            script.push('\n');
+        }
+        for (key, value) in &state.env {
+            script.push_str("set ");
+            script.push_str(key);
+            script.push('=');
+            script.push_str(value);
+            script.push('\n');
+        }
+        script.push_str(command);
+        script
+    };
 
-    let output = Command::new("/bin/sh")
-        .arg("-lc")
-        .arg(shell_script)
-        .output()
-        .map_err(|e| ProviderError {
-            message: format!("failed to run shell command: {e}"),
-        })?;
+    #[cfg(not(windows))]
+    let shell_script = {
+        let mut script = String::new();
+        script.push_str("set -e\n");
+        script.push_str(&format!("cd {}\n", shell_single_quote(&state.cwd)));
+        for (key, value) in &state.env {
+            script.push_str(&format!("export {}={}\n", key, shell_single_quote(value)));
+        }
+        script.push_str(command);
+        script
+    };
+
+    let output = run_shell_command(&shell_script)?;
 
     let mut lines = Vec::<String>::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -891,6 +908,55 @@ fn execute_with_shell_state(
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn shell_double_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn run_shell_command(command: &str) -> Result<Output, ProviderError> {
+    #[cfg(windows)]
+    let mut shell = {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    };
+
+    #[cfg(not(windows))]
+    let mut shell = {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-lc").arg(command);
+        cmd
+    };
+
+    shell.output().map_err(|e| ProviderError {
+        message: format!("failed to run shell command: {e}"),
+    })
+}
+
+fn platform_interactive_shell_command(launch_command: Option<&str>) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("cmd");
+        if let Some(launch_command) = launch_command {
+            command.arg("/C").arg(launch_command);
+        } else {
+            command.arg("/Q").arg("/K");
+        }
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("/bin/sh");
+        if let Some(launch_command) = launch_command {
+            command.arg("-lc").arg(launch_command);
+        } else {
+            command.arg("-s");
+        }
+        command
+    }
 }
 
 fn parse_artifact_refine_mode(mode_label: &str) -> Result<ArtifactRefineMode, ProviderError> {
@@ -948,6 +1014,7 @@ impl GitProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::time::SystemTime;
 
     use bridgingio_domain::PolicyProfile;
@@ -1009,6 +1076,25 @@ mod tests {
             )
             .expect_err("must reject command");
         assert!(err.message.contains("requires approval"));
+    }
+
+    #[test]
+    fn exec_local_records_basic_command_output() {
+        let mut provider = TerminalProvider::default();
+        let policy = PolicyProfile::default();
+        #[cfg(windows)]
+        let command = "echo provider-ok";
+        #[cfg(not(windows))]
+        let command = "printf 'provider-ok\\n'";
+
+        let artifact = provider
+            .exec_local("session", Some("ch-1"), Some("ts-1"), command, "art", &policy)
+            .expect("exec command");
+        let chunks = provider.artifacts.read_chunks(&artifact.id, 0, 20);
+        assert!(
+            chunks.iter().any(|line| line.contains("provider-ok")),
+            "artifact chunks: {chunks:?}"
+        );
     }
 
     #[test]
@@ -1089,6 +1175,57 @@ mod tests {
             assert!(state.interrupted);
             assert!(!state.running);
         }
+    }
+
+    #[test]
+    fn platform_interactive_shell_default_command_is_platform_specific() {
+        let command = super::platform_interactive_shell_command(None);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        #[cfg(windows)]
+        {
+            assert_eq!(command.get_program(), OsStr::new("cmd"));
+            assert_eq!(args, vec!["/Q", "/K"]);
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(command.get_program(), OsStr::new("/bin/sh"));
+            assert_eq!(args, vec!["-s"]);
+        }
+    }
+
+    #[test]
+    fn platform_interactive_shell_launch_command_is_platform_specific() {
+        let command = super::platform_interactive_shell_command(Some("echo hello"));
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        #[cfg(windows)]
+        {
+            assert_eq!(command.get_program(), OsStr::new("cmd"));
+            assert_eq!(args, vec!["/C", "echo hello"]);
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(command.get_program(), OsStr::new("/bin/sh"));
+            assert_eq!(args, vec!["-lc", "echo hello"]);
+        }
+    }
+
+    #[test]
+    fn marker_command_is_platform_specific() {
+        let command = super::marker_command_for_shell("BRIDGINGIO_DONE_MARKER");
+        #[cfg(windows)]
+        assert_eq!(command, "echo BRIDGINGIO_DONE_MARKER");
+        #[cfg(not(windows))]
+        assert_eq!(command, "printf '%s\\n' 'BRIDGINGIO_DONE_MARKER'");
     }
 
     #[cfg(unix)]

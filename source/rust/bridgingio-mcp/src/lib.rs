@@ -2457,7 +2457,14 @@ fn build_connector_command(
 }
 
 fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
+    #[cfg(windows)]
+    {
+        value.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
 }
 
 fn first_data_line(output: &str) -> String {
@@ -4574,6 +4581,15 @@ mod tests {
     }
 
     #[test]
+    fn shell_single_quote_is_platform_compatible() {
+        let value = "hello world";
+        #[cfg(windows)]
+        assert_eq!(super::shell_single_quote(value), "hello world");
+        #[cfg(not(windows))]
+        assert_eq!(super::shell_single_quote(value), "'hello world'");
+    }
+
+    #[test]
     fn connector_command_uses_resolved_adb_executable_path() {
         let target = TargetProfile {
             id: "adb-target".into(),
@@ -4594,6 +4610,9 @@ mod tests {
             "uname -r",
             Some("/opt/homebrew/bin/adb"),
         );
+        #[cfg(windows)]
+        assert_eq!(command, "/opt/homebrew/bin/adb -s emulator-5554 shell uname -r");
+        #[cfg(not(windows))]
         assert_eq!(
             command,
             "'/opt/homebrew/bin/adb' -s emulator-5554 shell 'uname -r'"
@@ -4617,6 +4636,9 @@ mod tests {
             toolchains: BTreeMap::new(),
         };
         let command = super::build_connector_command(&target, "uname -r", None);
+        #[cfg(windows)]
+        assert_eq!(command, "adb -s emulator-5554 shell uname -r");
+        #[cfg(not(windows))]
         assert_eq!(command, "adb -s emulator-5554 shell 'uname -r'");
     }
 
@@ -4642,6 +4664,9 @@ mod tests {
             "uname -r",
             Some("/opt/homebrew/bin/ssh"),
         );
+        #[cfg(windows)]
+        assert_eq!(command, "/opt/homebrew/bin/ssh -p 2222 root@10.1.1.8 uname -r");
+        #[cfg(not(windows))]
         assert_eq!(
             command,
             "'/opt/homebrew/bin/ssh' -p 2222 'root@10.1.1.8' 'uname -r'"
@@ -4666,6 +4691,9 @@ mod tests {
             toolchains: BTreeMap::new(),
         };
         let command = super::build_connector_command(&target, "whoami", None);
+        #[cfg(windows)]
+        assert_eq!(command, "ssh -p 22 ubuntu@192.168.56.2 whoami");
+        #[cfg(not(windows))]
         assert_eq!(command, "ssh -p 22 'ubuntu@192.168.56.2' 'whoami'");
     }
 
@@ -4711,6 +4739,12 @@ mod tests {
             &target,
             Some("/opt/homebrew/bin/adb"),
         );
+        #[cfg(windows)]
+        assert_eq!(
+            command.as_deref(),
+            Some("/opt/homebrew/bin/adb -s emulator-5554 shell")
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             command.as_deref(),
             Some("'/opt/homebrew/bin/adb' -s emulator-5554 shell")
@@ -4738,6 +4772,12 @@ mod tests {
             &target,
             Some("/opt/homebrew/bin/ssh"),
         );
+        #[cfg(windows)]
+        assert_eq!(
+            command.as_deref(),
+            Some("/opt/homebrew/bin/ssh -p 2222 root@10.1.1.8")
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             command.as_deref(),
             Some("'/opt/homebrew/bin/ssh' -p 2222 'root@10.1.1.8'")

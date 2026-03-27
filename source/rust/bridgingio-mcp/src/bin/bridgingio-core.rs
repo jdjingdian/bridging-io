@@ -1,29 +1,37 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bridgingio_app_api::{ApiRequest, ApiRequestContext, ApiResponse, AppCommand};
 use bridgingio_connectors::{
     BuiltInBinarySpec, BuiltInDistributionKind, ExecutableResolver, ToolchainResolver,
 };
-use bridgingio_engine::CoreSettings;
+use bridgingio_domain::{PolicyProfile, SessionReusePolicy, TargetKind};
+use bridgingio_engine::{
+    CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile, TerminalProviderSection,
+};
 use bridgingio_mcp::{
     control_plane_socket_path, CoreHostMode, ModelPlaneHttpServer, StandaloneCoreRuntime,
 };
+use bridgingio_providers::TerminalProvider;
 
 #[cfg(unix)]
 use bridgingio_mcp::ControlPlaneIpcServer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchMode {
+    SelfTest,
     UiManagedEphemeral,
     StandaloneRun,
     StandaloneDetachedLauncher,
     StandaloneDetachedChild,
 }
 
+#[derive(Debug)]
 struct CliArgs {
     config_path: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
@@ -48,6 +56,9 @@ fn main() {
 }
 
 fn run(args: CliArgs) -> Result<(), String> {
+    if args.mode == LaunchMode::SelfTest {
+        return run_self_test();
+    }
     let config_path = resolve_config_path(&args)?;
     match args.mode {
         LaunchMode::StandaloneDetachedLauncher => {
@@ -71,7 +82,411 @@ fn run(args: CliArgs) -> Result<(), String> {
             CoreHostMode::StandaloneDetached,
             args.control_plane_socket_override.as_deref(),
         ),
+        LaunchMode::SelfTest => unreachable!("self-test handled before config resolution"),
     }
+}
+
+fn run_self_test() -> Result<(), String> {
+    println!("running bridgingio-core self-test...");
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("clock error: {err}"))?
+        .as_nanos();
+    let self_test_root = env::temp_dir().join(format!("bridgingio-self-test-{stamp}"));
+    fs::create_dir_all(&self_test_root)
+        .map_err(|err| format!("create self-test root failed: {err}"))?;
+
+    let marker_one_shot = "BRIDGINGIO_SELFTEST_ONE_SHOT_OK";
+    let marker_interactive = "BRIDGINGIO_SELFTEST_INTERACTIVE_OK";
+    let marker_env = "BRIDGINGIO_SELFTEST_ENV_OK";
+    let marker_space = "BRIDGINGIO_SELFTEST_SPACE_OK";
+    let marker_arg = "BRIDGINGIO SELFTEST ARG OK";
+    let marker_runtime = "BRIDGINGIO_SELFTEST_RUNTIME_OK";
+    let cwd_hint = "bridgingio selftest cwd";
+
+    println!("self-test [1/5] validating terminal provider one-shot execution...");
+    let mut provider = TerminalProvider::default();
+    let one_shot_artifact = provider
+        .exec_local(
+            "self-test-session",
+            Some("self-test-channel"),
+            Some("self-test-transport"),
+            &format!("echo {marker_one_shot}"),
+            "self-test-artifact-one-shot",
+            &PolicyProfile::default(),
+        )
+        .map_err(|err| format!("one-shot exec failed: {}", err.message))?;
+    let one_shot_chunks = provider.artifacts.read_chunks(&one_shot_artifact.id, 0, 20);
+    if !one_shot_chunks
+        .iter()
+        .any(|line| line.contains(marker_one_shot))
+    {
+        return Err(format!(
+            "one-shot exec output missing marker {marker_one_shot}: {one_shot_chunks:?}"
+        ));
+    }
+    println!("self-test [ok] terminal provider one-shot execution");
+
+    println!("self-test [2/5] validating interactive shell open/write/read/interrupt/close...");
+    let shell = provider.open_interactive_shell(
+        "self-test-session",
+        "self-test-channel-interactive",
+        Some("self-test-transport-interactive"),
+        "self-test",
+    );
+    let write = provider
+        .write_interactive_shell(
+            &shell.shell_id,
+            &format!("echo {marker_interactive}"),
+            "self-test-artifact-interactive",
+            &PolicyProfile::default(),
+        )
+        .map_err(|err| format!("interactive write failed: {}", err.message))?;
+    if !write.output.contains(marker_interactive) {
+        return Err(format!(
+            "interactive output missing marker {marker_interactive}: {}",
+            write.output
+        ));
+    }
+    println!("self-test [ok] interactive shell lifecycle");
+
+    println!("self-test [3/5] validating interactive cwd/env semantics...");
+    let interactive_cwd = self_test_root.join(cwd_hint);
+    fs::create_dir_all(&interactive_cwd)
+        .map_err(|err| format!("create self-test cwd dir failed: {err}"))?;
+
+    #[cfg(windows)]
+    {
+        let change_dir_command = format!("cd /d {}", shell_quote_path(&interactive_cwd));
+        provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                &change_dir_command,
+                "self-test-artifact-cwd-change",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive cd /d failed: {}", err.message))?;
+
+        let cwd_output = provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                "cd",
+                "self-test-artifact-cwd-read",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive cwd read failed: {}", err.message))?;
+        if !cwd_output
+            .output
+            .to_ascii_lowercase()
+            .contains(cwd_hint)
+        {
+            return Err(format!(
+                "interactive cwd output missing expected folder hint ({cwd_hint}): {}",
+                cwd_output.output
+            ));
+        }
+
+        provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                &format!("set BRIDGINGIO_SELFTEST_ENV={marker_env}"),
+                "self-test-artifact-env-set",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive env set failed: {}", err.message))?;
+        let env_output = provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                "echo %BRIDGINGIO_SELFTEST_ENV%",
+                "self-test-artifact-env-read",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive env read failed: {}", err.message))?;
+        if !env_output.output.contains(marker_env) {
+            return Err(format!(
+                "interactive env output missing marker {marker_env}: {}",
+                env_output.output
+            ));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let change_dir_command = format!("cd {}", shell_quote_path(&interactive_cwd));
+        provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                &change_dir_command,
+                "self-test-artifact-cwd-change",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive cd failed: {}", err.message))?;
+
+        let cwd_output = provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                "pwd",
+                "self-test-artifact-cwd-read",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive cwd read failed: {}", err.message))?;
+        if !cwd_output.output.contains(cwd_hint) {
+            return Err(format!(
+                "interactive cwd output missing expected folder hint ({cwd_hint}): {}",
+                cwd_output.output
+            ));
+        }
+
+        provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                &format!("export BRIDGINGIO_SELFTEST_ENV={marker_env}"),
+                "self-test-artifact-env-set",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive env set failed: {}", err.message))?;
+        let env_output = provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                "printf \"%s\\n\" \"$BRIDGINGIO_SELFTEST_ENV\"",
+                "self-test-artifact-env-read",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive env read failed: {}", err.message))?;
+        if !env_output.output.contains(marker_env) {
+            return Err(format!(
+                "interactive env output missing marker {marker_env}: {}",
+                env_output.output
+            ));
+        }
+    }
+    println!("self-test [ok] interactive cwd/env semantics");
+
+    println!("self-test [4/5] validating space-containing path/argument handling...");
+    let spaced_file = interactive_cwd.join("file with space.txt");
+    fs::write(&spaced_file, format!("{marker_space}\n"))
+        .map_err(|err| format!("write self-test spaced file failed: {err}"))?;
+
+    #[cfg(windows)]
+    {
+        let read_command = format!("type {}", shell_quote_path(&spaced_file));
+        let read_output = provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                &read_command,
+                "self-test-artifact-space-read",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive spaced file read failed: {}", err.message))?;
+        if !read_output.output.contains(marker_space) {
+            return Err(format!(
+                "interactive spaced-path output missing marker {marker_space}: {}",
+                read_output.output
+            ));
+        }
+
+        let arg_output = provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                &format!("echo \"{marker_arg}\""),
+                "self-test-artifact-space-arg",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive spaced-arg echo failed: {}", err.message))?;
+        if !arg_output.output.contains(marker_arg) {
+            return Err(format!(
+                "interactive spaced-arg output missing marker {marker_arg}: {}",
+                arg_output.output
+            ));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let read_command = format!("cat {}", shell_quote_path(&spaced_file));
+        let read_output = provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                &read_command,
+                "self-test-artifact-space-read",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive spaced file read failed: {}", err.message))?;
+        if !read_output.output.contains(marker_space) {
+            return Err(format!(
+                "interactive spaced-path output missing marker {marker_space}: {}",
+                read_output.output
+            ));
+        }
+
+        let arg_output = provider
+            .write_interactive_shell(
+                &shell.shell_id,
+                &format!("printf \"%s\\n\" \"{marker_arg}\""),
+                "self-test-artifact-space-arg",
+                &PolicyProfile::default(),
+            )
+            .map_err(|err| format!("interactive spaced-arg echo failed: {}", err.message))?;
+        if !arg_output.output.contains(marker_arg) {
+            return Err(format!(
+                "interactive spaced-arg output missing marker {marker_arg}: {}",
+                arg_output.output
+            ));
+        }
+    }
+    println!("self-test [ok] space-containing path/argument handling");
+
+    provider
+        .interrupt_interactive_shell(&shell.shell_id)
+        .map_err(|err| format!("interactive interrupt failed: {}", err.message))?;
+    provider
+        .close_interactive_shell(&shell.shell_id)
+        .map_err(|err| format!("interactive close failed: {}", err.message))?;
+    let transcript = provider
+        .read_interactive_transcript(&shell.shell_id, 0, 50)
+        .map_err(|err| format!("interactive transcript read failed: {}", err.message))?;
+    if !transcript.iter().any(|line| line.contains(marker_interactive)) {
+        return Err(format!(
+            "interactive transcript missing marker {marker_interactive}: {transcript:?}"
+        ));
+    }
+    println!("self-test [ok] interactive transcript/checkpoint");
+
+    println!("self-test [5/5] validating standalone runtime execute path without config file...");
+    let runtime_root = self_test_root.join("runtime");
+    let state_dir = runtime_root.join("state");
+    let artifacts_dir = runtime_root.join("artifacts");
+    fs::create_dir_all(&state_dir)
+        .map_err(|err| format!("create self-test state dir failed: {err}"))?;
+    fs::create_dir_all(&artifacts_dir)
+        .map_err(|err| format!("create self-test artifacts dir failed: {err}"))?;
+
+    let mut settings = CoreSettings::from_toml_str(CoreSettings::minimal_example())
+        .map_err(|err| format!("parse minimal settings failed: {err:?}"))?;
+    settings.core.instance_name = "bridgingio-self-test".into();
+    settings.core.data_dir = runtime_root.to_string_lossy().to_string();
+    settings.storage.metadata_path = state_dir
+        .join("metadata.sqlite3")
+        .to_string_lossy()
+        .to_string();
+    settings.storage.artifacts.backend = "memory".into();
+    settings.storage.artifacts.root = artifacts_dir.to_string_lossy().to_string();
+    settings.model_plane.http.enabled = false;
+    settings.control_plane.enabled = false;
+    settings.targets = vec![StandaloneTargetProfile {
+        id: "self-test-local".into(),
+        display_name: "Self-Test Local".into(),
+        kind: TargetKind::Other("self-test".into()),
+        enabled: true,
+        aliases: vec!["local".into()],
+        credential_ref: None,
+        notes: Some("self-test synthetic local target".into()),
+        connection: StandaloneConnectionSection::default(),
+        toolchains: HashMap::new(),
+        terminal_provider: TerminalProviderSection {
+            enabled: true,
+            shell: None,
+        },
+        git_repositories: Vec::new(),
+    }];
+
+    let config_hint = runtime_root.join("self-test.toml");
+    let resolver = default_toolchain_resolver(&settings, &config_hint);
+    let mut runtime = StandaloneCoreRuntime::from_settings_with_mode(
+        settings,
+        resolver,
+        CoreHostMode::StandaloneRun,
+    )
+    .map_err(|err| format!("create runtime for self-test failed: {err:?}"))?;
+
+    let context = ApiRequestContext {
+        agent_id: "self-test-agent".into(),
+        run_id: "self-test-run".into(),
+        client_session_id: "self-test-client".into(),
+        reuse_policy: SessionReusePolicy::ReuseIfAlive,
+    };
+
+    let targets = runtime.handle_app_request(ApiRequest {
+        request_id: "self-test-list-targets".into(),
+        context: context.clone(),
+        command: AppCommand::ListTargets,
+    });
+    let target_id = match targets {
+        ApiResponse::Targets { items, .. } => items
+            .into_iter()
+            .find(|item| item.id == "self-test-local")
+            .map(|item| item.id)
+            .ok_or_else(|| "self-test target not found in runtime".to_string())?,
+        other => return Err(format!("unexpected response for list targets: {other:?}")),
+    };
+
+    let open_session = runtime.handle_app_request(ApiRequest {
+        request_id: "self-test-open-session".into(),
+        context: context.clone(),
+        command: AppCommand::OpenSession { target_id },
+    });
+    let session_id = match open_session {
+        ApiResponse::Session { session, .. } => session.id,
+        ApiResponse::Error { error, .. } => {
+            return Err(format!("open session failed: {}", error.message))
+        }
+        other => return Err(format!("unexpected response for open session: {other:?}")),
+    };
+
+    let execution = runtime.handle_app_request(ApiRequest {
+        request_id: "self-test-exec".into(),
+        context: context.clone(),
+        command: AppCommand::Execute {
+            session_id,
+            command: format!("echo {marker_runtime}"),
+            stream: false,
+        },
+    });
+    let artifact_id = match execution {
+        ApiResponse::Execution { artifact, .. } => artifact.id,
+        ApiResponse::Error { error, .. } => return Err(format!("execute failed: {}", error.message)),
+        other => return Err(format!("unexpected response for execute: {other:?}")),
+    };
+
+    let artifact = runtime.handle_app_request(ApiRequest {
+        request_id: "self-test-read-artifact".into(),
+        context,
+        command: AppCommand::ReadArtifact {
+            artifact_id,
+            offset: 0,
+            limit: 50,
+        },
+    });
+    match artifact {
+        ApiResponse::Artifact { artifact, .. } => {
+            if !artifact.chunks.iter().any(|line| line.contains(marker_runtime)) {
+                return Err(format!(
+                    "runtime execute output missing marker {marker_runtime}: {:?}",
+                    artifact.chunks
+                ));
+            }
+        }
+        ApiResponse::Error { error, .. } => {
+            return Err(format!("read artifact failed: {}", error.message))
+        }
+        other => return Err(format!("unexpected response for read artifact: {other:?}")),
+    }
+
+    let _ = fs::remove_dir_all(&self_test_root);
+    println!("self-test [ok] standalone runtime execute path");
+    println!("self-test passed");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn shell_quote_path(path: &Path) -> String {
+    format!("\"{}\"", path.to_string_lossy().replace('"', "\"\""))
+}
+
+#[cfg(not(windows))]
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 fn run_core(
@@ -296,6 +711,7 @@ where
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--self-test" => mode = LaunchMode::SelfTest,
             "run" => mode = LaunchMode::StandaloneRun,
             "ui-managed-ephemeral" => mode = LaunchMode::UiManagedEphemeral,
             "-d" => mode = LaunchMode::StandaloneDetachedLauncher,
@@ -329,6 +745,17 @@ where
     }
 
     match mode {
+        LaunchMode::SelfTest => {
+            if config_path.is_some()
+                || runtime_root.is_some()
+                || control_plane_socket_override.is_some()
+            {
+                return Err(
+                    "--self-test does not accept --config/--runtime-root/--control-plane-socket-override"
+                        .to_string(),
+                );
+            }
+        }
         LaunchMode::UiManagedEphemeral => {
             if runtime_root.is_none() && config_path.is_none() {
                 return Err(
@@ -362,6 +789,7 @@ where
 
 fn print_usage() {
     eprintln!("usage:");
+    eprintln!("  bridgingio-core --self-test");
     eprintln!("  bridgingio-core run --config <path-to-standalone.toml>");
     eprintln!("  bridgingio-core -d --config <path-to-standalone.toml>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --runtime-root <runtime-root-dir>");
@@ -534,6 +962,21 @@ mod tests {
             parse(&["ui-managed-ephemeral", "--runtime-root", "/tmp/runtime"]),
             LaunchMode::UiManagedEphemeral
         );
+    }
+
+    #[test]
+    fn parses_self_test_mode() {
+        assert_eq!(parse(&["--self-test"]), LaunchMode::SelfTest);
+    }
+
+    #[test]
+    fn rejects_self_test_with_config() {
+        let args = ["--self-test", "--config", "/tmp/standalone.toml"]
+            .iter()
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>();
+        let err = parse_args_from(args).expect_err("must reject mixed self-test arguments");
+        assert!(err.contains("--self-test does not accept"));
     }
 
     #[test]
