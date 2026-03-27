@@ -39,6 +39,13 @@ pub struct ArtifactCacheSettingsView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolchainSettingsView {
+    pub command: String,
+    pub path_override: String,
+    pub prefer_builtin_fallback: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreSettingsView {
     pub schema_version: u32,
     pub instance_name: String,
@@ -46,11 +53,19 @@ pub struct CoreSettingsView {
     pub model_plane_http: ModelPlaneHttpView,
     pub control_plane: ControlPlaneView,
     pub artifact_cache: ArtifactCacheSettingsView,
+    pub toolchains: Vec<ToolchainSettingsView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolchainDiagnosticView {
     pub command: String,
+    pub target_id: Option<String>,
+    pub target_name: Option<String>,
+    pub target_override_path: Option<String>,
+    pub global_override_path: Option<String>,
+    pub effective_scope: Option<String>,
+    pub effective_source: Option<String>,
+    pub effective_path: Option<String>,
     pub selected_source: Option<String>,
     pub selected_path: Option<String>,
 }
@@ -413,6 +428,16 @@ impl AppApiLineCodec {
                 if let Some(credential) = profile.credential_ref.as_ref() {
                     base.push_str(&format!("|credential_ref={}", escape(&credential.id)));
                 }
+                let mut toolchain_entries = profile.toolchains.iter().collect::<Vec<_>>();
+                toolchain_entries.sort_by(|a, b| a.0.cmp(b.0));
+                base.push_str(&format!("|target_toolchain_count={}", toolchain_entries.len()));
+                for (index, (command, path_override)) in toolchain_entries.iter().enumerate() {
+                    base.push_str(&format!(
+                        "|target_toolchain_{index}_command={}|target_toolchain_{index}_path_override={}",
+                        escape(command),
+                        escape(path_override)
+                    ));
+                }
                 match &profile.connection {
                     ConnectionConfig::Ssh {
                         host,
@@ -662,22 +687,34 @@ impl AppApiLineCodec {
             ApiResponse::Settings {
                 request_id,
                 settings,
-            } => format!(
-                "kind=settings|request_id={request_id}|schema_version={}|instance_name={}|host={}|port={}|allow_non_loopback={}|auth_mode={}|control_transport={}|artifact_backend={}|artifact_root={}|artifact_max_bytes={}|artifact_eviction_policy={}|artifact_used_bytes={}|artifact_count={}",
-                settings.schema_version,
-                escape(&settings.instance_name),
-                settings.model_plane_http.host,
-                settings.model_plane_http.port,
-                settings.model_plane_http.allow_non_loopback,
-                settings.model_plane_http.auth_mode,
-                settings.control_plane.transport,
-                settings.artifact_cache.backend,
-                escape(&settings.artifact_cache.root),
-                settings.artifact_cache.max_bytes,
-                settings.artifact_cache.eviction_policy,
-                settings.artifact_cache.used_bytes,
-                settings.artifact_cache.artifact_count,
-            ),
+            } => {
+                let mut line = format!(
+                    "kind=settings|request_id={request_id}|schema_version={}|instance_name={}|host={}|port={}|allow_non_loopback={}|auth_mode={}|control_transport={}|artifact_backend={}|artifact_root={}|artifact_max_bytes={}|artifact_eviction_policy={}|artifact_used_bytes={}|artifact_count={}|toolchain_count={}",
+                    settings.schema_version,
+                    escape(&settings.instance_name),
+                    settings.model_plane_http.host,
+                    settings.model_plane_http.port,
+                    settings.model_plane_http.allow_non_loopback,
+                    settings.model_plane_http.auth_mode,
+                    settings.control_plane.transport,
+                    settings.artifact_cache.backend,
+                    escape(&settings.artifact_cache.root),
+                    settings.artifact_cache.max_bytes,
+                    settings.artifact_cache.eviction_policy,
+                    settings.artifact_cache.used_bytes,
+                    settings.artifact_cache.artifact_count,
+                    settings.toolchains.len(),
+                );
+                for (index, toolchain) in settings.toolchains.iter().enumerate() {
+                    line.push_str(&format!(
+                        "|toolchain_{index}_command={}|toolchain_{index}_path_override={}|toolchain_{index}_prefer_builtin_fallback={}",
+                        escape(&toolchain.command),
+                        escape(&toolchain.path_override),
+                        toolchain.prefer_builtin_fallback
+                    ));
+                }
+                line
+            }
             ApiResponse::Sessions { request_id, items } => {
                 format!("kind=sessions|request_id={request_id}|count={}", items.len())
             }
@@ -833,6 +870,37 @@ impl AppApiLineCodec {
                             .parse()
                             .map_err(|_| invalid_request("artifact_count must be usize"))?,
                     },
+                    toolchains: {
+                        let toolchain_count = optional(&map, "toolchain_count")
+                            .map(|raw| {
+                                raw.parse::<usize>()
+                                    .map_err(|_| invalid_request("toolchain_count must be usize"))
+                            })
+                            .transpose()?
+                            .unwrap_or(0);
+                        let mut items = Vec::with_capacity(toolchain_count);
+                        for index in 0..toolchain_count {
+                            items.push(ToolchainSettingsView {
+                                command: unescape(required(&map, &format!(
+                                    "toolchain_{index}_command"
+                                ))?),
+                                path_override: unescape(required(&map, &format!(
+                                    "toolchain_{index}_path_override"
+                                ))?),
+                                prefer_builtin_fallback: required(
+                                    &map,
+                                    &format!("toolchain_{index}_prefer_builtin_fallback"),
+                                )?
+                                .parse()
+                                .map_err(|_| {
+                                    invalid_request(
+                                        "toolchain_<n>_prefer_builtin_fallback must be bool",
+                                    )
+                                })?,
+                            });
+                        }
+                        items
+                    },
                 },
             }),
             "session" => Ok(ApiResponse::Accepted {
@@ -980,6 +1048,25 @@ fn parse_profile_from_fields(
         }
     }
 
+    let mut toolchains = std::collections::BTreeMap::new();
+    let count = optional(map, "target_toolchain_count")
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|_| invalid_request("target_toolchain_count must be usize"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    for index in 0..count {
+        let command_key = format!("target_toolchain_{index}_command");
+        let path_key = format!("target_toolchain_{index}_path_override");
+        let command = unescape(required(map, &command_key)?).trim().to_string();
+        let path_override = unescape(required(map, &path_key)?).trim().to_string();
+        if command.is_empty() {
+            return Err(invalid_request("target toolchain command must be non-empty"));
+        }
+        toolchains.insert(command, path_override);
+    }
+
     Ok(TargetProfile {
         id,
         name,
@@ -992,6 +1079,7 @@ fn parse_profile_from_fields(
         default_policy: PolicyProfile::default(),
         notes: optional(map, "notes").map(unescape),
         metadata,
+        toolchains,
     })
 }
 
@@ -1039,7 +1127,9 @@ fn unescape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use bridgingio_domain::SessionReusePolicy;
+    use std::collections::BTreeMap;
+
+    use bridgingio_domain::{ConnectionConfig, SessionReusePolicy, TargetKind, TargetProfile};
 
     use super::{
         ApiRequest, ApiRequestContext, ApiResponse, AppApiLineCodec, AppCommand,
@@ -1124,6 +1214,7 @@ mod tests {
                     used_bytes: 128,
                     artifact_count: 2,
                 },
+                toolchains: Vec::new(),
             },
         });
         assert!(line.contains("kind=settings"));
@@ -1159,6 +1250,95 @@ mod tests {
                 assert_eq!(payload_json, "{\"targets\":[]}");
             }
             other => panic!("expected bootstrap response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_upsert_profile_with_target_toolchains() {
+        let mut toolchains = BTreeMap::new();
+        toolchains.insert("adb".to_string(), "/Applications/AndroidStudio.app/adb".to_string());
+        let request = ApiRequest {
+            request_id: "req-upsert-profile".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::UpsertProfile {
+                profile: TargetProfile {
+                    id: "android-emulator".into(),
+                    name: "Android Emulator".into(),
+                    kind: TargetKind::Adb,
+                    connection: ConnectionConfig::Adb {
+                        serial: Some("emulator-5554".into()),
+                        transport: Some("serial".into()),
+                    },
+                    credential_ref: None,
+                    default_policy: bridgingio_domain::PolicyProfile::default(),
+                    notes: None,
+                    metadata: BTreeMap::new(),
+                    toolchains,
+                },
+            },
+        };
+
+        let line = AppApiLineCodec::encode_request_line(&request);
+        let parsed = AppApiLineCodec::decode_request_line(&line).expect("decode request");
+        match parsed.command {
+            AppCommand::UpsertProfile { profile } => {
+                assert_eq!(
+                    profile.toolchains.get("adb").map(String::as_str),
+                    Some("/Applications/AndroidStudio.app/adb")
+                );
+            }
+            other => panic!("expected upsert_profile command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_settings_toolchains() {
+        let response = ApiResponse::Settings {
+            request_id: "req-settings".into(),
+            settings: CoreSettingsView {
+                schema_version: 1,
+                instance_name: "bridgingio".into(),
+                data_dir: "~/.bridgingio".into(),
+                model_plane_http: ModelPlaneHttpView {
+                    host: "127.0.0.1".into(),
+                    port: 19718,
+                    allow_non_loopback: false,
+                    auth_mode: "none".into(),
+                },
+                control_plane: ControlPlaneView {
+                    enabled: true,
+                    transport: "platform-ipc".into(),
+                    endpoint: "auto".into(),
+                },
+                artifact_cache: ArtifactCacheSettingsView {
+                    backend: "filesystem".into(),
+                    root: "~/.bridgingio/artifacts".into(),
+                    max_bytes: 1024,
+                    eviction_policy: "lru".into(),
+                    used_bytes: 128,
+                    artifact_count: 2,
+                },
+                toolchains: vec![super::ToolchainSettingsView {
+                    command: "adb".into(),
+                    path_override: "/opt/homebrew/bin/adb".into(),
+                    prefer_builtin_fallback: false,
+                }],
+            },
+        };
+        let line = AppApiLineCodec::encode_response_line(&response);
+        let parsed = AppApiLineCodec::decode_response_line(&line).expect("decode settings line");
+        match parsed {
+            ApiResponse::Settings { settings, .. } => {
+                assert_eq!(settings.toolchains.len(), 1);
+                assert_eq!(settings.toolchains[0].command, "adb");
+                assert_eq!(settings.toolchains[0].path_override, "/opt/homebrew/bin/adb");
+            }
+            other => panic!("expected settings response, got {other:?}"),
         }
     }
 }

@@ -329,6 +329,7 @@ pub struct StandaloneTargetProfile {
     pub credential_ref: Option<String>,
     pub notes: Option<String>,
     pub connection: StandaloneConnectionSection,
+    pub toolchains: HashMap<String, ToolchainSection>,
     pub terminal_provider: TerminalProviderSection,
     pub git_repositories: Vec<GitRepositorySection>,
 }
@@ -431,6 +432,7 @@ impl CoreSettings {
             PoliciesDefaults,
             Target,
             TargetConnection,
+            TargetToolchain(String),
             TargetTerminal,
             TargetGitRepo,
             TargetGitReview,
@@ -501,6 +503,7 @@ impl CoreSettings {
                             credential_ref: None,
                             notes: None,
                             connection: StandaloneConnectionSection::default(),
+                            toolchains: HashMap::new(),
                             terminal_provider: TerminalProviderSection {
                                 enabled: false,
                                 shell: None,
@@ -544,6 +547,12 @@ impl CoreSettings {
                     "model_plane.http.auth" => Section::ModelPlaneHttpAuth,
                     "policies.defaults" => Section::PoliciesDefaults,
                     "targets.connection" => Section::TargetConnection,
+                    _ if section_name.starts_with("targets.toolchains.") => {
+                        let name = section_name
+                            .trim_start_matches("targets.toolchains.")
+                            .to_string();
+                        Section::TargetToolchain(name)
+                    }
                     "targets.providers.terminal" => Section::TargetTerminal,
                     "targets.providers.git.repositories.review" => Section::TargetGitReview,
                     _ if section_name.starts_with("toolchains.") => {
@@ -686,6 +695,25 @@ impl CoreSettings {
                             target.connection.selector_value = Some(parse_string(key, value)?)
                         }
                         _ => return Err(invalid_field(key, "targets.connection")),
+                    }
+                }
+                Section::TargetToolchain(name) => {
+                    let target = targets
+                        .last_mut()
+                        .ok_or(ConfigError::MissingSection("targets"))?;
+                    let entry = target
+                        .toolchains
+                        .entry(name.clone())
+                        .or_insert(ToolchainSection {
+                            path_override: String::new(),
+                            prefer_builtin_fallback: false,
+                        });
+                    match key {
+                        "path_override" => entry.path_override = parse_string(key, value)?,
+                        "prefer_builtin_fallback" => {
+                            entry.prefer_builtin_fallback = parse_bool(key, value)?
+                        }
+                        _ => return Err(invalid_field(key, "targets.toolchains.<name>")),
                     }
                 }
                 Section::TargetTerminal => {
@@ -904,6 +932,10 @@ impl CoreSettings {
                 description: "工具用户覆盖路径。",
             },
             ConfigFieldDescription {
+                path: "targets[].toolchains.<name>.path_override",
+                description: "目标级工具覆盖路径，优先于全局 toolchains。",
+            },
+            ConfigFieldDescription {
                 path: "policies.defaults.reuse_policy",
                 description: "逻辑会话复用策略。",
             },
@@ -1045,6 +1077,26 @@ impl CoreSettings {
                 lines.push(format!("selector_value = {}", toml_quote(selector_value)));
             }
             lines.push(String::new());
+
+            let mut target_toolchain_keys =
+                target.toolchains.keys().cloned().collect::<Vec<_>>();
+            target_toolchain_keys.sort();
+            for key in target_toolchain_keys {
+                let section = target
+                    .toolchains
+                    .get(&key)
+                    .expect("target toolchain key from sorted iteration");
+                lines.push(format!("[targets.toolchains.{key}]"));
+                lines.push(format!(
+                    "path_override = {}",
+                    toml_quote(&section.path_override)
+                ));
+                lines.push(format!(
+                    "prefer_builtin_fallback = {}",
+                    section.prefer_builtin_fallback
+                ));
+                lines.push(String::new());
+            }
 
             lines.push("[targets.providers.terminal]".to_string());
             lines.push(format!("enabled = {}", target.terminal_provider.enabled));
@@ -1255,6 +1307,7 @@ mod tests {
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
+            toolchains: Default::default(),
         });
 
         let now = SystemTime::now();
@@ -1409,8 +1462,49 @@ mod config_tests {
             CoreSettings::from_toml_str(CoreSettings::complete_example()).expect("parse complete");
         assert_eq!(config.targets.len(), 2);
         assert!(config.toolchains.contains_key("adb"));
+        let adb_target = config
+            .targets
+            .iter()
+            .find(|target| target.id == "android-emulator")
+            .expect("android emulator target");
+        assert_eq!(
+            adb_target
+                .toolchains
+                .get("adb")
+                .map(|section| section.path_override.as_str()),
+            Some("/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb")
+        );
         assert_eq!(config.model_plane.http.host, "127.0.0.1");
         assert_eq!(config.storage.artifacts.backend, "filesystem");
+    }
+
+    #[test]
+    fn target_and_global_toolchain_roundtrip_preserves_scope() {
+        let config = CoreSettings::from_toml_str(CoreSettings::complete_example())
+            .expect("parse complete example");
+        let serialized = config.to_toml_string();
+        let reparsed = CoreSettings::from_toml_str(&serialized).expect("reparse serialized");
+
+        assert_eq!(
+            reparsed
+                .toolchains
+                .get("adb")
+                .map(|section| section.path_override.as_str()),
+            Some("/opt/homebrew/bin/adb")
+        );
+
+        let adb_target = reparsed
+            .targets
+            .iter()
+            .find(|target| target.id == "android-emulator")
+            .expect("android emulator target");
+        assert_eq!(
+            adb_target
+                .toolchains
+                .get("adb")
+                .map(|section| section.path_override.as_str()),
+            Some("/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb")
+        );
     }
 
     #[test]

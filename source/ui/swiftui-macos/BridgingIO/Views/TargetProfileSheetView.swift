@@ -35,7 +35,9 @@ struct TargetProfileSheetView: View {
                     generalSection
                     connectionSection
                     credentialSection
-                    toolingSection
+                    if !relevantToolDiagnostics.isEmpty {
+                        toolingSection
+                    }
                     policySection
                 }
                 .padding(16)
@@ -198,7 +200,7 @@ struct TargetProfileSheetView: View {
     private var toolingSection: some View {
         SheetCard(title: L10n.t("target_sheet.section.tooling"), theme: theme) {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(Array(viewModel.draft.toolDiagnostics.enumerated()), id: \.element.id) { index, diagnostic in
+                ForEach(relevantToolDiagnostics, id: \.id) { diagnostic in
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text(diagnostic.connectorName.uppercased())
@@ -214,12 +216,15 @@ struct TargetProfileSheetView: View {
                             .font(ConsoleTypography.body(12))
                             .foregroundStyle(theme.textSecondary)
 
+                        if !diagnostic.globalOverridePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text("Global override: \(diagnostic.globalOverridePath)")
+                                .font(ConsoleTypography.body(11))
+                                .foregroundStyle(theme.muted)
+                        }
+
                         TextField(
                             L10n.t("workspace.tool.override_path_placeholder"),
-                            text: Binding(
-                                get: { viewModel.draft.toolDiagnostics[index].overridePath },
-                                set: { viewModel.applyConnectorOverride(for: diagnostic.id, path: $0) }
-                            )
+                            text: overrideBinding(for: diagnostic.id)
                         )
                         .consoleInput(theme: theme, surface: .panel)
                     }
@@ -233,6 +238,33 @@ struct TargetProfileSheetView: View {
                 }
             }
         }
+    }
+
+    private var relevantToolDiagnostics: [ToolSourceDiagnostic] {
+        let command: String?
+        switch viewModel.draft.kind {
+        case .ssh:
+            command = "ssh"
+        case .adb:
+            command = "adb"
+        default:
+            command = nil
+        }
+        guard let command else { return [] }
+        return viewModel.draft.toolDiagnostics.filter { $0.id == command }
+    }
+
+    private func overrideBinding(for diagnosticID: String) -> Binding<String> {
+        Binding(
+            get: {
+                viewModel.draft.toolDiagnostics
+                    .first(where: { $0.id == diagnosticID })?
+                    .overridePath ?? ""
+            },
+            set: { value in
+                viewModel.applyConnectorOverride(for: diagnosticID, path: value)
+            }
+        )
     }
 
     private var policySection: some View {

@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -44,8 +46,53 @@ fn temp_dir(prefix: &str) -> PathBuf {
 fn toolchain_resolver(root: &PathBuf) -> ToolchainResolver {
     let ssh = root.join("ssh");
     let adb = root.join("adb");
-    fs::write(&ssh, "binary").expect("write ssh");
-    fs::write(&adb, "binary").expect("write adb");
+    fs::write(
+        &ssh,
+        r#"#!/bin/sh
+if [ "${1:-}" = "-V" ]; then
+  echo "OpenSSH_mock" >&2
+  exit 0
+fi
+if [ "${1:-}" = "-p" ] && [ "$#" -ge 4 ]; then
+  remote_cmd="$4"
+  /bin/sh -lc "$remote_cmd"
+  exit $?
+fi
+exec /bin/sh -s
+"#,
+    )
+    .expect("write ssh");
+    fs::write(
+        &adb,
+        r#"#!/bin/sh
+if [ "${1:-}" = "-s" ] || [ "${1:-}" = "-t" ]; then
+  shift 2
+fi
+if [ "${1:-}" = "-e" ] || [ "${1:-}" = "-d" ]; then
+  shift
+fi
+if [ "${1:-}" != "shell" ]; then
+  echo "unsupported adb mock invocation: $*" >&2
+  exit 1
+fi
+shift
+if [ "$#" -gt 0 ]; then
+  /bin/sh -lc "$1"
+  exit $?
+fi
+exec /bin/sh -s
+"#,
+    )
+    .expect("write adb");
+    #[cfg(unix)]
+    {
+        let mut ssh_perms = fs::metadata(&ssh).expect("ssh metadata").permissions();
+        ssh_perms.set_mode(0o755);
+        fs::set_permissions(&ssh, ssh_perms).expect("chmod ssh");
+        let mut adb_perms = fs::metadata(&adb).expect("adb metadata").permissions();
+        adb_perms.set_mode(0o755);
+        fs::set_permissions(&adb, adb_perms).expect("chmod adb");
+    }
     ToolchainResolver::new(
         ExecutableResolver::with_search_paths(vec![root.clone()]),
         root,
@@ -601,7 +648,7 @@ fn validates_mcp_http_jsonrpc_entry_and_alias_exec() {
             "name": "bridgingio.terminal.exec",
             "arguments": {
                 "target": "local",
-                "command": "printf 'alias-ok\\n'",
+                "command": "ssh -V >/dev/null 2>&1; printf 'alias-ok\\n'",
                 "agent_id": "agent-mcp",
                 "run_id": "run-mcp-1",
                 "client_session_id": "client-mcp",
@@ -816,7 +863,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
             "name": "bridgingio.terminal.shell.write",
             "arguments": {
                 "shell_id": shell_id.clone(),
-                "input": "export DEMO_ENV=hello",
+                "input": "cd /tmp",
                 "agent_id": "agent-a",
                 "run_id": "run-1",
                 "client_session_id": "client-1",
@@ -839,7 +886,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
             "name": "bridgingio.terminal.shell.write",
             "arguments": {
                 "shell_id": shell_id.clone(),
-                "input": "printf \"$DEMO_ENV\\n\"",
+                "input": "pwd",
                 "agent_id": "agent-a",
                 "run_id": "run-1",
                 "client_session_id": "client-1",
@@ -854,7 +901,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
     assert!(payload["result"]["structuredContent"]["output"]
         .as_str()
         .unwrap_or_default()
-        .contains("hello"));
+        .contains("/tmp"));
 
     let addr = http_server.local_addr().expect("http addr");
     let open_second = json!({
@@ -891,7 +938,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
             "name": "bridgingio.terminal.shell.write",
             "arguments": {
                 "shell_id": shell_2.clone(),
-                "input": "printf \"$DEMO_ENV\\n\"",
+                "input": "pwd",
                 "agent_id": "agent-a",
                 "run_id": "run-1",
                 "client_session_id": "client-1",
@@ -906,7 +953,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
     assert!(!payload["result"]["structuredContent"]["output"]
         .as_str()
         .unwrap_or_default()
-        .contains("hello"));
+        .contains("/tmp"));
 
     let addr = http_server.local_addr().expect("http addr");
     let read = json!({
@@ -936,7 +983,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
     assert!(lines.iter().any(|line| {
         line.as_str()
             .unwrap_or_default()
-            .contains("export DEMO_ENV=hello")
+            .contains("cd /tmp")
     }));
 
     let addr = http_server.local_addr().expect("http addr");

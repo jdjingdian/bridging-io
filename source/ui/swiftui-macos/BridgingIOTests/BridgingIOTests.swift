@@ -122,6 +122,49 @@ struct BridgingIOTests {
         #expect(viewModel.coreConnectionState == .restartFailed("restart boom"))
     }
 
+    @Test func targetEditorShowsOnlyKindRelevantToolDiagnostics() throws {
+        let viewModel = WorkspaceViewModel(dataSource: WorkspaceViewModel.fixtureDataSource())
+        guard let sshTarget = viewModel.targets.first(where: { $0.kind == .ssh }) else {
+            Issue.record("Expected SSH target in fixture")
+            return
+        }
+        guard let adbTarget = viewModel.targets.first(where: { $0.kind == .adb }) else {
+            Issue.record("Expected ADB target in fixture")
+            return
+        }
+
+        viewModel.openEditTargetSheet(for: sshTarget)
+        let sshDiagnostics = viewModel.targetEditorContext?.draft.toolDiagnostics.map(\.id) ?? []
+        #expect(Set(sshDiagnostics) == ["ssh"])
+
+        viewModel.openEditTargetSheet(for: adbTarget)
+        let adbDiagnostics = viewModel.targetEditorContext?.draft.toolDiagnostics.map(\.id) ?? []
+        #expect(Set(adbDiagnostics) == ["adb"])
+    }
+
+    @Test func fixtureSnapshotExposesGlobalToolchainSettings() throws {
+        let viewModel = WorkspaceViewModel(dataSource: WorkspaceViewModel.fixtureDataSource())
+        #expect(viewModel.globalToolchains.contains(where: { $0.command == "adb" }))
+        #expect(viewModel.globalToolchains.contains(where: { $0.command == "ssh" }))
+    }
+
+    @Test func savingGlobalToolchainOverrideUpdatesDiagnosticsEcho() throws {
+        let viewModel = WorkspaceViewModel(dataSource: WorkspaceViewModel.fixtureDataSource())
+        guard let sshTarget = viewModel.targets.first(where: { $0.kind == .ssh }) else {
+            Issue.record("Expected SSH target in fixture")
+            return
+        }
+        viewModel.selectTarget(sshTarget)
+
+        viewModel.updateGlobalToolchainDraft(command: "ssh", path: "/tmp/custom-ssh")
+        viewModel.saveGlobalToolchain(command: "ssh")
+
+        let diagnostic = viewModel.selectedTarget?.toolDiagnostics.first(where: { $0.id == "ssh" })
+        #expect(diagnostic?.globalOverridePath == "/tmp/custom-ssh")
+        #expect(diagnostic?.effectiveScope == "global_override")
+        #expect(diagnostic?.effectivePath == "/tmp/custom-ssh")
+    }
+
     private func localized(_ key: String, locale: String) -> String {
         let bundle = Bundle.main
         guard let path = bundle.path(forResource: locale, ofType: "lproj"),
@@ -162,6 +205,7 @@ private final class ManagedMockDataSource: ManagedWorkspaceDataSource {
     private(set) var updateModelPlaneCallCount = 0
     private(set) var controlledRestartCallCount = 0
     private(set) var upsertProfileCallCount = 0
+    private(set) var updateToolOverrideCallCount = 0
     private(set) var lastUpsertDraft: TargetProfileDraft?
     private(set) var runtimeRootPath: String?
 
@@ -206,8 +250,14 @@ private final class ManagedMockDataSource: ManagedWorkspaceDataSource {
     }
 
     func updateToolOverride(connectorID: String, newPath: String) throws -> String {
-        _ = connectorID
-        _ = newPath
+        updateToolOverrideCallCount += 1
+        if let index = snapshot.globalToolchains.firstIndex(where: { $0.command == connectorID }) {
+            snapshot.globalToolchains[index].pathOverride = newPath
+        } else {
+            snapshot.globalToolchains.append(
+                ToolchainSetting(command: connectorID, pathOverride: newPath)
+            )
+        }
         return updateToolOverrideStrategy
     }
 

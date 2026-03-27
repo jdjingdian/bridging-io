@@ -656,6 +656,7 @@ mod tests {
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
+            toolchains: Default::default(),
         };
 
         let invocation = connector
@@ -682,6 +683,7 @@ mod tests {
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
+            toolchains: Default::default(),
         };
 
         let invocation = connector
@@ -707,6 +709,7 @@ mod tests {
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
+            toolchains: Default::default(),
         };
 
         let invocation = connector
@@ -732,6 +735,7 @@ mod tests {
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
+            toolchains: Default::default(),
         };
 
         let invocation = connector

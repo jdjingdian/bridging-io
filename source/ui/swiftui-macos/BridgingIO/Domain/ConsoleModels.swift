@@ -246,7 +246,15 @@ struct ToolSourceDiagnostic: Identifiable, Equatable {
     var sourceType: ToolSourceType
     var effectivePath: String
     var overridePath: String
+    var globalOverridePath: String = ""
+    var effectiveScope: String = ""
     var lastChecked: Date
+}
+
+struct ToolchainSetting: Identifiable, Equatable {
+    var id: String { command }
+    var command: String
+    var pathOverride: String
 }
 
 struct TargetPolicyDefaults: Equatable {

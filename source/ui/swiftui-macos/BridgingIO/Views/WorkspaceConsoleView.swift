@@ -454,15 +454,21 @@ struct WorkspaceConsoleView: View {
                                 .font(ConsoleTypography.body(12))
                                 .foregroundStyle(theme.textSecondary)
 
-                            TextField(
-                                L10n.t("workspace.tool.override_path_placeholder"),
-                                text: Binding(
-                                    get: { diagnostic.overridePath },
-                                    set: { viewModel.updateToolOverride(connectorID: diagnostic.id, newPath: $0) }
-                                )
-                            )
-                            .consoleInput(theme: theme, surface: .panel)
-                            .accessibilityIdentifier("tool-override-\(diagnostic.id)")
+                            if !diagnostic.overridePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text("Target override: \(diagnostic.overridePath)")
+                                    .font(ConsoleTypography.body(11))
+                                    .foregroundStyle(theme.textSecondary)
+                            }
+                            if !diagnostic.globalOverridePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text("Global override: \(diagnostic.globalOverridePath)")
+                                    .font(ConsoleTypography.body(11))
+                                    .foregroundStyle(theme.textSecondary)
+                            }
+                            if !diagnostic.effectiveScope.isEmpty {
+                                Text("Effective scope: \(diagnostic.effectiveScope)")
+                                    .font(ConsoleTypography.body(11))
+                                    .foregroundStyle(theme.muted)
+                            }
                         }
                         .padding(8)
                         .background(theme.elevated)

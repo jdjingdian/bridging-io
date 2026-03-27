@@ -189,6 +189,23 @@ impl TerminalProvider {
         transport_session_id: Option<&str>,
         target_kind: &str,
     ) -> InteractiveShellState {
+        self.open_interactive_shell_with_command(
+            logical_session_id,
+            channel_id,
+            transport_session_id,
+            target_kind,
+            None,
+        )
+    }
+
+    pub fn open_interactive_shell_with_command(
+        &mut self,
+        logical_session_id: &str,
+        channel_id: &str,
+        transport_session_id: Option<&str>,
+        target_kind: &str,
+        launch_command: Option<&str>,
+    ) -> InteractiveShellState {
         self.next_shell_seq += 1;
         let shell_id = format!("shell-{:06}", self.next_shell_seq);
         let prompt = default_prompt_for(target_kind);
@@ -210,7 +227,7 @@ impl TerminalProvider {
             inflight_marker: None,
         };
 
-        if let Ok(process) = spawn_interactive_process() {
+        if let Ok(process) = spawn_interactive_process(launch_command) {
             if process.backend == InteractiveShellBackend::Pipe {
                 state
                     .transcript
@@ -413,17 +430,29 @@ fn default_prompt_for(target_kind: &str) -> String {
     }
 }
 
-fn spawn_interactive_process() -> Result<InteractiveShellProcess, ProviderError> {
+fn spawn_interactive_process(
+    launch_command: Option<&str>,
+) -> Result<InteractiveShellProcess, ProviderError> {
+    if launch_command.is_some() {
+        return spawn_interactive_pipe_process(launch_command);
+    }
     #[cfg(unix)]
-    if let Ok(process) = spawn_interactive_pty_process() {
+    if let Ok(process) = spawn_interactive_pty_process(launch_command) {
         return Ok(process);
     }
-    spawn_interactive_pipe_process()
+    spawn_interactive_pipe_process(launch_command)
 }
 
-fn spawn_interactive_pipe_process() -> Result<InteractiveShellProcess, ProviderError> {
-    let mut child = Command::new("/bin/sh")
-        .arg("-s")
+fn spawn_interactive_pipe_process(
+    launch_command: Option<&str>,
+) -> Result<InteractiveShellProcess, ProviderError> {
+    let mut command = Command::new("/bin/sh");
+    if let Some(launch_command) = launch_command {
+        command.arg("-lc").arg(launch_command);
+    } else {
+        command.arg("-s");
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -455,7 +484,9 @@ fn spawn_interactive_pipe_process() -> Result<InteractiveShellProcess, ProviderE
 }
 
 #[cfg(unix)]
-fn spawn_interactive_pty_process() -> Result<InteractiveShellProcess, ProviderError> {
+fn spawn_interactive_pty_process(
+    launch_command: Option<&str>,
+) -> Result<InteractiveShellProcess, ProviderError> {
     let (master_fd, slave_fd) = openpty_pair()?;
     let master = unsafe { File::from_raw_fd(master_fd) };
     let master_reader = master.try_clone().map_err(|err| ProviderError {
@@ -472,8 +503,13 @@ fn spawn_interactive_pty_process() -> Result<InteractiveShellProcess, ProviderEr
         message: format!("failed to clone PTY slave fd for stderr: {err}"),
     })?;
 
-    let child = Command::new("/bin/sh")
-        .arg("-s")
+    let mut command = Command::new("/bin/sh");
+    if let Some(launch_command) = launch_command {
+        command.arg("-lc").arg(launch_command);
+    } else {
+        command.arg("-s");
+    }
+    let child = command
         .stdin(Stdio::from(child_stdin))
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr))

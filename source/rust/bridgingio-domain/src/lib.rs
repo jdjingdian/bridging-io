@@ -87,6 +87,7 @@ pub struct TargetProfile {
     pub default_policy: PolicyProfile,
     pub notes: Option<String>,
     pub metadata: MetadataMap,
+    pub toolchains: MetadataMap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,6 +362,7 @@ mod tests {
             default_policy: PolicyProfile::default(),
             notes: Some("production bastion".into()),
             metadata: MetadataMap::new(),
+            toolchains: MetadataMap::new(),
         };
 
         assert!(matches!(profile.kind, TargetKind::Ssh));

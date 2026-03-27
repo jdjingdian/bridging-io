@@ -89,6 +89,10 @@ credential_ref = "vault://bridgingio/adb/default"
 selector_kind = "serial"
 selector_value = "emulator-5554"
 
+[targets.toolchains.adb]
+path_override = "/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb"
+prefer_builtin_fallback = false
+
 [targets.providers.terminal]
 enabled = true
 shell = "/system/bin/sh"

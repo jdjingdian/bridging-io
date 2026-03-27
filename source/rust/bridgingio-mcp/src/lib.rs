@@ -14,13 +14,14 @@ use bridgingio_artifacts::{
     ArtifactCacheBackend, ArtifactEvictionPolicy, ArtifactReadResult, ArtifactRefineMode,
     ArtifactStore, ArtifactStoreConfig,
 };
-use bridgingio_connectors::{ToolchainResolutionDiagnostics, ToolchainResolver};
+use bridgingio_connectors::{ExecutableSource, ToolchainResolver};
 use bridgingio_domain::{
     AccessScope, ArtifactRecord, CapabilitySummary, ChannelKind, ChannelStatus, ConnectionConfig,
     SessionRecord, SessionReusePolicy, SessionState, TargetKind, TargetProfile,
 };
 use bridgingio_engine::{
     CoreSettings, CoreSettingsStore, StandaloneConnectionSection, StandaloneTargetProfile,
+    ToolchainSection,
 };
 use bridgingio_policy::{evaluate, OperationKind, PolicyDecision};
 use bridgingio_providers::{GitProvider, TerminalProvider};
@@ -712,6 +713,7 @@ pub struct StandaloneCoreRuntime {
     next_timeline_seq: u64,
     next_internal_artifact_seq: u64,
     toolchain_diagnostics: Vec<ToolchainDiagnosticView>,
+    toolchain_resolver: ToolchainResolver,
     _vault_router: SecretVaultRouter,
 }
 
@@ -768,32 +770,9 @@ impl StandaloneCoreRuntime {
             .set_active_backend(&settings.vault.backend)
             .map_err(vault_error_to_runtime)?;
 
-        let mut diagnostics = Vec::new();
-        let mut commands = settings
-            .toolchains
-            .keys()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        commands.sort();
-        for command in commands {
-            let configured = settings
-                .toolchains
-                .get(&command)
-                .expect("toolchain key from iteration");
-            let override_path = if configured.path_override.trim().is_empty() {
-                None
-            } else {
-                Some(Path::new(&configured.path_override))
-            };
-            let (_selected, diag) =
-                toolchain_resolver.resolve_with_diagnostics(&command, override_path);
-            diagnostics.push(to_toolchain_diagnostic(diag));
-        }
-
         let artifact_store = ArtifactStore::new(artifact_store_config_from_settings(&settings)?)
             .map_err(|err| CoreRuntimeError::Config(err.message))?;
-
-        Ok(Self {
+        let mut runtime = Self {
             host_mode,
             readiness_state,
             attached_ui: None,
@@ -808,9 +787,12 @@ impl StandaloneCoreRuntime {
             next_session_seq: 0,
             next_timeline_seq: 0,
             next_internal_artifact_seq: 0,
-            toolchain_diagnostics: diagnostics,
+            toolchain_diagnostics: Vec::new(),
+            toolchain_resolver,
             _vault_router: vault_router,
-        })
+        };
+        runtime.refresh_toolchain_diagnostics();
+        Ok(runtime)
     }
 
     pub fn from_config_file(
@@ -918,7 +900,8 @@ impl StandaloneCoreRuntime {
         let target = self
             .resolve_target_profile_by_ref(target_ref)
             .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
-        let connector_command = build_connector_command(&target, command);
+        let (resolved_path, _resolved_source) = self.resolve_transport_executable_for_target(&target);
+        let connector_command = build_connector_command(&target, command, resolved_path.as_deref());
         let artifact_id = artifact_id.unwrap_or_else(|| self.next_internal_artifact_hint());
         let result = self.tool_handler.handle(ToolRequest::TerminalExec {
             target_id: target.id.clone(),
@@ -1012,12 +995,15 @@ impl StandaloneCoreRuntime {
             context.reuse_policy.clone(),
             now,
         );
+        let (resolved_path, resolved_source) = self.resolve_transport_executable_for_target(&target);
+        let launch_command =
+            build_interactive_connector_command(&target, resolved_path.as_deref());
         let transport = self.tool_handler.metadata_mut().open_transport_session(
             &logical.logical_session_id,
             &target.id,
             target.kind.clone(),
-            None,
-            None,
+            resolved_path,
+            resolved_source,
             now,
         );
         let channel = self.tool_handler.metadata_mut().open_channel(
@@ -1028,12 +1014,16 @@ impl StandaloneCoreRuntime {
             Some("terminal.interactive".into()),
             now,
         );
-        let shell = self.tool_handler.terminal_provider.open_interactive_shell(
-            &logical.logical_session_id,
-            &channel.channel_id,
-            Some(&transport.transport_session_id),
-            &target_kind_label(&target.kind),
-        );
+        let shell = self
+            .tool_handler
+            .terminal_provider
+            .open_interactive_shell_with_command(
+                &logical.logical_session_id,
+                &channel.channel_id,
+                Some(&transport.transport_session_id),
+                &target_kind_label(&target.kind),
+                launch_command.as_deref(),
+            );
         self.interactive_shell_owners.insert(
             shell.shell_id.clone(),
             InteractiveShellOwner {
@@ -1212,8 +1202,139 @@ impl StandaloneCoreRuntime {
         Ok(owner)
     }
 
+    fn resolve_transport_executable_for_target(
+        &self,
+        target: &TargetProfile,
+    ) -> (Option<String>, Option<String>) {
+        let Some(command) = toolchain_command_for_kind(&target.kind) else {
+            return (None, None);
+        };
+        let diagnostic = self.resolve_toolchain_diagnostic_for_target(target, command);
+        (diagnostic.effective_path, diagnostic.effective_source)
+    }
+
+    fn refresh_toolchain_diagnostics(&mut self) {
+        let mut target_ids = self.profiles.keys().cloned().collect::<Vec<_>>();
+        target_ids.sort();
+        let mut diagnostics = Vec::new();
+        for target_id in target_ids {
+            let Some(profile) = self.profiles.get(&target_id) else {
+                continue;
+            };
+            let Some(command) = toolchain_command_for_kind(&profile.kind) else {
+                continue;
+            };
+            diagnostics.push(self.resolve_toolchain_diagnostic_for_target(profile, command));
+        }
+        self.toolchain_diagnostics = diagnostics;
+    }
+
+    fn resolve_toolchain_diagnostic_for_target(
+        &self,
+        profile: &TargetProfile,
+        command: &str,
+    ) -> ToolchainDiagnosticView {
+        let target_override_path = profile
+            .toolchains
+            .get(command)
+            .and_then(|value| non_empty_path(value))
+            .map(ToOwned::to_owned);
+        let global_override_path = self
+            .settings_store
+            .settings
+            .toolchains
+            .get(command)
+            .and_then(|section| non_empty_path(&section.path_override))
+            .map(ToOwned::to_owned);
+
+        let (resolution, diagnostics, override_scope) = if let Some(path) = target_override_path.as_deref() {
+            let (target_resolution, target_diag) = self
+                .toolchain_resolver
+                .resolve_with_diagnostics(command, Some(Path::new(path)));
+            match &target_resolution {
+                Ok(selected) if selected.source == ExecutableSource::UserOverride => {
+                    (target_resolution, target_diag, Some("target_override"))
+                }
+                _ => {
+                    let (fallback_resolution, fallback_diag) = self
+                        .toolchain_resolver
+                        .resolve_with_diagnostics(
+                            command,
+                            global_override_path.as_deref().map(Path::new),
+                        );
+                    let scope = match &fallback_resolution {
+                        Ok(selected)
+                            if selected.source == ExecutableSource::UserOverride
+                                && global_override_path.is_some() =>
+                        {
+                            Some("global_override")
+                        }
+                        _ => None,
+                    };
+                    (fallback_resolution, fallback_diag, scope)
+                }
+            }
+        } else {
+            let (fallback_resolution, fallback_diag) = self.toolchain_resolver.resolve_with_diagnostics(
+                command,
+                global_override_path.as_deref().map(Path::new),
+            );
+            let scope = match &fallback_resolution {
+                Ok(selected)
+                    if selected.source == ExecutableSource::UserOverride
+                        && global_override_path.is_some() =>
+                {
+                    Some("global_override")
+                }
+                _ => None,
+            };
+            (fallback_resolution, fallback_diag, scope)
+        };
+
+        let effective_scope = match &resolution {
+            Ok(selection) => Some(match selection.source {
+                ExecutableSource::UserOverride => override_scope.unwrap_or("global_override"),
+                ExecutableSource::SystemPath => "system_path",
+                ExecutableSource::BuiltInFallback => "builtin_fallback",
+            }),
+            Err(_) => None,
+        }
+        .map(str::to_string);
+
+        let effective_source = diagnostics.selected_source.clone();
+        let effective_path = diagnostics
+            .selected_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
+
+        ToolchainDiagnosticView {
+            command: command.to_string(),
+            target_id: Some(profile.id.clone()),
+            target_name: Some(profile.name.clone()),
+            target_override_path,
+            global_override_path,
+            effective_scope,
+            effective_source: effective_source.clone(),
+            effective_path: effective_path.clone(),
+            selected_source: effective_source,
+            selected_path: effective_path,
+        }
+    }
+
     pub fn settings_view(&self) -> CoreSettingsView {
         let artifact_usage = self.tool_handler.artifact_service.usage();
+        let mut toolchain_entries = self
+            .settings_store
+            .settings
+            .toolchains
+            .iter()
+            .map(|(command, section)| bridgingio_app_api::ToolchainSettingsView {
+                command: command.clone(),
+                path_override: section.path_override.clone(),
+                prefer_builtin_fallback: section.prefer_builtin_fallback,
+            })
+            .collect::<Vec<_>>();
+        toolchain_entries.sort_by(|a, b| a.command.cmp(&b.command));
         CoreSettingsView {
             schema_version: self.settings_store.settings.schema_version,
             instance_name: self.settings_store.settings.core.instance_name.clone(),
@@ -1261,6 +1382,7 @@ impl StandaloneCoreRuntime {
                 used_bytes: artifact_usage.used_bytes,
                 artifact_count: artifact_usage.artifact_count,
             },
+            toolchains: toolchain_entries,
         }
     }
 
@@ -1324,6 +1446,7 @@ impl StandaloneCoreRuntime {
 
         self.settings_store.settings = settings;
         self.rebuild_profile_cache_from_settings()?;
+        self.refresh_toolchain_diagnostics();
         self.persist_settings_to_disk()?;
         Ok("live_applied".to_string())
     }
@@ -1383,6 +1506,7 @@ impl StandaloneCoreRuntime {
             CoreRuntimeError::Config(format!("settings validation failed: {err:?}"))
         })?;
         self.settings_store.settings = settings;
+        self.refresh_toolchain_diagnostics();
         self.persist_settings_to_disk()?;
 
         if restart_required {
@@ -1561,6 +1685,13 @@ impl StandaloneCoreRuntime {
             .map(|diag| {
                 json!({
                     "command": diag.command,
+                    "target_id": diag.target_id,
+                    "target_name": diag.target_name,
+                    "target_override_path": diag.target_override_path,
+                    "global_override_path": diag.global_override_path,
+                    "effective_scope": diag.effective_scope,
+                    "effective_source": diag.effective_source,
+                    "effective_path": diag.effective_path,
                     "selected_source": diag.selected_source,
                     "selected_path": diag.selected_path,
                 })
@@ -1628,7 +1759,14 @@ impl StandaloneCoreRuntime {
                     "eviction_policy": settings.artifact_cache.eviction_policy,
                     "used_bytes": settings.artifact_cache.used_bytes,
                     "artifact_count": settings.artifact_cache.artifact_count,
-                }
+                },
+                "toolchains": settings.toolchains.iter().map(|toolchain| {
+                    json!({
+                        "command": toolchain.command,
+                        "path_override": toolchain.path_override,
+                        "prefer_builtin_fallback": toolchain.prefer_builtin_fallback,
+                    })
+                }).collect::<Vec<_>>()
             },
             "diagnostics": diagnostics,
             "timeline": self.timeline_json_items(timeline_limit),
@@ -2147,6 +2285,23 @@ fn target_kind_label(kind: &TargetKind) -> String {
     }
 }
 
+fn toolchain_command_for_kind(kind: &TargetKind) -> Option<&'static str> {
+    match kind {
+        TargetKind::Ssh => Some("ssh"),
+        TargetKind::Adb => Some("adb"),
+        _ => None,
+    }
+}
+
+fn non_empty_path(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn session_state_label(state: &SessionState) -> &'static str {
     match state {
         SessionState::Connecting => "connecting",
@@ -2172,41 +2327,133 @@ fn system_time_to_unix_millis(ts: SystemTime) -> u128 {
         .unwrap_or(0)
 }
 
-fn build_connector_command(target: &TargetProfile, command: &str) -> String {
-    if !matches!(target.kind, TargetKind::Adb) {
-        return command.to_string();
-    }
-    if command.trim_start().starts_with("adb ") {
-        return command.to_string();
-    }
-    let mut tokens = vec!["adb".to_string()];
-    if let ConnectionConfig::Adb { serial, transport } = &target.connection {
-        let selector = serial
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string);
-        let transport = transport
-            .as_ref()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .filter(|v| !v.is_empty());
-        match (transport.as_deref(), selector.as_deref()) {
-            (Some("emulator"), _) => tokens.push("-e".to_string()),
-            (Some("device"), _) | (Some("usb"), _) => tokens.push("-d".to_string()),
-            (Some("transport-id"), Some(value)) => {
-                tokens.push("-t".to_string());
-                tokens.push(value.to_string());
+fn build_interactive_connector_command(
+    target: &TargetProfile,
+    resolved_executable_path: Option<&str>,
+) -> Option<String> {
+    let resolved_executable = |default: &str| {
+        resolved_executable_path
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(shell_single_quote)
+            .unwrap_or_else(|| default.to_string())
+    };
+
+    match (&target.kind, &target.connection) {
+        (TargetKind::Adb, ConnectionConfig::Adb { serial, transport }) => {
+            let mut tokens = vec![resolved_executable("adb")];
+            let selector = serial
+                .as_ref()
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string);
+            let transport = transport
+                .as_ref()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty());
+            match (transport.as_deref(), selector.as_deref()) {
+                (Some("transport-id"), Some(value)) => {
+                    tokens.push("-t".to_string());
+                    tokens.push(value.to_string());
+                }
+                (_, Some(value)) => {
+                    tokens.push("-s".to_string());
+                    tokens.push(value.to_string());
+                }
+                (Some("emulator"), None) => tokens.push("-e".to_string()),
+                (Some("device"), None) | (Some("usb"), None) => tokens.push("-d".to_string()),
+                _ => {}
             }
-            (_, Some(value)) => {
-                tokens.push("-s".to_string());
-                tokens.push(value.to_string());
-            }
-            _ => {}
+            tokens.push("shell".to_string());
+            Some(tokens.join(" "))
         }
+        (
+            TargetKind::Ssh,
+            ConnectionConfig::Ssh {
+                host,
+                port,
+                username,
+            },
+        ) => {
+            let user_host = format!("{username}@{host}");
+            Some(format!(
+                "{} -p {} {}",
+                resolved_executable("ssh"),
+                port,
+                shell_single_quote(&user_host)
+            ))
+        }
+        _ => None,
     }
-    tokens.push("shell".to_string());
-    tokens.push(shell_single_quote(command));
-    tokens.join(" ")
+}
+
+fn build_connector_command(
+    target: &TargetProfile,
+    command: &str,
+    resolved_executable_path: Option<&str>,
+) -> String {
+    let resolved_executable = |default: &str| {
+        resolved_executable_path
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(shell_single_quote)
+            .unwrap_or_else(|| default.to_string())
+    };
+
+    match (&target.kind, &target.connection) {
+        (TargetKind::Adb, ConnectionConfig::Adb { serial, transport }) => {
+            if command.trim_start().starts_with("adb ") {
+                return command.to_string();
+            }
+            let mut tokens = vec![resolved_executable("adb")];
+            let selector = serial
+                .as_ref()
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string);
+            let transport = transport
+                .as_ref()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty());
+            match (transport.as_deref(), selector.as_deref()) {
+                (Some("transport-id"), Some(value)) => {
+                    tokens.push("-t".to_string());
+                    tokens.push(value.to_string());
+                }
+                (_, Some(value)) => {
+                    tokens.push("-s".to_string());
+                    tokens.push(value.to_string());
+                }
+                (Some("emulator"), None) => tokens.push("-e".to_string()),
+                (Some("device"), None) | (Some("usb"), None) => tokens.push("-d".to_string()),
+                _ => {}
+            }
+            tokens.push("shell".to_string());
+            tokens.push(shell_single_quote(command));
+            tokens.join(" ")
+        }
+        (
+            TargetKind::Ssh,
+            ConnectionConfig::Ssh {
+                host,
+                port,
+                username,
+            },
+        ) => {
+            if command.trim_start().starts_with("ssh ") {
+                return command.to_string();
+            }
+            let user_host = format!("{username}@{host}");
+            format!(
+                "{} -p {} {} {}",
+                resolved_executable("ssh"),
+                port,
+                shell_single_quote(&user_host),
+                shell_single_quote(command)
+            )
+        }
+        _ => command.to_string(),
+    }
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -2273,6 +2520,18 @@ fn to_target_profile(
     if let Some(alias) = configured.aliases.first() {
         metadata.insert("alias".to_string(), alias.clone());
     }
+    let toolchains = configured
+        .toolchains
+        .iter()
+        .filter_map(|(command, section)| {
+            let path = section.path_override.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some((command.clone(), path.to_string()))
+            }
+        })
+        .collect::<bridgingio_domain::MetadataMap>();
     Ok(TargetProfile {
         id: configured.id.clone(),
         name: configured.display_name.clone(),
@@ -2287,6 +2546,7 @@ fn to_target_profile(
         default_policy: bridgingio_domain::PolicyProfile::default(),
         notes: configured.notes.clone(),
         metadata,
+        toolchains,
     })
 }
 
@@ -2373,6 +2633,25 @@ fn to_standalone_target_profile(
         }
     }
 
+    let toolchains = profile
+        .toolchains
+        .iter()
+        .filter_map(|(command, path_override)| {
+            let trimmed = path_override.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some((
+                    command.clone(),
+                    ToolchainSection {
+                        path_override: trimmed.to_string(),
+                        prefer_builtin_fallback: false,
+                    },
+                ))
+            }
+        })
+        .collect::<HashMap<_, _>>();
+
     Ok(StandaloneTargetProfile {
         id: profile.id.clone(),
         display_name: profile.name.clone(),
@@ -2386,6 +2665,7 @@ fn to_standalone_target_profile(
         credential_ref: profile.credential_ref.as_ref().map(|value| value.id.clone()),
         notes: profile.notes.clone(),
         connection,
+        toolchains,
         terminal_provider: bridgingio_engine::TerminalProviderSection {
             enabled: false,
             shell: None,
@@ -2449,19 +2729,15 @@ fn target_profile_json_value(profile: &TargetProfile) -> Value {
         "alias": alias,
         "notes": profile.notes,
         "credential_ref": profile.credential_ref.as_ref().map(|value| value.id.clone()),
+        "toolchains": profile.toolchains.iter().map(|(command, path_override)| {
+            json!({
+                "command": command,
+                "path_override": path_override,
+            })
+        }).collect::<Vec<_>>(),
         "connection_kind": connection_kind,
         "connection": connection_json,
     })
-}
-
-fn to_toolchain_diagnostic(diag: ToolchainResolutionDiagnostics) -> ToolchainDiagnosticView {
-    ToolchainDiagnosticView {
-        command: diag.command,
-        selected_source: diag.selected_source,
-        selected_path: diag
-            .selected_path
-            .map(|path| path.to_string_lossy().to_string()),
-    }
 }
 
 fn vault_error_to_runtime(err: VaultError) -> CoreRuntimeError {
@@ -4080,13 +4356,14 @@ fn parse_reuse_policy(value: &str) -> Result<SessionReusePolicy, CoreRuntimeErro
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use bridgingio_app_api::{ApiRequest, ApiRequestContext, ApiResponse, AppCommand};
     use bridgingio_connectors::{BuiltInBinarySpec, BuiltInDistributionKind, ExecutableResolver};
-    use bridgingio_domain::{ConnectionConfig, PolicyProfile};
+    use bridgingio_domain::{ConnectionConfig, PolicyProfile, TargetKind, TargetProfile};
 
     use super::{
         CapabilityDiscovery, ControlPlaneIpcClient, ControlPlaneIpcServer, CoreRuntimeError,
@@ -4108,6 +4385,25 @@ mod tests {
         }
     }
 
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = PathBuf::from("/tmp").join(format!("bridgingio-mcp-{prefix}-{stamp}"));
+        fs::create_dir_all(&root).expect("create temp dir");
+        root
+    }
+
+    fn request_context() -> ApiRequestContext {
+        ApiRequestContext {
+            agent_id: "ui-agent".into(),
+            run_id: "ui-run".into(),
+            client_session_id: "ui-client".into(),
+            reuse_policy: bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+        }
+    }
+
     #[test]
     fn returns_structured_capabilities_for_ssh_target() {
         let target = bridgingio_domain::TargetProfile {
@@ -4123,6 +4419,7 @@ mod tests {
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
+            toolchains: Default::default(),
         };
 
         let discovery = DefaultCapabilityDiscovery;
@@ -4274,5 +4571,380 @@ mod tests {
             err,
             bridgingio_engine::ConfigError::NonLoopbackExplicitEnableRequired(_)
         ));
+    }
+
+    #[test]
+    fn connector_command_uses_resolved_adb_executable_path() {
+        let target = TargetProfile {
+            id: "adb-target".into(),
+            name: "adb-target".into(),
+            kind: TargetKind::Adb,
+            connection: ConnectionConfig::Adb {
+                serial: Some("emulator-5554".into()),
+                transport: Some("usb".into()),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: BTreeMap::new(),
+            toolchains: BTreeMap::new(),
+        };
+        let command = super::build_connector_command(
+            &target,
+            "uname -r",
+            Some("/opt/homebrew/bin/adb"),
+        );
+        assert_eq!(
+            command,
+            "'/opt/homebrew/bin/adb' -s emulator-5554 shell 'uname -r'"
+        );
+    }
+
+    #[test]
+    fn connector_command_prefers_serial_selector_over_usb_transport() {
+        let target = TargetProfile {
+            id: "adb-target".into(),
+            name: "adb-target".into(),
+            kind: TargetKind::Adb,
+            connection: ConnectionConfig::Adb {
+                serial: Some("emulator-5554".into()),
+                transport: Some("usb".into()),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: BTreeMap::new(),
+            toolchains: BTreeMap::new(),
+        };
+        let command = super::build_connector_command(&target, "uname -r", None);
+        assert_eq!(command, "adb -s emulator-5554 shell 'uname -r'");
+    }
+
+    #[test]
+    fn connector_command_uses_resolved_ssh_executable_path() {
+        let target = TargetProfile {
+            id: "ssh-target".into(),
+            name: "ssh-target".into(),
+            kind: TargetKind::Ssh,
+            connection: ConnectionConfig::Ssh {
+                host: "10.1.1.8".into(),
+                port: 2222,
+                username: "root".into(),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: BTreeMap::new(),
+            toolchains: BTreeMap::new(),
+        };
+        let command = super::build_connector_command(
+            &target,
+            "uname -r",
+            Some("/opt/homebrew/bin/ssh"),
+        );
+        assert_eq!(
+            command,
+            "'/opt/homebrew/bin/ssh' -p 2222 'root@10.1.1.8' 'uname -r'"
+        );
+    }
+
+    #[test]
+    fn connector_command_builds_ssh_command_from_target_connection() {
+        let target = TargetProfile {
+            id: "ssh-target".into(),
+            name: "ssh-target".into(),
+            kind: TargetKind::Ssh,
+            connection: ConnectionConfig::Ssh {
+                host: "192.168.56.2".into(),
+                port: 22,
+                username: "ubuntu".into(),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: BTreeMap::new(),
+            toolchains: BTreeMap::new(),
+        };
+        let command = super::build_connector_command(&target, "whoami", None);
+        assert_eq!(command, "ssh -p 22 'ubuntu@192.168.56.2' 'whoami'");
+    }
+
+    #[test]
+    fn connector_command_keeps_explicit_ssh_invocation_unchanged() {
+        let target = TargetProfile {
+            id: "ssh-target".into(),
+            name: "ssh-target".into(),
+            kind: TargetKind::Ssh,
+            connection: ConnectionConfig::Ssh {
+                host: "192.168.56.2".into(),
+                port: 22,
+                username: "ubuntu".into(),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: BTreeMap::new(),
+            toolchains: BTreeMap::new(),
+        };
+        let raw = "ssh -p 22 ubuntu@192.168.56.2 whoami";
+        let command = super::build_connector_command(&target, raw, Some("/opt/homebrew/bin/ssh"));
+        assert_eq!(command, raw);
+    }
+
+    #[test]
+    fn interactive_connector_command_uses_resolved_adb_path_and_selector() {
+        let target = TargetProfile {
+            id: "adb-target".into(),
+            name: "adb-target".into(),
+            kind: TargetKind::Adb,
+            connection: ConnectionConfig::Adb {
+                serial: Some("emulator-5554".into()),
+                transport: Some("usb".into()),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: BTreeMap::new(),
+            toolchains: BTreeMap::new(),
+        };
+        let command = super::build_interactive_connector_command(
+            &target,
+            Some("/opt/homebrew/bin/adb"),
+        );
+        assert_eq!(
+            command.as_deref(),
+            Some("'/opt/homebrew/bin/adb' -s emulator-5554 shell")
+        );
+    }
+
+    #[test]
+    fn interactive_connector_command_uses_resolved_ssh_path() {
+        let target = TargetProfile {
+            id: "ssh-target".into(),
+            name: "ssh-target".into(),
+            kind: TargetKind::Ssh,
+            connection: ConnectionConfig::Ssh {
+                host: "10.1.1.8".into(),
+                port: 2222,
+                username: "root".into(),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: BTreeMap::new(),
+            toolchains: BTreeMap::new(),
+        };
+        let command = super::build_interactive_connector_command(
+            &target,
+            Some("/opt/homebrew/bin/ssh"),
+        );
+        assert_eq!(
+            command.as_deref(),
+            Some("'/opt/homebrew/bin/ssh' -p 2222 'root@10.1.1.8'")
+        );
+    }
+
+    #[test]
+    fn toolchain_resolution_prefers_target_then_global_then_system_path() {
+        let root = temp_dir("toolchain-precedence");
+        let target_adb = root.join("target-adb");
+        let global_adb = root.join("global-adb");
+        let system_dir = root.join("system");
+        let system_adb = system_dir.join("adb");
+        let bundled_root = root.join("bundled");
+        fs::create_dir_all(&system_dir).expect("create system dir");
+        fs::create_dir_all(&bundled_root).expect("create bundled dir");
+        fs::write(&target_adb, "binary").expect("write target adb");
+        fs::write(&global_adb, "binary").expect("write global adb");
+        fs::write(&system_adb, "binary").expect("write system adb");
+        fs::write(bundled_root.join("adb"), "binary").expect("write bundled adb");
+
+        let mut text = bridgingio_engine::CoreSettings::complete_example().to_string();
+        text = text.replace("/opt/homebrew/bin/adb", &global_adb.to_string_lossy());
+        text = text.replace(
+            "/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb",
+            &target_adb.to_string_lossy(),
+        );
+        let config_path = root.join("managed-core.toml");
+        fs::write(&config_path, text).expect("write config");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(vec![system_dir.clone()]),
+            &bundled_root,
+            vec![BuiltInBinarySpec {
+                command: "adb".into(),
+                relative_path: PathBuf::from("adb"),
+                distribution: BuiltInDistributionKind::StandalonePackage,
+            }],
+        );
+        let mut runtime = StandaloneCoreRuntime::from_config_file(&config_path, resolver)
+            .expect("runtime from config");
+
+        let diagnostics = runtime.handle_app_request(ApiRequest {
+            request_id: "diag-1".into(),
+            context: request_context(),
+            command: AppCommand::GetToolchainDiagnostics,
+        });
+        let adb_diag = match diagnostics {
+            ApiResponse::Diagnostics { items, .. } => items
+                .into_iter()
+                .find(|item| {
+                    item.target_id.as_deref() == Some("android-emulator")
+                        && item.command == "adb"
+                })
+                .expect("adb diagnostics for android-emulator"),
+            other => panic!("unexpected diagnostics response: {other:?}"),
+        };
+        assert_eq!(adb_diag.effective_scope.as_deref(), Some("target_override"));
+        assert_eq!(
+            adb_diag.effective_path.as_deref(),
+            Some(target_adb.to_string_lossy().as_ref())
+        );
+
+        let mut cleared_toolchains = BTreeMap::new();
+        cleared_toolchains.insert("adb".to_string(), String::new());
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "upsert-clear-target".into(),
+            context: request_context(),
+            command: AppCommand::UpsertProfile {
+                profile: TargetProfile {
+                    id: "android-emulator".into(),
+                    name: "Android Emulator".into(),
+                    kind: TargetKind::Adb,
+                    connection: ConnectionConfig::Adb {
+                        serial: Some("emulator-5554".into()),
+                        transport: Some("serial".into()),
+                    },
+                    credential_ref: Some(bridgingio_domain::CredentialRef {
+                        id: "vault://bridgingio/adb/default".into(),
+                        provider: "vault".into(),
+                    }),
+                    default_policy: PolicyProfile::default(),
+                    notes: None,
+                    metadata: BTreeMap::new(),
+                    toolchains: cleared_toolchains,
+                },
+            },
+        });
+        match response {
+            ApiResponse::Accepted { apply_strategy, .. } => {
+                assert_eq!(apply_strategy.as_deref(), Some("live_applied"));
+            }
+            other => panic!("unexpected upsert response: {other:?}"),
+        }
+
+        let diagnostics = runtime.handle_app_request(ApiRequest {
+            request_id: "diag-2".into(),
+            context: request_context(),
+            command: AppCommand::GetToolchainDiagnostics,
+        });
+        let adb_diag = match diagnostics {
+            ApiResponse::Diagnostics { items, .. } => items
+                .into_iter()
+                .find(|item| {
+                    item.target_id.as_deref() == Some("android-emulator")
+                        && item.command == "adb"
+                })
+                .expect("adb diagnostics after clearing target override"),
+            other => panic!("unexpected diagnostics response: {other:?}"),
+        };
+        assert_eq!(adb_diag.effective_scope.as_deref(), Some("global_override"));
+        assert_eq!(
+            adb_diag.effective_path.as_deref(),
+            Some(global_adb.to_string_lossy().as_ref())
+        );
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "update-global-clear".into(),
+            context: request_context(),
+            command: AppCommand::UpdateSettings {
+                model_plane_host: None,
+                model_plane_port: None,
+                artifact_cache_backend: None,
+                artifact_cache_root: None,
+                artifact_cache_max_bytes: None,
+                artifact_cache_eviction_policy: None,
+                tool_override_command: Some("adb".into()),
+                tool_override_path: Some(String::new()),
+            },
+        });
+        match response {
+            ApiResponse::Accepted { apply_strategy, .. } => {
+                assert_eq!(apply_strategy.as_deref(), Some("live_applied"));
+            }
+            other => panic!("unexpected update settings response: {other:?}"),
+        }
+
+        let diagnostics = runtime.handle_app_request(ApiRequest {
+            request_id: "diag-3".into(),
+            context: request_context(),
+            command: AppCommand::GetToolchainDiagnostics,
+        });
+        let adb_diag = match diagnostics {
+            ApiResponse::Diagnostics { items, .. } => items
+                .into_iter()
+                .find(|item| {
+                    item.target_id.as_deref() == Some("android-emulator")
+                        && item.command == "adb"
+                })
+                .expect("adb diagnostics after clearing global override"),
+            other => panic!("unexpected diagnostics response: {other:?}"),
+        };
+        assert_eq!(adb_diag.effective_scope.as_deref(), Some("system_path"));
+        assert_eq!(
+            adb_diag.effective_path.as_deref(),
+            Some(system_adb.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn toolchain_resolution_falls_back_to_builtin_when_path_missing() {
+        let root = temp_dir("toolchain-builtin-fallback");
+        let system_dir = root.join("system-empty");
+        let bundled_root = root.join("bundled");
+        fs::create_dir_all(&system_dir).expect("create empty system dir");
+        fs::create_dir_all(&bundled_root).expect("create bundled dir");
+        let bundled_adb = bundled_root.join("adb");
+        fs::write(&bundled_adb, "binary").expect("write bundled adb");
+
+        let mut text = bridgingio_engine::CoreSettings::complete_example().to_string();
+        text = text.replace("/opt/homebrew/bin/adb", "");
+        text = text.replace(
+            "/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb",
+            "",
+        );
+        let config_path = root.join("managed-core.toml");
+        fs::write(&config_path, text).expect("write config");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(vec![system_dir]),
+            &bundled_root,
+            vec![BuiltInBinarySpec {
+                command: "adb".into(),
+                relative_path: PathBuf::from("adb"),
+                distribution: BuiltInDistributionKind::StandalonePackage,
+            }],
+        );
+        let mut runtime = StandaloneCoreRuntime::from_config_file(&config_path, resolver)
+            .expect("runtime from config");
+
+        let diagnostics = runtime.handle_app_request(ApiRequest {
+            request_id: "diag-builtin".into(),
+            context: request_context(),
+            command: AppCommand::GetToolchainDiagnostics,
+        });
+        let adb_diag = match diagnostics {
+            ApiResponse::Diagnostics { items, .. } => items
+                .into_iter()
+                .find(|item| {
+                    item.target_id.as_deref() == Some("android-emulator")
+                        && item.command == "adb"
+                })
+                .expect("adb diagnostics for android-emulator"),
+            other => panic!("unexpected diagnostics response: {other:?}"),
+        };
+        assert_eq!(adb_diag.effective_scope.as_deref(), Some("builtin_fallback"));
+        assert_eq!(
+            adb_diag.effective_path.as_deref(),
+            Some(bundled_adb.to_string_lossy().as_ref())
+        );
     }
 }

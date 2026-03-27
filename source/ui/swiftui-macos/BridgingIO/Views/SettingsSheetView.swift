@@ -89,6 +89,64 @@ struct SettingsSheetView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
             VStack(alignment: .leading, spacing: 10) {
+                Text("Tool Sources")
+                    .font(ConsoleTypography.heading(13, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+
+                if viewModel.globalToolchains.isEmpty {
+                    Text("No global tool overrides configured.")
+                        .font(ConsoleTypography.body(12))
+                        .foregroundStyle(theme.muted)
+                } else {
+                    ForEach(Array(viewModel.globalToolchains.enumerated()), id: \.element.id) { _, setting in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(setting.command.uppercased())
+                                .font(ConsoleTypography.heading(12, weight: .semibold))
+                                .foregroundStyle(theme.textPrimary)
+
+                            TextField(
+                                "/path/to/\(setting.command)",
+                                text: Binding(
+                                    get: {
+                                        viewModel.globalToolchains
+                                            .first(where: { $0.command == setting.command })?
+                                            .pathOverride ?? ""
+                                    },
+                                    set: { newValue in
+                                        viewModel.updateGlobalToolchainDraft(
+                                            command: setting.command,
+                                            path: newValue
+                                        )
+                                    }
+                                )
+                            )
+                            .consoleInput(theme: theme, surface: .panel)
+
+                            Button("Save \(setting.command.uppercased()) Override") {
+                                viewModel.saveGlobalToolchain(command: setting.command)
+                            }
+                            .consoleButton(theme: theme, tone: .secondary)
+                            .accessibilityIdentifier("settings-save-tool-\(setting.command)")
+                        }
+                        .padding(8)
+                        .background(theme.elevated)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(theme.border, lineWidth: 1)
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+            .padding(12)
+            .background(theme.panel)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(theme.border, lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+
+            VStack(alignment: .leading, spacing: 10) {
                 Text(L10n.t("settings.artifact_cache"))
                     .font(ConsoleTypography.heading(13, weight: .semibold))
                     .foregroundStyle(theme.textPrimary)

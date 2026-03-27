@@ -317,6 +317,21 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
         case .openGrok:
             fields["custom_description"] = "opengrok:\(draft.openGrokConfig.endpoint)"
         }
+        let relevantCommands = toolchainCommands(for: draft.kind)
+        let toolEntries: [(command: String, path: String)] = draft.toolDiagnostics
+            .filter { relevantCommands.contains($0.id) }
+            .map {
+                (
+                    command: $0.id,
+                    path: $0.overridePath.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+            .sorted { $0.command < $1.command }
+        fields["target_toolchain_count"] = "\(toolEntries.count)"
+        for (index, entry) in toolEntries.enumerated() {
+            fields["target_toolchain_\(index)_command"] = entry.command
+            fields["target_toolchain_\(index)_path_override"] = entry.path
+        }
         let response = try sendCommandLocked(command: "upsert_profile", fields: fields)
         return try parseApplyStrategyOrThrow(response: response)
     }
@@ -509,6 +524,12 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
             throw WorkspaceDataSourceError.protocolViolation("invalid bootstrap payload")
         }
 
+        let settingsPayload = root["settings"] as? [String: Any]
+        let globalToolchains = decodeGlobalToolchains(settingsPayload)
+        let globalToolchainByCommand = Dictionary(
+            uniqueKeysWithValues: globalToolchains.map { ($0.command, $0.pathOverride) }
+        )
+
         let sessionRows = root["sessions"] as? [[String: Any]] ?? []
         var sessionStateByID: [String: String] = [:]
         var targetBySessionID: [String: String] = [:]
@@ -550,21 +571,49 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
         }
 
         let diagnosticsRows = root["diagnostics"] as? [[String: Any]] ?? []
-        let toolDiagnostics: [ToolSourceDiagnostic] = diagnosticsRows.map { row in
+        var diagnosticsByTargetID: [String: [ToolSourceDiagnostic]] = [:]
+        for row in diagnosticsRows {
             let command = row["command"] as? String ?? "tool"
-            let selectedSource = (row["selected_source"] as? String ?? "system").lowercased()
-            let sourceType: ToolSourceType = selectedSource.contains("bundled")
-                ? .bundledFallback
-                : (selectedSource.contains("override") ? .userOverride : .systemPath)
-            let path = row["selected_path"] as? String ?? ""
-            return ToolSourceDiagnostic(
+            let targetID = row["target_id"] as? String ?? ""
+            guard !targetID.isEmpty else { continue }
+            let effectiveScope = (row["effective_scope"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let selectedSource = (
+                row["effective_source"] as? String
+                ?? row["selected_source"] as? String
+                ?? "system_path"
+            ).lowercased()
+            let sourceType: ToolSourceType
+            if selectedSource.contains("bundled") || selectedSource.contains("builtin") {
+                sourceType = .bundledFallback
+            } else if selectedSource.contains("override") {
+                sourceType = .userOverride
+            } else {
+                sourceType = .systemPath
+            }
+            let effectivePath = (row["effective_path"] as? String)
+                ?? (row["selected_path"] as? String)
+                ?? ""
+            let targetOverridePath = (row["target_override_path"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let globalOverridePath = (row["global_override_path"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let diagnostic = ToolSourceDiagnostic(
                 id: command,
                 connectorName: command,
                 sourceType: sourceType,
-                effectivePath: path,
-                overridePath: "",
+                effectivePath: effectivePath,
+                overridePath: targetOverridePath,
+                globalOverridePath: globalOverridePath,
+                effectiveScope: effectiveScope,
                 lastChecked: .now
             )
+            diagnosticsByTargetID[targetID, default: []].append(diagnostic)
+        }
+        for (targetID, diagnostics) in diagnosticsByTargetID {
+            diagnosticsByTargetID[targetID] = diagnostics.sorted { lhs, rhs in
+                lhs.connectorName < rhs.connectorName
+            }
         }
 
         let profileRows = root["profiles"] as? [[String: Any]] ?? []
@@ -589,6 +638,7 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
             }
             let profilePayload = profileByCoreID[coreID]
             let draft = profilePayload.flatMap { try? parseDraftFromProfilePayload($0) }
+            let resolvedKind = draft?.kind ?? mapTargetKind(row["kind"] as? String)
             let resolvedName = {
                 guard let draft else { return row["name"] as? String ?? coreID }
                 let trimmed = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -599,11 +649,18 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
                 let trimmed = draft.aliasForModel.trimmingCharacters(in: .whitespacesAndNewlines)
                 return trimmed.isEmpty ? coreID : draft.aliasForModel
             }()
+            let fallbackDiagnostics = defaultToolDiagnostics(
+                for: resolvedKind,
+                globalToolchainByCommand: globalToolchainByCommand
+            )
+            let resolvedToolDiagnostics = diagnosticsByTargetID[coreID]
+                ?? draft?.toolDiagnostics
+                ?? fallbackDiagnostics
             return TargetProfile(
                 id: targetID,
                 coreID: coreID,
                 name: resolvedName,
-                kind: draft?.kind ?? mapTargetKind(row["kind"] as? String),
+                kind: resolvedKind,
                 aliasForModel: resolvedAlias,
                 notes: draft?.notes ?? (row["notes"] as? String ?? ""),
                 credentialReference: draft?.credentialReference ?? "vault://\(coreID)",
@@ -629,7 +686,7 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
                     )
                 ),
                 capabilities: capabilities,
-                toolDiagnostics: draft?.toolDiagnostics ?? toolDiagnostics
+                toolDiagnostics: resolvedToolDiagnostics
             )
         }
 
@@ -691,8 +748,8 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
             )
         }
 
-        let cacheSettings = decodeCacheSettings(root["settings"] as? [String: Any])
-        let modelPlane = decodeModelPlaneSettings(root["settings"] as? [String: Any])
+        let cacheSettings = decodeCacheSettings(settingsPayload)
+        let modelPlane = decodeModelPlaneSettings(settingsPayload)
         let runtimeRoot = decodeRuntimeRootDiagnostics(root["runtime_root"] as? [String: Any])
 
         return WorkspaceSnapshot(
@@ -704,6 +761,7 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
             cacheSettings: cacheSettings,
             modelPlaneHost: modelPlane.host,
             modelPlanePort: modelPlane.port,
+            globalToolchains: globalToolchains,
             runtimeRootPath: runtimeRoot.path,
             runtimeRootAccessible: runtimeRoot.accessible
         )
@@ -724,6 +782,59 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
             evictionPolicy: eviction,
             usedCacheMB: max(0, Int(usedBytes / 1024 / 1024))
         )
+    }
+
+    private func decodeGlobalToolchains(_ settings: [String: Any]?) -> [ToolchainSetting] {
+        let rows = settings?["toolchains"] as? [[String: Any]] ?? []
+        let entries = rows.compactMap { row -> ToolchainSetting? in
+            let command = (row["command"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !command.isEmpty else { return nil }
+            let path = (row["path_override"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return ToolchainSetting(command: command, pathOverride: path)
+        }
+        return entries.sorted { lhs, rhs in lhs.command < rhs.command }
+    }
+
+    private func defaultToolDiagnostics(
+        for kind: TargetKind,
+        globalToolchainByCommand: [String: String]
+    ) -> [ToolSourceDiagnostic] {
+        switch kind {
+        case .ssh:
+            let globalPath = globalToolchainByCommand["ssh"] ?? ""
+            return [
+                ToolSourceDiagnostic(
+                    id: "ssh",
+                    connectorName: "ssh",
+                    sourceType: globalPath.isEmpty ? .systemPath : .userOverride,
+                    effectivePath: globalPath.isEmpty ? "/usr/bin/ssh" : globalPath,
+                    overridePath: "",
+                    globalOverridePath: globalPath,
+                    effectiveScope: globalPath.isEmpty ? "system_path" : "global_override",
+                    lastChecked: .now
+                )
+            ]
+        case .adb:
+            let globalPath = globalToolchainByCommand["adb"] ?? ""
+            return [
+                ToolSourceDiagnostic(
+                    id: "adb",
+                    connectorName: "adb",
+                    sourceType: globalPath.isEmpty ? .bundledFallback : .userOverride,
+                    effectivePath: globalPath.isEmpty
+                        ? L10n.t("seed.tool.effective_path.bridgingio_bundle")
+                        : globalPath,
+                    overridePath: "",
+                    globalOverridePath: globalPath,
+                    effectiveScope: globalPath.isEmpty ? "builtin_fallback" : "global_override",
+                    lastChecked: .now
+                )
+            ]
+        default:
+            return []
+        }
     }
 
     private func decodeModelPlaneSettings(_ settings: [String: Any]?) -> (host: String, port: Int) {
@@ -791,7 +902,38 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
                 draft.openGrokConfig.endpoint = String(value)
             }
         }
+        let toolchainRows = payload["toolchains"] as? [[String: Any]] ?? []
+        var targetOverrides: [String: String] = [:]
+        for row in toolchainRows {
+            let command = (row["command"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !command.isEmpty else { continue }
+            let path = (row["path_override"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            targetOverrides[command] = path
+        }
+        draft.toolDiagnostics = ["ssh", "adb"]
+            .map { command in
+                ToolSourceDiagnostic(
+                    id: command,
+                    connectorName: command,
+                    sourceType: .systemPath,
+                    effectivePath: "",
+                    overridePath: targetOverrides[command] ?? "",
+                    lastChecked: .now
+                )
+            }
         return draft
+    }
+
+    private func toolchainCommands(for kind: TargetKind) -> [String] {
+        switch kind {
+        case .ssh:
+            return ["ssh"]
+        case .adb:
+            return ["adb"]
+        default:
+            return []
+        }
     }
 
     private func targetKindLabel(for kind: TargetKind) -> String {
@@ -932,6 +1074,7 @@ struct WorkspaceSnapshot {
     var cacheSettings: ArtifactCacheSettings
     var modelPlaneHost: String
     var modelPlanePort: Int
+    var globalToolchains: [ToolchainSetting]
     var runtimeRootPath: String?
     var runtimeRootAccessible: Bool
 }
@@ -990,6 +1133,7 @@ final class WorkspaceViewModel: ObservableObject {
     @Published var cacheSettingsNeedRestart: Bool = false
     @Published var modelPlaneHost: String = "127.0.0.1"
     @Published var modelPlanePort: Int = 19718
+    @Published var globalToolchains: [ToolchainSetting] = []
     @Published var targetEditorContext: TargetEditorContext?
     @Published var isShowingSettingsSheet: Bool = false
     @Published private(set) var coreConnectionState: WorkspaceCoreConnectionState = .startingCore
@@ -1162,6 +1306,7 @@ final class WorkspaceViewModel: ObservableObject {
         cacheSettings = snapshot.cacheSettings
         modelPlaneHost = snapshot.modelPlaneHost
         modelPlanePort = snapshot.modelPlanePort
+        globalToolchains = snapshot.globalToolchains
         runtimeRootPath = snapshot.runtimeRootPath
         if !snapshot.runtimeRootAccessible, let path = snapshot.runtimeRootPath {
             coreConnectionState = .runtimeRootUnavailable(path)
@@ -1216,6 +1361,17 @@ final class WorkspaceViewModel: ObservableObject {
             return message(for: underlying)
         }
         return error.localizedDescription
+    }
+
+    private func relevantToolchainCommands(for kind: TargetKind) -> Set<String> {
+        switch kind {
+        case .ssh:
+            return ["ssh"]
+        case .adb:
+            return ["adb"]
+        default:
+            return []
+        }
     }
 
     var filteredTargets: [TargetProfile] {
@@ -1301,7 +1457,16 @@ final class WorkspaceViewModel: ObservableObject {
         }
         guard let managed = managedDataSource else { return }
         do {
-            let draft = try managed.fetchProfileDraft(coreID: target.coreID)
+            var draft = try managed.fetchProfileDraft(coreID: target.coreID)
+            let relevantCommands = relevantToolchainCommands(for: draft.kind)
+            let diagnosticsFromTarget = target.toolDiagnostics
+                .filter { relevantCommands.contains($0.id) }
+            if !diagnosticsFromTarget.isEmpty {
+                draft.toolDiagnostics = diagnosticsFromTarget
+            } else {
+                draft.toolDiagnostics = draft.toolDiagnostics
+                    .filter { relevantCommands.contains($0.id) }
+            }
             targetEditorContext = TargetEditorContext(mode: .edit, draft: draft)
         } catch {
             coreConnectionState = .attachFailed(message(for: error))
@@ -1347,21 +1512,55 @@ final class WorkspaceViewModel: ObservableObject {
             }
             return
         }
-        guard let selectedTargetID,
-              let targetIndex = targets.firstIndex(where: { $0.id == selectedTargetID }),
-              let diagIndex = targets[targetIndex].toolDiagnostics.firstIndex(where: { $0.id == connectorID }) else {
-            return
+        let trimmed = newPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let index = globalToolchains.firstIndex(where: { $0.command == connectorID }) {
+            globalToolchains[index].pathOverride = trimmed
+        } else {
+            globalToolchains.append(
+                ToolchainSetting(command: connectorID, pathOverride: trimmed)
+            )
         }
 
-        let trimmed = newPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        targets[targetIndex].toolDiagnostics[diagIndex].overridePath = trimmed
-        if trimmed.isEmpty {
-            targets[targetIndex].toolDiagnostics[diagIndex].sourceType = .systemPath
-        } else {
-            targets[targetIndex].toolDiagnostics[diagIndex].sourceType = .userOverride
-            targets[targetIndex].toolDiagnostics[diagIndex].effectivePath = trimmed
+        for targetIndex in targets.indices {
+            for diagIndex in targets[targetIndex].toolDiagnostics.indices where
+                targets[targetIndex].toolDiagnostics[diagIndex].id == connectorID &&
+                targets[targetIndex].toolDiagnostics[diagIndex].overridePath
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                targets[targetIndex].toolDiagnostics[diagIndex].globalOverridePath = trimmed
+                if trimmed.isEmpty {
+                    targets[targetIndex].toolDiagnostics[diagIndex].sourceType =
+                        targets[targetIndex].toolDiagnostics[diagIndex].id == "adb"
+                        ? .bundledFallback
+                        : .systemPath
+                    targets[targetIndex].toolDiagnostics[diagIndex].effectiveScope =
+                        targets[targetIndex].toolDiagnostics[diagIndex].id == "adb"
+                        ? "builtin_fallback"
+                        : "system_path"
+                } else {
+                    targets[targetIndex].toolDiagnostics[diagIndex].sourceType = .userOverride
+                    targets[targetIndex].toolDiagnostics[diagIndex].effectivePath = trimmed
+                    targets[targetIndex].toolDiagnostics[diagIndex].effectiveScope = "global_override"
+                }
+                targets[targetIndex].toolDiagnostics[diagIndex].lastChecked = .now
+            }
         }
-        targets[targetIndex].toolDiagnostics[diagIndex].lastChecked = .now
+    }
+
+    func updateGlobalToolchainDraft(command: String, path: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let index = globalToolchains.firstIndex(where: { $0.command == command }) {
+            globalToolchains[index].pathOverride = trimmed
+        } else {
+            globalToolchains.append(ToolchainSetting(command: command, pathOverride: trimmed))
+        }
+    }
+
+    func saveGlobalToolchain(command: String) {
+        guard let setting = globalToolchains.first(where: { $0.command == command }) else {
+            return
+        }
+        updateToolOverride(connectorID: setting.command, newPath: setting.pathOverride)
     }
 
     func selectArtifact(hash: String) {
@@ -1580,7 +1779,10 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     private func buildProfile(from draft: TargetProfileDraft, id: UUID, createdAt: Date) -> TargetProfile {
-        TargetProfile(
+        let diagnostics = draft.toolDiagnostics.filter {
+            relevantToolchainCommands(for: draft.kind).contains($0.id)
+        }
+        return TargetProfile(
             id: id,
             coreID: draft.existingCoreID ?? id.uuidString.lowercased(),
             name: draft.name,
@@ -1614,7 +1816,7 @@ final class WorkspaceViewModel: ObservableObject {
                 CapabilitySummary(id: "artifacts", title: L10n.t("capability.artifacts")),
                 CapabilitySummary(id: "approvals", title: L10n.t("capability.approvals"))
             ],
-            toolDiagnostics: draft.toolDiagnostics
+            toolDiagnostics: diagnostics
         )
     }
 
@@ -1633,6 +1835,7 @@ final class WorkspaceViewModel: ObservableObject {
             cacheSettings: seed.cacheSettings,
             modelPlaneHost: "127.0.0.1",
             modelPlanePort: 19718,
+            globalToolchains: seed.globalToolchains,
             runtimeRootPath: "~/Library/Application Support/BridgingIO",
             runtimeRootAccessible: true
         )
@@ -1644,7 +1847,8 @@ final class WorkspaceViewModel: ObservableObject {
         artifacts: [ArtifactRecord],
         approvals: [ApprovalRequestItem],
         shellChannels: [ShellChannel],
-        cacheSettings: ArtifactCacheSettings
+        cacheSettings: ArtifactCacheSettings,
+        globalToolchains: [ToolchainSetting]
     ) {
         let now = Date()
         let opsID = UUID(uuidString: "4F5D6A8A-53AB-4F47-9A3E-4EA49FE4E1B1") ?? UUID()
@@ -1694,14 +1898,8 @@ final class WorkspaceViewModel: ObservableObject {
                         sourceType: .systemPath,
                         effectivePath: "/usr/bin/ssh",
                         overridePath: "",
-                        lastChecked: now.addingTimeInterval(-30)
-                    ),
-                    ToolSourceDiagnostic(
-                        id: "adb",
-                        connectorName: "adb",
-                        sourceType: .bundledFallback,
-                        effectivePath: L10n.t("seed.tool.effective_path.bridgingio_bundle"),
-                        overridePath: "",
+                        globalOverridePath: "",
+                        effectiveScope: "system_path",
                         lastChecked: now.addingTimeInterval(-30)
                     )
                 ]
@@ -1743,9 +1941,11 @@ final class WorkspaceViewModel: ObservableObject {
                     ToolSourceDiagnostic(
                         id: "adb",
                         connectorName: "adb",
-                        sourceType: .bundledFallback,
-                        effectivePath: L10n.t("seed.tool.effective_path.bridgingio_bundle"),
+                        sourceType: .userOverride,
+                        effectivePath: "/opt/homebrew/bin/adb",
                         overridePath: "",
+                        globalOverridePath: "/opt/homebrew/bin/adb",
+                        effectiveScope: "global_override",
                         lastChecked: now.addingTimeInterval(-90)
                     )
                 ]
@@ -1790,6 +1990,8 @@ final class WorkspaceViewModel: ObservableObject {
                         sourceType: .systemPath,
                         effectivePath: "/usr/bin/ssh",
                         overridePath: "",
+                        globalOverridePath: "",
+                        effectiveScope: "system_path",
                         lastChecked: now.addingTimeInterval(-130)
                     )
                 ]
@@ -1954,7 +2156,11 @@ final class WorkspaceViewModel: ObservableObject {
             artifacts: artifacts,
             approvals: approvals,
             shellChannels: shellChannels,
-            cacheSettings: .default
+            cacheSettings: .default,
+            globalToolchains: [
+                ToolchainSetting(command: "adb", pathOverride: "/opt/homebrew/bin/adb"),
+                ToolchainSetting(command: "ssh", pathOverride: "")
+            ]
         )
     }
 }
