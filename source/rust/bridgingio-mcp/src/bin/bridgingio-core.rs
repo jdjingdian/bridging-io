@@ -361,7 +361,7 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("self-test [ok] interactive transcript/checkpoint");
 
-    println!("self-test [5/6] validating standalone runtime execute path without config file...");
+    println!("self-test [5/7] validating default model-plane bind probe...");
     let runtime_root = self_test_root.join("runtime");
     let state_dir = runtime_root.join("state");
     let artifacts_dir = runtime_root.join("artifacts");
@@ -380,8 +380,19 @@ fn run_self_test() -> Result<(), String> {
         .to_string();
     settings.storage.artifacts.backend = "memory".into();
     settings.storage.artifacts.root = artifacts_dir.to_string_lossy().to_string();
-    settings.model_plane.http.enabled = false;
     settings.control_plane.enabled = false;
+
+    let bind_probe_host = settings.model_plane.http.host.clone();
+    let bind_probe_port = settings.model_plane.http.port;
+    let config_hint = runtime_root.join("self-test.toml");
+    probe_model_plane_bind(&settings, &config_hint)?;
+    println!(
+        "self-test [ok] default model-plane bind probe on {}:{}",
+        bind_probe_host, bind_probe_port
+    );
+
+    println!("self-test [6/7] validating standalone runtime execute path without config file...");
+    settings.model_plane.http.enabled = false;
     settings.targets = vec![StandaloneTargetProfile {
         id: "self-test-local".into(),
         display_name: "Self-Test Local".into(),
@@ -400,7 +411,6 @@ fn run_self_test() -> Result<(), String> {
         git_repositories: Vec::new(),
     }];
 
-    let config_hint = runtime_root.join("self-test.toml");
     let resolver = default_toolchain_resolver(&settings, &config_hint);
     let mut runtime = StandaloneCoreRuntime::from_settings_with_mode(
         settings,
@@ -490,7 +500,7 @@ fn run_self_test() -> Result<(), String> {
 
     println!("self-test [ok] standalone runtime execute path");
 
-    println!("self-test [6/6] validating host platform contract snapshot...");
+    println!("self-test [7/7] validating host platform contract snapshot...");
     let host_platform_adapter = detect_host_platform_adapter("info");
     let snapshot = host_platform_adapter.snapshot();
     if snapshot.host_platform == HostPlatform::Unknown {
@@ -560,6 +570,25 @@ fn run_self_test() -> Result<(), String> {
 
     let _ = fs::remove_dir_all(&self_test_root);
     println!("self-test passed");
+    Ok(())
+}
+
+fn probe_model_plane_bind(settings: &CoreSettings, config_hint: &Path) -> Result<(), String> {
+    let host = settings.model_plane.http.host.clone();
+    let port = settings.model_plane.http.port;
+    let resolver = default_toolchain_resolver(settings, config_hint);
+    let runtime = StandaloneCoreRuntime::from_settings_with_mode(
+        settings.clone(),
+        resolver,
+        CoreHostMode::StandaloneRun,
+    )
+    .map_err(|err| format!("create runtime for model-plane bind probe failed: {err:?}"))?
+    .shared();
+
+    let server = ModelPlaneHttpServer::bind(runtime, settings).map_err(|err| {
+        format!("self-test model-plane bind probe failed at {host}:{port}: {err:?}")
+    })?;
+    drop(server);
     Ok(())
 }
 
@@ -1219,7 +1248,9 @@ fn toml_escape_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1331,5 +1362,55 @@ mod tests {
         assert_eq!(settings.model_plane.http.host, "127.0.0.1");
         assert_eq!(settings.model_plane.http.port, 19718);
         assert_eq!(settings.core.data_dir, root.to_string_lossy().to_string());
+    }
+
+    fn self_test_probe_settings(port: u16) -> (CoreSettings, PathBuf, PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bridgingio-probe-{stamp}"));
+        let state_dir = root.join("state");
+        let artifacts_dir = root.join("artifacts");
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        fs::create_dir_all(&artifacts_dir).expect("create artifacts dir");
+
+        let mut settings = CoreSettings::from_toml_str(CoreSettings::minimal_example())
+            .expect("parse minimal settings");
+        settings.core.instance_name = format!("bridgingio-self-test-{stamp}");
+        settings.core.data_dir = root.to_string_lossy().to_string();
+        settings.storage.metadata_path = state_dir
+            .join("metadata.sqlite3")
+            .to_string_lossy()
+            .to_string();
+        settings.storage.artifacts.backend = "memory".into();
+        settings.storage.artifacts.root = artifacts_dir.to_string_lossy().to_string();
+        settings.control_plane.enabled = false;
+        settings.model_plane.http.host = "127.0.0.1".into();
+        settings.model_plane.http.port = port;
+
+        let config_hint = root.join("self-test.toml");
+        (settings, config_hint, root)
+    }
+
+    #[test]
+    fn model_plane_bind_probe_accepts_available_port() {
+        let (settings, config_hint, root) = self_test_probe_settings(0);
+        super::probe_model_plane_bind(&settings, &config_hint).expect("probe should bind");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_plane_bind_probe_reports_host_port_and_error_on_failure() {
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("bind occupied port");
+        let port = occupied.local_addr().expect("read local addr").port();
+        let (settings, config_hint, root) = self_test_probe_settings(port);
+        let err =
+            super::probe_model_plane_bind(&settings, &config_hint).expect_err("probe must fail");
+        assert!(err.contains("127.0.0.1"));
+        assert!(err.contains(&port.to_string()));
+        assert!(err.contains("bind"));
+        drop(occupied);
+        let _ = fs::remove_dir_all(root);
     }
 }
