@@ -78,9 +78,11 @@ pub struct ToolchainDiagnosticView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppCommand {
     AttachUi {
-        ui_instance_id: String,
+        host_id: String,
+        ui_session_id: String,
         ui_kind: String,
     },
+    ProbeHostInstance,
     GetBootstrapState {
         timeline_limit: usize,
         artifact_limit: usize,
@@ -196,6 +198,14 @@ pub enum ApiResponse {
         readiness_state: String,
         model_plane_ready: bool,
     },
+    HostInstanceProbe {
+        request_id: String,
+        payload_json: String,
+    },
+    OwnershipConflict {
+        request_id: String,
+        payload_json: String,
+    },
     Bootstrap {
         request_id: String,
         payload_json: String,
@@ -294,15 +304,20 @@ impl AppApiLineCodec {
         );
         match &request.command {
             AppCommand::AttachUi {
-                ui_instance_id,
+                host_id,
+                ui_session_id,
                 ui_kind,
             } => {
                 base.push_str("|command=attach_ui");
                 base.push_str(&format!(
-                    "|ui_instance_id={}|ui_kind={}",
-                    escape(ui_instance_id),
+                    "|host_id={}|ui_session_id={}|ui_kind={}",
+                    escape(host_id),
+                    escape(ui_session_id),
                     escape(ui_kind)
                 ));
+            }
+            AppCommand::ProbeHostInstance => {
+                base.push_str("|command=probe_host_instance");
             }
             AppCommand::GetBootstrapState {
                 timeline_limit,
@@ -516,9 +531,17 @@ impl AppApiLineCodec {
         };
         let command = match required(&map, "command")? {
             "attach_ui" => AppCommand::AttachUi {
-                ui_instance_id: unescape(required(&map, "ui_instance_id")?),
+                host_id: optional(&map, "host_id")
+                    .map(unescape)
+                    .or_else(|| optional(&map, "ui_instance_id").map(unescape))
+                    .ok_or_else(|| invalid_request("missing field: host_id"))?,
+                ui_session_id: optional(&map, "ui_session_id")
+                    .map(unescape)
+                    .or_else(|| optional(&map, "ui_instance_id").map(unescape))
+                    .ok_or_else(|| invalid_request("missing field: ui_session_id"))?,
                 ui_kind: unescape(required(&map, "ui_kind")?),
             },
+            "probe_host_instance" => AppCommand::ProbeHostInstance,
             "get_bootstrap_state" => AppCommand::GetBootstrapState {
                 timeline_limit: required(&map, "timeline_limit")?
                     .parse::<usize>()
@@ -628,6 +651,20 @@ impl AppApiLineCodec {
             } => format!(
                 "kind=attached|request_id={request_id}|readiness_state={}|model_plane_ready={model_plane_ready}",
                 escape(readiness_state)
+            ),
+            ApiResponse::HostInstanceProbe {
+                request_id,
+                payload_json,
+            } => format!(
+                "kind=host_instance_probe|request_id={request_id}|payload={}",
+                escape(payload_json)
+            ),
+            ApiResponse::OwnershipConflict {
+                request_id,
+                payload_json,
+            } => format!(
+                "kind=ownership_conflict|request_id={request_id}|payload={}",
+                escape(payload_json)
             ),
             ApiResponse::Bootstrap {
                 request_id,
@@ -786,6 +823,14 @@ impl AppApiLineCodec {
                 model_plane_ready: required(&map, "model_plane_ready")?
                     .parse()
                     .map_err(|_| invalid_request("model_plane_ready must be bool"))?,
+            }),
+            "host_instance_probe" => Ok(ApiResponse::HostInstanceProbe {
+                request_id,
+                payload_json: unescape(required(&map, "payload")?),
+            }),
+            "ownership_conflict" => Ok(ApiResponse::OwnershipConflict {
+                request_id,
+                payload_json: unescape(required(&map, "payload")?),
             }),
             "bootstrap" => Ok(ApiResponse::Bootstrap {
                 request_id,
@@ -1205,7 +1250,8 @@ mod tests {
                 reuse_policy: SessionReusePolicy::ReuseIfAlive,
             },
             command: AppCommand::AttachUi {
-                ui_instance_id: "swiftui-main".into(),
+                host_id: "swiftui-host".into(),
+                ui_session_id: "swiftui-session".into(),
                 ui_kind: "swiftui-macos".into(),
             },
         };
@@ -1213,10 +1259,30 @@ mod tests {
         let parsed = AppApiLineCodec::decode_request_line(&line).expect("decode");
         match parsed.command {
             AppCommand::AttachUi {
-                ui_instance_id,
+                host_id,
+                ui_session_id,
                 ui_kind,
             } => {
-                assert_eq!(ui_instance_id, "swiftui-main");
+                assert_eq!(host_id, "swiftui-host");
+                assert_eq!(ui_session_id, "swiftui-session");
+                assert_eq!(ui_kind, "swiftui-macos");
+            }
+            other => panic!("expected attach_ui command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_legacy_attach_ui_instance_id_as_host_and_session() {
+        let line = "request_id=req-attach|agent_id=ui-agent|run_id=ui-run|client_session_id=ui-client|reuse_policy=reuse_if_alive|command=attach_ui|ui_instance_id=swiftui-main|ui_kind=swiftui-macos";
+        let parsed = AppApiLineCodec::decode_request_line(line).expect("decode");
+        match parsed.command {
+            AppCommand::AttachUi {
+                host_id,
+                ui_session_id,
+                ui_kind,
+            } => {
+                assert_eq!(host_id, "swiftui-main");
+                assert_eq!(ui_session_id, "swiftui-main");
                 assert_eq!(ui_kind, "swiftui-macos");
             }
             other => panic!("expected attach_ui command, got {other:?}"),

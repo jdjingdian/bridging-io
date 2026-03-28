@@ -19,6 +19,7 @@ This contract defines how `bridgingio-core` owns and uses directories under a ru
 Within `state/`, core currently reserves:
 
 - `metadata.sqlite3`
+- `managed-instance.json` (instance discovery hint, ownership/probe summary seed)
 - `control-plane.sock` on Unix hosts
 - named-pipe endpoint `\\.\pipe\bridgingio-<sanitized-instance>-control-plane` on Windows hosts
 

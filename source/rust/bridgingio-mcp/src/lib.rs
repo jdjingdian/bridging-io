@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -589,6 +590,14 @@ fn scope_id_from_context(context: &ToolRequestContext) -> String {
     )
 }
 
+fn generate_core_instance_id() -> String {
+    let stamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("core-{stamp}-{}", process::id())
+}
+
 #[derive(Debug)]
 pub enum CoreRuntimeError {
     Config(String),
@@ -638,7 +647,8 @@ impl CoreReadinessState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UiAttachment {
-    ui_instance_id: String,
+    host_id: String,
+    ui_session_id: String,
     ui_kind: String,
     scope_id: String,
     attached_at: SystemTime,
@@ -832,6 +842,7 @@ enum TargetResolutionResult {
 pub type SharedRuntime = Arc<Mutex<StandaloneCoreRuntime>>;
 
 pub struct StandaloneCoreRuntime {
+    core_instance_id: String,
     host_mode: CoreHostMode,
     readiness_state: CoreReadinessState,
     attached_ui: Option<UiAttachment>,
@@ -922,6 +933,7 @@ impl StandaloneCoreRuntime {
         )?)
         .map_err(|err| CoreRuntimeError::Config(err.message))?;
         let mut runtime = Self {
+            core_instance_id: generate_core_instance_id(),
             host_mode,
             readiness_state,
             attached_ui: None,
@@ -974,6 +986,10 @@ impl StandaloneCoreRuntime {
 
     pub fn logical_session_count(&self) -> usize {
         self.tool_handler.metadata().logical_sessions.len()
+    }
+
+    pub fn core_instance_id(&self) -> &str {
+        &self.core_instance_id
     }
 
     pub fn host_mode(&self) -> CoreHostMode {
@@ -1076,6 +1092,72 @@ impl StandaloneCoreRuntime {
         );
         self.readiness_state = CoreReadinessState::ShuttingDown;
         self.shutdown_requested = true;
+    }
+
+    fn host_instance_probe_payload(&self) -> Value {
+        let settings = &self.settings_store.settings;
+        let runtime_root = settings.core.data_dir.clone();
+        let runtime_paths = self.host_platform_adapter.runtime_paths().runtime_paths(
+            &settings.core.instance_name,
+            Path::new(&settings.core.data_dir),
+        );
+        let attached_owner = self.attached_ui.as_ref().map(|attachment| {
+            json!({
+                "host_id": attachment.host_id,
+                "ui_session_id": attachment.ui_session_id,
+                "ui_kind": attachment.ui_kind,
+                "scope_id": attachment.scope_id,
+                "attached_at_ms": system_time_to_unix_millis(attachment.attached_at),
+            })
+        });
+        json!({
+            "core_instance_id": self.core_instance_id,
+            "host_mode": self.host_mode.as_label(),
+            "ownership_mode": self.host_mode.as_label(),
+            "pid": process::id(),
+            "started_at_ms": system_time_to_unix_millis(self.settings_store.runtime_metadata.started_at),
+            "runtime_root": runtime_root,
+            "readiness_state": self.readiness_state_label(),
+            "control_plane": {
+                "transport": settings.control_plane.transport,
+                "endpoint": runtime_paths.control_plane_endpoint,
+            },
+            "model_plane": {
+                "enabled": settings.model_plane.http.enabled,
+                "host": settings.model_plane.http.host,
+                "port": settings.model_plane.http.port,
+            },
+            "attached_owner": attached_owner,
+        })
+    }
+
+    fn ownership_conflict_payload_json(
+        &self,
+        requested_host_id: &str,
+        requested_ui_session_id: &str,
+        requested_ui_kind: &str,
+    ) -> String {
+        json!({
+            "reason": "ownership_conflict",
+            "message": "another owner is already attached",
+            "recovery_hint": "close the current owner or reconcile the running instance before retrying attach",
+            "requested_owner": {
+                "host_id": requested_host_id,
+                "ui_session_id": requested_ui_session_id,
+                "ui_kind": requested_ui_kind,
+            },
+            "current_owner": self.attached_ui.as_ref().map(|owner| {
+                json!({
+                    "host_id": owner.host_id,
+                    "ui_session_id": owner.ui_session_id,
+                    "ui_kind": owner.ui_kind,
+                    "scope_id": owner.scope_id,
+                    "attached_at_ms": system_time_to_unix_millis(owner.attached_at),
+                })
+            }),
+            "instance": self.host_instance_probe_payload(),
+        })
+        .to_string()
     }
 
     fn push_timeline_entry(
@@ -2466,6 +2548,7 @@ impl StandaloneCoreRuntime {
             "logs_dir": runtime_root_path.join("logs").to_string_lossy().to_string(),
             "state_dir": runtime_root_path.join("state").to_string_lossy().to_string(),
             "accessible": runtime_root_path.exists(),
+            "host_instance": self.host_instance_probe_payload(),
         });
         let platform_snapshot = self.host_platform_adapter.snapshot();
         let runtime_paths = self.host_platform_adapter.runtime_paths().runtime_paths(
@@ -2621,7 +2704,8 @@ impl StandaloneCoreRuntime {
     pub fn handle_app_request(&mut self, request: ApiRequest) -> ApiResponse {
         match request.command {
             AppCommand::AttachUi {
-                ui_instance_id,
+                host_id,
+                ui_session_id,
                 ui_kind,
             } => {
                 if !self.host_mode.requires_ui_attach() {
@@ -2639,17 +2723,21 @@ impl StandaloneCoreRuntime {
                     request.context.client_session_id
                 );
                 if let Some(existing) = self.attached_ui.as_ref() {
-                    if existing.ui_instance_id != ui_instance_id {
-                        return error_response(
-                            request.request_id,
-                            ApiErrorCode::ValidationFailed,
-                            "another ui instance already attached",
-                        );
+                    if existing.host_id != host_id {
+                        return ApiResponse::OwnershipConflict {
+                            request_id: request.request_id,
+                            payload_json: self.ownership_conflict_payload_json(
+                                &host_id,
+                                &ui_session_id,
+                                &ui_kind,
+                            ),
+                        };
                     }
                 }
 
                 self.attached_ui = Some(UiAttachment {
-                    ui_instance_id,
+                    host_id,
+                    ui_session_id,
                     ui_kind,
                     scope_id,
                     attached_at: SystemTime::now(),
@@ -2661,6 +2749,10 @@ impl StandaloneCoreRuntime {
                     model_plane_ready: self.model_plane_ready(),
                 }
             }
+            AppCommand::ProbeHostInstance => ApiResponse::HostInstanceProbe {
+                request_id: request.request_id,
+                payload_json: self.host_instance_probe_payload().to_string(),
+            },
             AppCommand::GetBootstrapState {
                 timeline_limit,
                 artifact_limit,

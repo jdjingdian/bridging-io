@@ -17,7 +17,8 @@ UI responsibilities:
 
 - host lifecycle ownership (start/attach/restart/shutdown)
 - runtime root location selection and persistence policy
-- attach gating orchestration in UI-managed mode
+- startup reconcile orchestration in UI-managed mode (`discover -> probe -> reconcile -> spawn`)
+- attach gating orchestration in UI-managed mode (`host_id` + `ui_session_id`)
 - user-facing diagnostics rendering and recovery UX
 - platform packaging/distribution specifics outside core contract
 

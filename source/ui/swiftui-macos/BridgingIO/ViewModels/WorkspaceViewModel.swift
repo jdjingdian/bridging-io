@@ -7,6 +7,11 @@ import Darwin
 enum WorkspaceCoreConnectionState: Equatable {
     case needsRuntimeRoot
     case runtimeRootUnavailable(String)
+    case discoveringExisting
+    case probingExisting
+    case reconcilingOrphan
+    case waitingResourceRelease
+    case ownershipConflict(String)
     case startingCore
     case attachingUI
     case attachFailed(String)
@@ -23,15 +28,24 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
     private var coreLogHandle: FileHandle?
     private var requestSequence: Int = 0
     private var targetIDMap: [String: UUID] = [:]
-    private let uiInstanceID: String
+    private let hostID: String
+    private let uiSessionID: String
     private var socketPath: String = ""
     private var coreLogPath: String = ""
     private var runtimeRootPath: String?
     private static let runtimeRootDefaultsKey = "bridgingio.runtime_root"
+    private static let hostIDDefaultsKey = "bridgingio.host_id"
 
     init() {
-        let shortID = String(UUID().uuidString.lowercased().prefix(8))
-        uiInstanceID = "swiftui-\(shortID)"
+        if let savedHostID = UserDefaults.standard.string(forKey: Self.hostIDDefaultsKey),
+           !savedHostID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            hostID = savedHostID
+        } else {
+            let newHostID = "swiftui-host-\(UUID().uuidString.lowercased())"
+            UserDefaults.standard.set(newHostID, forKey: Self.hostIDDefaultsKey)
+            hostID = newHostID
+        }
+        uiSessionID = "swiftui-session-\(UUID().uuidString.lowercased())"
         runtimeRootPath = UserDefaults.standard.string(forKey: Self.runtimeRootDefaultsKey)
     }
 
@@ -53,18 +67,8 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
     func shutdown() {
         lock.lock()
         defer { lock.unlock() }
-        _ = try? sendCommandLocked(command: "request_shutdown", fields: [:])
-        if let process {
-            if process.isRunning {
-                process.terminate()
-            }
-            self.process = nil
-        }
-        try? coreLogHandle?.close()
-        coreLogHandle = nil
-        if !socketPath.isEmpty {
-            try? FileManager.default.removeItem(atPath: socketPath)
-        }
+        requestShutdownAndWaitLocked(timeoutSeconds: 8.0)
+        stopCoreLocked(forceOnly: true)
     }
 
     func hasRuntimeRootSelection() -> Bool {
@@ -89,7 +93,8 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
     func controlledRestart() throws -> WorkspaceSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        stopCoreLocked()
+        requestShutdownAndWaitLocked(timeoutSeconds: 8.0)
+        stopCoreLocked(forceOnly: true)
         try ensureCoreStartedLocked()
         try attachUILocked()
         return try fetchBootstrapLocked()
@@ -106,23 +111,25 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
             .appendingPathComponent("logs", isDirectory: true)
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
-        socketPath = try controlPlaneSocketPathLocked()
+        socketPath = try controlPlaneSocketPathLocked(runtimeRoot: runtimeRoot)
         coreLogPath = logsDir.appendingPathComponent("bridgingio-core.log").path
 
-        stopCoreLocked()
-        try? FileManager.default.removeItem(atPath: socketPath)
+        stopCoreLocked(forceOnly: false)
+        try reconcileExistingInstanceLocked(runtimeRoot: runtimeRoot, socketPath: socketPath)
         let executable = try resolveCoreExecutablePath()
         FileManager.default.createFile(atPath: coreLogPath, contents: nil)
         let logHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: coreLogPath))
         let coreProcess = Process()
         coreProcess.executableURL = URL(fileURLWithPath: executable)
-        coreProcess.arguments = [
+        var arguments = [
             "ui-managed-ephemeral",
-            "--runtime-root",
-            runtimeRoot,
-            "--control-plane-socket-override",
-            socketPath
+            "--runtime-root", runtimeRoot
         ]
+        if let overridePath = controlPlaneSocketOverrideLocked() {
+            arguments.append(contentsOf: ["--control-plane-socket-override", overridePath])
+            socketPath = overridePath
+        }
+        coreProcess.arguments = arguments
         coreProcess.standardOutput = logHandle
         coreProcess.standardError = logHandle
         do {
@@ -148,16 +155,18 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
         }
     }
 
-    private func stopCoreLocked() {
+    private func stopCoreLocked(forceOnly: Bool) {
         if let running = process, running.isRunning {
-            running.terminate()
+            if forceOnly {
+                running.terminate()
+                if running.isRunning {
+                    kill(running.processIdentifier, SIGKILL)
+                }
+            }
         }
         process = nil
         try? coreLogHandle?.close()
         coreLogHandle = nil
-        if !socketPath.isEmpty {
-            try? FileManager.default.removeItem(atPath: socketPath)
-        }
     }
 
     private func validatedRuntimeRootLocked() throws -> String {
@@ -199,12 +208,11 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
         throw WorkspaceDataSourceError.transport("cannot find bridgingio-core executable")
     }
 
-    private func controlPlaneSocketPathLocked() throws -> String {
-        let ipcDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("bridgingio-ipc", isDirectory: true)
-        try FileManager.default.createDirectory(at: ipcDir, withIntermediateDirectories: true)
-        let shortID = String(uiInstanceID.suffix(8))
-        let candidate = ipcDir.appendingPathComponent("cp-\(shortID).sock").path
+    private func controlPlaneSocketPathLocked(runtimeRoot: String) throws -> String {
+        let candidate = URL(fileURLWithPath: runtimeRoot, isDirectory: true)
+            .appendingPathComponent("state", isDirectory: true)
+            .appendingPathComponent("control-plane.sock")
+            .path
         let maxSocketPathBytes = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
         if candidate.utf8CString.count > maxSocketPathBytes {
             throw WorkspaceDataSourceError.transport(
@@ -212,6 +220,18 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
             )
         }
         return candidate
+    }
+
+    private func controlPlaneSocketOverrideLocked() -> String? {
+        let raw = ProcessInfo.processInfo.environment["BRIDGINGIO_CONTROL_PLANE_SOCKET_OVERRIDE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw, !raw.isEmpty else {
+            return nil
+        }
+        if raw.hasPrefix("/") {
+            return raw
+        }
+        return URL(fileURLWithPath: raw, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)).path
     }
 
     private func waitForSocketReady(timeoutSeconds: TimeInterval) -> Bool {
@@ -225,16 +245,191 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
         return false
     }
 
+    private struct HostInstanceProbe {
+        let coreInstanceID: String
+        let hostMode: String
+        let modelPlaneHost: String
+        let modelPlanePort: Int
+    }
+
+    private func requestShutdownAndWaitLocked(timeoutSeconds: TimeInterval) {
+        guard !socketPath.isEmpty else {
+            return
+        }
+        let probe = try? probeHostInstanceLocked(socketPath: socketPath)
+        _ = try? sendCommandToSocketLocked(command: "request_shutdown", fields: [:], socketPath: socketPath)
+
+        let waitDeadline = Date().addingTimeInterval(timeoutSeconds)
+        if let running = process {
+            while running.isRunning && Date() < waitDeadline {
+                usleep(100_000)
+            }
+            if running.isRunning {
+                running.terminate()
+                usleep(200_000)
+                if running.isRunning {
+                    kill(running.processIdentifier, SIGKILL)
+                }
+            }
+        }
+
+        let host = probe?.modelPlaneHost ?? "127.0.0.1"
+        let port = probe?.modelPlanePort ?? 19718
+        _ = waitForResourceReleaseLocked(
+            socketPath: socketPath,
+            modelPlaneHost: host,
+            modelPlanePort: port,
+            timeoutSeconds: timeoutSeconds
+        )
+    }
+
+    private func reconcileExistingInstanceLocked(runtimeRoot: String, socketPath: String) throws {
+        guard FileManager.default.fileExists(atPath: socketPath) else {
+            return
+        }
+
+        let probe: HostInstanceProbe?
+        do {
+            probe = try probeHostInstanceLocked(socketPath: socketPath)
+        } catch {
+            // stale socket or partially written state; best effort cleanup before spawn.
+            try? FileManager.default.removeItem(atPath: socketPath)
+            let staleMetadata = URL(fileURLWithPath: runtimeRoot, isDirectory: true)
+                .appendingPathComponent("state", isDirectory: true)
+                .appendingPathComponent("managed-instance.json")
+                .path
+            try? FileManager.default.removeItem(atPath: staleMetadata)
+            return
+        }
+
+        guard let probe else {
+            return
+        }
+        if probe.hostMode != "ui-managed-ephemeral" {
+            throw WorkspaceDataSourceError.ownershipConflict(
+                "existing core ownership mode is \(probe.hostMode)"
+            )
+        }
+
+        _ = try? sendCommandToSocketLocked(command: "request_shutdown", fields: [:], socketPath: socketPath)
+        let released = waitForResourceReleaseLocked(
+            socketPath: socketPath,
+            modelPlaneHost: probe.modelPlaneHost,
+            modelPlanePort: probe.modelPlanePort,
+            timeoutSeconds: 8.0
+        )
+        if !released {
+            throw WorkspaceDataSourceError.ownershipConflict(
+                "existing managed core (\(probe.coreInstanceID)) did not release control-plane/model-plane resources in time"
+            )
+        }
+    }
+
+    private func waitForResourceReleaseLocked(
+        socketPath: String,
+        modelPlaneHost: String,
+        modelPlanePort: Int,
+        timeoutSeconds: TimeInterval
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            let socketExists = FileManager.default.fileExists(atPath: socketPath)
+            let modelPlaneBusy = isModelPlaneReachable(host: modelPlaneHost, port: modelPlanePort)
+            if !socketExists && !modelPlaneBusy {
+                return true
+            }
+            usleep(100_000)
+        }
+        return false
+    }
+
+    private func isModelPlaneReachable(host: String, port: Int) -> Bool {
+        guard let parsedPort = in_port_t(exactly: port), parsedPort > 0 else {
+            return false
+        }
+        var sockaddr = sockaddr_in()
+        sockaddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        sockaddr.sin_family = sa_family_t(AF_INET)
+        sockaddr.sin_port = parsedPort.bigEndian
+        let conversion = host.withCString { cString in
+            inet_pton(AF_INET, cString, &sockaddr.sin_addr)
+        }
+        guard conversion == 1 else {
+            return false
+        }
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 {
+            return false
+        }
+        defer { Darwin.close(fd) }
+        let result = withUnsafePointer(to: &sockaddr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { rebound in
+                Darwin.connect(fd, rebound, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return result == 0
+    }
+
+    private func probeHostInstanceLocked(socketPath: String) throws -> HostInstanceProbe {
+        let response = try sendCommandToSocketLocked(
+            command: "probe_host_instance",
+            fields: [:],
+            socketPath: socketPath
+        )
+        if response["kind"] == "error" {
+            throw WorkspaceDataSourceError.transport(
+                unescape(response["message"] ?? "probe_host_instance failed")
+            )
+        }
+        if response["kind"] == "ownership_conflict" {
+            throw WorkspaceDataSourceError.ownershipConflict(
+                unescape(response["payload"] ?? "ownership conflict")
+            )
+        }
+        guard response["kind"] == "host_instance_probe",
+              let payload = response["payload"] else {
+            throw WorkspaceDataSourceError.protocolViolation("unexpected probe response")
+        }
+        let payloadText = unescape(payload)
+        guard let data = payloadText.data(using: .utf8),
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw WorkspaceDataSourceError.protocolViolation("invalid probe payload")
+        }
+        let modelPlane = root["model_plane"] as? [String: Any] ?? [:]
+        let portValue = modelPlane["port"]
+        let port: Int
+        if let intPort = portValue as? Int {
+            port = intPort
+        } else if let doublePort = portValue as? Double {
+            port = Int(doublePort)
+        } else if let stringPort = portValue as? String, let parsed = Int(stringPort) {
+            port = parsed
+        } else {
+            port = 19718
+        }
+        return HostInstanceProbe(
+            coreInstanceID: root["core_instance_id"] as? String ?? "unknown-core",
+            hostMode: root["host_mode"] as? String ?? "unknown",
+            modelPlaneHost: modelPlane["host"] as? String ?? "127.0.0.1",
+            modelPlanePort: port
+        )
+    }
+
     private func attachUILocked() throws {
         let response = try sendCommandLocked(
             command: "attach_ui",
             fields: [
-                "ui_instance_id": uiInstanceID,
+                "host_id": hostID,
+                "ui_session_id": uiSessionID,
                 "ui_kind": "swiftui-macos"
             ]
         )
         if let kind = response["kind"], kind == "attached" {
             return
+        }
+        if let kind = response["kind"], kind == "ownership_conflict" {
+            let payload = unescape(response["payload"] ?? "")
+            throw WorkspaceDataSourceError.ownershipConflict(payload.isEmpty ? "ownership conflict" : payload)
         }
         if let kind = response["kind"], kind == "not_ready" {
             throw WorkspaceDataSourceError.waitingForAttach
@@ -400,6 +595,14 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
     }
 
     private func sendCommandLocked(command: String, fields: [String: String]) throws -> [String: String] {
+        try sendCommandToSocketLocked(command: command, fields: fields, socketPath: socketPath)
+    }
+
+    private func sendCommandToSocketLocked(
+        command: String,
+        fields: [String: String],
+        socketPath: String
+    ) throws -> [String: String] {
         requestSequence += 1
         let requestID = "ui-\(requestSequence)"
         var pairs = [
@@ -414,11 +617,11 @@ final class ManagedCoreWorkspaceDataSource: ManagedWorkspaceDataSource {
             pairs.append("\(key)=\(escape(value))")
         }
         let line = pairs.joined(separator: "|") + "\n"
-        let responseLine = try sendLineToSocketLocked(line)
+        let responseLine = try sendLineToSocketLocked(line, socketPath: socketPath)
         return parseKVPairs(responseLine)
     }
 
-    private func sendLineToSocketLocked(_ line: String) throws -> String {
+    private func sendLineToSocketLocked(_ line: String, socketPath: String) throws -> String {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         if fd < 0 {
             throw WorkspaceDataSourceError.transport("create unix socket failed")
@@ -1061,6 +1264,7 @@ enum WorkspaceDataSourceError: Error {
     case needsRuntimeRoot
     case runtimeRootUnavailable(String)
     case waitingForAttach
+    case ownershipConflict(String)
     case transport(String)
     case protocolViolation(String)
 }
@@ -1136,7 +1340,7 @@ final class WorkspaceViewModel: ObservableObject {
     @Published var globalToolchains: [ToolchainSetting] = []
     @Published var targetEditorContext: TargetEditorContext?
     @Published var isShowingSettingsSheet: Bool = false
-    @Published private(set) var coreConnectionState: WorkspaceCoreConnectionState = .startingCore
+    @Published private(set) var coreConnectionState: WorkspaceCoreConnectionState = .discoveringExisting
 
     @Published private(set) var targets: [TargetProfile]
     @Published private(set) var timeline: [CommandTimelineItem]
@@ -1150,6 +1354,7 @@ final class WorkspaceViewModel: ObservableObject {
     private var refreshInFlight = false
     private var appliedCacheBackend: ArtifactCacheBackend
     private var runtimeRootPath: String?
+    private var hasRequestedShutdown = false
 
     convenience init() {
         self.init(dataSource: ManagedCoreWorkspaceDataSource())
@@ -1173,7 +1378,31 @@ final class WorkspaceViewModel: ObservableObject {
 
     deinit {
         refreshTimer?.invalidate()
+        if !hasRequestedShutdown {
+            dataSource.shutdown()
+        }
+    }
+
+    func appWillTerminate() {
+        guard !hasRequestedShutdown else { return }
+        hasRequestedShutdown = true
+        refreshTimer?.invalidate()
         dataSource.shutdown()
+    }
+
+    func openManagedCoreLogs() {
+        let logsRoot: String
+        if let runtimeRootPath {
+            logsRoot = URL(fileURLWithPath: runtimeRootPath, isDirectory: true)
+                .appendingPathComponent("logs", isDirectory: true)
+                .path
+        } else {
+            logsRoot = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".bridgingio", isDirectory: true)
+                .appendingPathComponent("logs", isDirectory: true)
+                .path
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: logsRoot, isDirectory: true))
     }
 
     var connectionStatusText: String {
@@ -1182,6 +1411,16 @@ final class WorkspaceViewModel: ObservableObject {
             return "Select runtime root to start managed core"
         case .runtimeRootUnavailable:
             return "Saved runtime root unavailable"
+        case .discoveringExisting:
+            return "Discovering existing managed core"
+        case .probingExisting:
+            return "Probing existing managed core"
+        case .reconcilingOrphan:
+            return "Reconciling orphan core"
+        case .waitingResourceRelease:
+            return "Waiting for endpoint/resource release"
+        case .ownershipConflict:
+            return "Managed core ownership conflict"
         case .startingCore:
             return L10n.t("workspace.connection.starting")
         case .attachingUI:
@@ -1202,7 +1441,7 @@ final class WorkspaceViewModel: ObservableObject {
     }
 
     private func loadInitialSnapshot() {
-        coreConnectionState = .startingCore
+        coreConnectionState = .discoveringExisting
         if !(dataSource is ManagedCoreWorkspaceDataSource) {
             do {
                 let snapshot = try dataSource.bootstrapSnapshot()
@@ -1214,6 +1453,8 @@ final class WorkspaceViewModel: ObservableObject {
                 coreConnectionState = .runtimeRootUnavailable(path)
             } catch WorkspaceDataSourceError.waitingForAttach {
                 coreConnectionState = .attachingUI
+            } catch WorkspaceDataSourceError.ownershipConflict(let message) {
+                coreConnectionState = .ownershipConflict(message)
             } catch {
                 coreConnectionState = .attachFailed(message(for: error))
             }
@@ -1240,6 +1481,11 @@ final class WorkspaceViewModel: ObservableObject {
             } catch WorkspaceDataSourceError.waitingForAttach {
                 await MainActor.run {
                     self.coreConnectionState = .attachingUI
+                    self.startRefreshTimer()
+                }
+            } catch WorkspaceDataSourceError.ownershipConflict(let message) {
+                await MainActor.run {
+                    self.coreConnectionState = .ownershipConflict(message)
                     self.startRefreshTimer()
                 }
             } catch {
@@ -1288,6 +1534,10 @@ final class WorkspaceViewModel: ObservableObject {
             } catch WorkspaceDataSourceError.waitingForAttach {
                 await MainActor.run {
                     self.coreConnectionState = .attachingUI
+                }
+            } catch WorkspaceDataSourceError.ownershipConflict(let message) {
+                await MainActor.run {
+                    self.coreConnectionState = .ownershipConflict(message)
                 }
             } catch {
                 await MainActor.run {
@@ -1345,6 +1595,8 @@ final class WorkspaceViewModel: ObservableObject {
             return "runtime root unavailable: \(path)"
         case .waitingForAttach:
             return L10n.t("workspace.connection.waiting")
+        case .ownershipConflict(let message):
+            return message
         case .transport(let message):
             return message
         case .protocolViolation(let message):
@@ -1743,14 +1995,14 @@ final class WorkspaceViewModel: ObservableObject {
         panel.message = "Choose a runtime root folder for BridgingIO managed core."
         if panel.runModal() == .OK, let url = panel.url {
             managed.setRuntimeRoot(path: url.path)
-            coreConnectionState = .startingCore
+            coreConnectionState = .discoveringExisting
             loadInitialSnapshot()
         }
     }
 
     func retryManagedConnection() {
         guard !isFixtureDataSource else { return }
-        coreConnectionState = .startingCore
+        coreConnectionState = .discoveringExisting
         loadInitialSnapshot()
     }
 

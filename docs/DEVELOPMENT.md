@@ -222,15 +222,19 @@ cargo run -p bridgingio-mcp --bin bridgingio-core -- ui-managed-ephemeral --runt
 
 Bundled lifecycle contract (`ui-managed-ephemeral`):
 
-- Core opens local control-plane first.
+- Core discovery identity is runtime-root-stable by default (`state/control-plane.sock` on Unix or platform-equivalent endpoint); host should not depend on per-UI temporary endpoint for normal product flow.
+- `--control-plane-socket-override` is a debug/testing escape hatch and should not be used as bundled default.
+- Core opens local control-plane first and publishes managed instance metadata in runtime root (`state/managed-instance.json`).
 - Core owns `config/managed-core.toml` under runtime root and performs load-or-create on startup.
 - Core reserves `state/`, `artifacts/`, and `logs/` under runtime root; UI should treat them as core-owned internals.
 - Default model-plane listener is `127.0.0.1:19718` in freshly initialized runtime root config.
-- UI must attach through control-plane (`attach_ui`) before model-plane is considered ready.
+- UI must attach through control-plane (`attach_ui`) using stable `host_id` plus per-process `ui_session_id` before model-plane is considered ready.
+- Host can call `probe_host_instance` before attach to get structured instance/ownership summary.
+- Attach ownership conflicts return structured `ownership_conflict` payloads (instead of only generic validation failure text).
 - Before UI attach succeeds, `/mcp` and equivalent model-plane entrypoints return explicit not-ready semantics.
 - Settings/profile writes are core-owned; UI submits updates through local control-plane IPC.
 - For updates marked `restart_required`, UI must perform managed core restart before treating changes as active.
-- When UI exits normally, UI host should request shutdown (`request_shutdown`) so managed core exits with it.
+- When UI exits normally or performs controlled restart, UI host should run two-phase shutdown (`request_shutdown` -> wait process exit -> wait endpoint/model-plane release), escalating only on timeout.
 
 Standalone lifecycle contract (`run` and `-d`):
 

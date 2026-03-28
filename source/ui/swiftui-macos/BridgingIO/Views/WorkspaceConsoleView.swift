@@ -637,9 +637,21 @@ struct WorkspaceConsoleView: View {
         switch viewModel.coreConnectionState {
         case .connected:
             return theme.success
-        case .startingCore, .attachingUI, .savingChanges, .restartRequired, .restartingCore:
+        case .discoveringExisting,
+             .probingExisting,
+             .reconcilingOrphan,
+             .waitingResourceRelease,
+             .startingCore,
+             .attachingUI,
+             .savingChanges,
+             .restartRequired,
+             .restartingCore:
             return theme.warning
-        case .needsRuntimeRoot, .runtimeRootUnavailable, .attachFailed, .restartFailed:
+        case .needsRuntimeRoot,
+             .runtimeRootUnavailable,
+             .ownershipConflict,
+             .attachFailed,
+             .restartFailed:
             return theme.danger
         }
     }
@@ -664,6 +676,18 @@ struct WorkspaceConsoleView: View {
                 }
                 .consoleButton(theme: theme, tone: .secondary)
             }
+            if case .ownershipConflict = viewModel.coreConnectionState {
+                HStack(spacing: 8) {
+                    Button("Retry Reconcile") {
+                        viewModel.retryManagedConnection()
+                    }
+                    .consoleButton(theme: theme, tone: .secondary)
+                    Button("Open Logs") {
+                        viewModel.openManagedCoreLogs()
+                    }
+                    .consoleButton(theme: theme, tone: .subtle)
+                }
+            }
         }
     }
 
@@ -673,6 +697,16 @@ struct WorkspaceConsoleView: View {
             return "Runtime root required"
         case .runtimeRootUnavailable:
             return "Runtime root unavailable"
+        case .discoveringExisting:
+            return "Discovering existing instance"
+        case .probingExisting:
+            return "Probing existing instance"
+        case .reconcilingOrphan:
+            return "Reconciling orphan core"
+        case .waitingResourceRelease:
+            return "Waiting resource release"
+        case .ownershipConflict:
+            return "Ownership conflict"
         case .startingCore:
             return L10n.t("workspace.connection.starting_title")
         case .attachingUI:
@@ -698,6 +732,16 @@ struct WorkspaceConsoleView: View {
             return "Choose a runtime root directory before starting bundled managed core."
         case .runtimeRootUnavailable(let path):
             return "Saved runtime root is unavailable: \(path)"
+        case .discoveringExisting:
+            return "Discovering previously running managed core under the same runtime root."
+        case .probingExisting:
+            return "Probing discovered managed core before launching a replacement."
+        case .reconcilingOrphan:
+            return "Reconciling orphan managed core via graceful shutdown."
+        case .waitingResourceRelease:
+            return "Waiting for control-plane endpoint and model-plane listener release."
+        case .ownershipConflict(let message):
+            return message
         case .startingCore:
             return L10n.t("workspace.connection.starting_message")
         case .attachingUI:

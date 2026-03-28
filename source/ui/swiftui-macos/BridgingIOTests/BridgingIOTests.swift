@@ -78,6 +78,13 @@ struct BridgingIOTests {
         #expect(viewModel.coreConnectionState == .runtimeRootUnavailable("/tmp/missing"))
     }
 
+    @Test func startupOwnershipConflictStateIsShown() throws {
+        let viewModel = WorkspaceViewModel(
+            dataSource: FailingDataSource(error: .ownershipConflict("owner conflict"))
+        )
+        #expect(viewModel.coreConnectionState == .ownershipConflict("owner conflict"))
+    }
+
     @Test func managedSaveTargetUsesCoreOwnedUpsert() throws {
         let dataSource = ManagedMockDataSource(snapshot: WorkspaceViewModel.fixtureSnapshot())
         let viewModel = WorkspaceViewModel(dataSource: dataSource)
@@ -165,6 +172,16 @@ struct BridgingIOTests {
         #expect(diagnostic?.effectivePath == "/tmp/custom-ssh")
     }
 
+    @Test func appWillTerminateTriggersDataSourceShutdownOnce() throws {
+        let dataSource = ManagedMockDataSource(snapshot: WorkspaceViewModel.fixtureSnapshot())
+        let viewModel = WorkspaceViewModel(dataSource: dataSource)
+
+        viewModel.appWillTerminate()
+        viewModel.appWillTerminate()
+
+        #expect(dataSource.shutdownCallCount == 1)
+    }
+
     private func localized(_ key: String, locale: String) -> String {
         let bundle = Bundle.main
         guard let path = bundle.path(forResource: locale, ofType: "lproj"),
@@ -206,6 +223,7 @@ private final class ManagedMockDataSource: ManagedWorkspaceDataSource {
     private(set) var controlledRestartCallCount = 0
     private(set) var upsertProfileCallCount = 0
     private(set) var updateToolOverrideCallCount = 0
+    private(set) var shutdownCallCount = 0
     private(set) var lastUpsertDraft: TargetProfileDraft?
     private(set) var runtimeRootPath: String?
 
@@ -221,7 +239,9 @@ private final class ManagedMockDataSource: ManagedWorkspaceDataSource {
         snapshot
     }
 
-    func shutdown() {}
+    func shutdown() {
+        shutdownCallCount += 1
+    }
 
     func fetchProfileDraft(coreID: String) throws -> TargetProfileDraft {
         var draft = TargetProfileDraft()

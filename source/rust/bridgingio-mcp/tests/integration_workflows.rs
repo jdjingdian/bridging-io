@@ -642,7 +642,8 @@ fn validates_ui_managed_mode_gates_mcp_until_attach() {
                 reuse_policy: SessionReusePolicy::ReuseIfAlive,
             },
             command: AppCommand::AttachUi {
-                ui_instance_id: "swiftui-main".into(),
+                host_id: "swiftui-host".into(),
+                ui_session_id: "swiftui-session-1".into(),
                 ui_kind: "swiftui-macos".into(),
             },
         })
@@ -958,6 +959,90 @@ fn validates_mcp_http_jsonrpc_entry_and_alias_exec() {
     let payload: Value = serde_json::from_str(&body).expect("missing tool json");
     assert_eq!(payload["id"].as_u64(), Some(10));
     assert!(payload.get("error").is_some());
+}
+
+#[test]
+fn validates_probe_and_structured_ownership_conflict_for_ui_managed_mode() {
+    let root = temp_dir("ui-managed-probe");
+    let settings = bridgingio_engine::CoreSettings::from_toml_str(
+        &bridgingio_engine::CoreSettings::minimal_example().replace("port = 19718", "port = 0"),
+    )
+    .expect("parse config");
+    let mut runtime = StandaloneCoreRuntime::from_settings_with_mode(
+        settings,
+        toolchain_resolver(&root),
+        CoreHostMode::UiManagedEphemeral,
+    )
+    .expect("runtime");
+
+    let attached = runtime.handle_app_request(ApiRequest {
+        request_id: "attach-owner-a".into(),
+        context: ApiRequestContext {
+            agent_id: "agent-ui".into(),
+            run_id: "run-ui".into(),
+            client_session_id: "client-ui".into(),
+            reuse_policy: SessionReusePolicy::ReuseIfAlive,
+        },
+        command: AppCommand::AttachUi {
+            host_id: "swiftui-host-a".into(),
+            ui_session_id: "swiftui-session-a".into(),
+            ui_kind: "swiftui-macos".into(),
+        },
+    });
+    assert!(matches!(attached, ApiResponse::Attached { .. }));
+
+    let probe = runtime.handle_app_request(ApiRequest {
+        request_id: "probe-owner".into(),
+        context: ApiRequestContext {
+            agent_id: "agent-ui".into(),
+            run_id: "run-ui".into(),
+            client_session_id: "client-ui".into(),
+            reuse_policy: SessionReusePolicy::ReuseIfAlive,
+        },
+        command: AppCommand::ProbeHostInstance,
+    });
+    let payload = match probe {
+        ApiResponse::HostInstanceProbe { payload_json, .. } => payload_json,
+        other => panic!("expected host probe response, got {other:?}"),
+    };
+    let probe_json: Value = serde_json::from_str(&payload).expect("probe payload json");
+    assert_eq!(
+        probe_json["attached_owner"]["host_id"].as_str(),
+        Some("swiftui-host-a")
+    );
+    assert_eq!(
+        probe_json["host_mode"].as_str(),
+        Some("ui-managed-ephemeral")
+    );
+
+    let conflict = runtime.handle_app_request(ApiRequest {
+        request_id: "attach-owner-b".into(),
+        context: ApiRequestContext {
+            agent_id: "agent-ui".into(),
+            run_id: "run-ui".into(),
+            client_session_id: "client-ui".into(),
+            reuse_policy: SessionReusePolicy::ReuseIfAlive,
+        },
+        command: AppCommand::AttachUi {
+            host_id: "swiftui-host-b".into(),
+            ui_session_id: "swiftui-session-b".into(),
+            ui_kind: "swiftui-macos".into(),
+        },
+    });
+    let conflict_payload = match conflict {
+        ApiResponse::OwnershipConflict { payload_json, .. } => payload_json,
+        other => panic!("expected ownership conflict, got {other:?}"),
+    };
+    let conflict_json: Value =
+        serde_json::from_str(&conflict_payload).expect("ownership conflict json");
+    assert_eq!(
+        conflict_json["current_owner"]["host_id"].as_str(),
+        Some("swiftui-host-a")
+    );
+    assert_eq!(
+        conflict_json["requested_owner"]["host_id"].as_str(),
+        Some("swiftui-host-b")
+    );
 }
 
 #[test]

@@ -24,6 +24,7 @@ use bridgingio_platform::{
     RuntimeLogLevel,
 };
 use bridgingio_providers::TerminalProvider;
+use serde_json::json;
 
 #[cfg(unix)]
 use bridgingio_mcp::ControlPlaneIpcServer;
@@ -590,6 +591,16 @@ fn run_core(
         ),
     );
     apply_control_plane_socket_override(&mut settings, control_plane_socket_override)?;
+    if control_plane_socket_override.is_some() {
+        let warning =
+            "using --control-plane-socket-override escape hatch (intended for debug/testing)";
+        println!("{warning}");
+        host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Warn,
+            RuntimeLogCategory::Transport,
+            warning,
+        );
+    }
     let toolchain_resolver = default_toolchain_resolver(&settings, &config_path);
     let runtime = StandaloneCoreRuntime::from_settings_with_mode(
         settings.clone(),
@@ -611,6 +622,7 @@ fn run_core(
         &settings.core.instance_name,
         Path::new(&settings.core.data_dir),
     );
+    write_managed_instance_metadata(&runtime, &settings, host_mode, &runtime_paths)?;
     let transport = host_platform_adapter.control_plane_transport();
     let transport_lifecycle = transport.lifecycle_semantics();
     host_platform_adapter.runtime_logger().log(
@@ -776,7 +788,71 @@ fn run_core(
             break;
         }
     }
+    cleanup_managed_instance_metadata(&runtime_paths);
     Ok(())
+}
+
+fn managed_instance_metadata_path(runtime_paths: &bridgingio_platform::RuntimePaths) -> PathBuf {
+    runtime_paths.state_dir.join("managed-instance.json")
+}
+
+fn write_managed_instance_metadata(
+    runtime: &bridgingio_mcp::SharedRuntime,
+    settings: &CoreSettings,
+    host_mode: CoreHostMode,
+    runtime_paths: &bridgingio_platform::RuntimePaths,
+) -> Result<(), String> {
+    let host_mode_label = match host_mode {
+        CoreHostMode::UiManagedEphemeral => "ui-managed-ephemeral",
+        CoreHostMode::StandaloneRun => "standalone-run",
+        CoreHostMode::StandaloneDetached => "standalone-detached",
+    };
+    let (core_instance_id, started_at_ms, readiness_state) = {
+        let locked = runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned while writing instance metadata".to_string())?;
+        (
+            locked.core_instance_id().to_string(),
+            locked
+                .settings_store
+                .runtime_metadata
+                .started_at
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0),
+            locked.readiness_state_label().to_string(),
+        )
+    };
+
+    let payload = json!({
+        "core_instance_id": core_instance_id,
+        "host_mode": host_mode_label,
+        "pid": std::process::id(),
+        "started_at_ms": started_at_ms,
+        "runtime_root": settings.core.data_dir,
+        "control_plane_endpoint": runtime_paths.control_plane_endpoint,
+        "model_plane": {
+            "enabled": settings.model_plane.http.enabled,
+            "host": settings.model_plane.http.host,
+            "port": settings.model_plane.http.port,
+        },
+        "readiness_state": readiness_state,
+    });
+    let metadata_path = managed_instance_metadata_path(runtime_paths);
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|err| format!("encode managed instance metadata failed: {err}"))?;
+    fs::write(&metadata_path, bytes).map_err(|err| {
+        format!(
+            "write managed instance metadata failed: {} ({err})",
+            metadata_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn cleanup_managed_instance_metadata(runtime_paths: &bridgingio_platform::RuntimePaths) {
+    let metadata_path = managed_instance_metadata_path(runtime_paths);
+    let _ = fs::remove_file(metadata_path);
 }
 
 #[cfg(unix)]
@@ -993,7 +1069,7 @@ fn print_usage() {
     eprintln!("  bridgingio-core -d --config <path-to-standalone.toml>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --runtime-root <runtime-root-dir>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-managed-core.toml>");
-    eprintln!("  optional for all modes: --control-plane-socket-override <path-or-endpoint>");
+    eprintln!("  debug/testing escape hatch: --control-plane-socket-override <path-or-endpoint>");
 }
 
 fn resolve_config_path(args: &CliArgs) -> Result<PathBuf, String> {

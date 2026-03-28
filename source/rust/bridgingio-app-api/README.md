@@ -16,6 +16,8 @@ the Rust core engine.
 
 Commands currently cover:
 
+- UI attach (`attach_ui`) with stable `host_id` and per-session `ui_session_id`
+- startup probe (`probe_host_instance`) and structured ownership conflict semantics
 - target listing
 - profile detail read (`get_profile`) and upsert
 - settings snapshot and update (`update_settings`)
