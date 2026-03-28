@@ -5,6 +5,9 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 pub type MetadataMap = BTreeMap<String, String>;
+pub const TARGET_TERMINAL_SHELL_METADATA_KEY: &str = "terminal.shell";
+pub const TARGET_TERMINAL_FAMILY_METADATA_KEY: &str = "terminal.family";
+pub const TARGET_TERMINAL_CONCURRENCY_METADATA_KEY: &str = "terminal.concurrency";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TargetKind {
@@ -88,6 +91,101 @@ pub struct TargetProfile {
     pub notes: Option<String>,
     pub metadata: MetadataMap,
     pub toolchains: MetadataMap,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalTargetFamily {
+    Terminal,
+    Other(String),
+}
+
+impl TerminalTargetFamily {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return None;
+        }
+        match normalized.as_str() {
+            "terminal" => Some(Self::Terminal),
+            other => Some(Self::Other(other.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalConcurrencyPolicy {
+    Multiplexed,
+    Exclusive,
+}
+
+impl TerminalConcurrencyPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Multiplexed => "multiplexed",
+            Self::Exclusive => "exclusive",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "multiplexed" => Some(Self::Multiplexed),
+            "exclusive" => Some(Self::Exclusive),
+            _ => None,
+        }
+    }
+}
+
+pub fn default_terminal_target_family_for_kind(kind: &TargetKind) -> Option<TerminalTargetFamily> {
+    match kind {
+        TargetKind::Ssh | TargetKind::Adb | TargetKind::Serial => Some(TerminalTargetFamily::Terminal),
+        _ => None,
+    }
+}
+
+pub fn terminal_target_family_for(target: &TargetProfile) -> Option<TerminalTargetFamily> {
+    if let Some(family) = target
+        .metadata
+        .get(TARGET_TERMINAL_FAMILY_METADATA_KEY)
+        .and_then(|raw| TerminalTargetFamily::parse(raw))
+    {
+        return Some(family);
+    }
+    default_terminal_target_family_for_kind(&target.kind)
+}
+
+pub fn default_terminal_concurrency_policy_for_kind(
+    kind: &TargetKind,
+) -> Option<TerminalConcurrencyPolicy> {
+    match kind {
+        TargetKind::Ssh | TargetKind::Adb => Some(TerminalConcurrencyPolicy::Multiplexed),
+        TargetKind::Serial => Some(TerminalConcurrencyPolicy::Exclusive),
+        _ => None,
+    }
+}
+
+pub fn terminal_concurrency_policy_for(target: &TargetProfile) -> Option<TerminalConcurrencyPolicy> {
+    if let Some(policy) = target
+        .metadata
+        .get(TARGET_TERMINAL_CONCURRENCY_METADATA_KEY)
+        .and_then(|raw| TerminalConcurrencyPolicy::parse(raw))
+    {
+        return Some(policy);
+    }
+    default_terminal_concurrency_policy_for_kind(&target.kind)
+}
+
+pub fn is_terminal_target(target: &TargetProfile) -> bool {
+    matches!(
+        terminal_target_family_for(target),
+        Some(TerminalTargetFamily::Terminal)
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -403,5 +501,117 @@ mod tests {
         let key_b = build_logical_session_key(&scope_b, "target-1", "client-1");
 
         assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn terminal_family_and_concurrency_defaults_follow_target_kind() {
+        let make_target = |id: &str, kind: TargetKind, connection: ConnectionConfig| TargetProfile {
+            id: id.into(),
+            name: id.into(),
+            kind,
+            connection,
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: MetadataMap::new(),
+            toolchains: MetadataMap::new(),
+        };
+
+        let ssh = make_target(
+            "t-ssh",
+            TargetKind::Ssh,
+            ConnectionConfig::Ssh {
+                host: "127.0.0.1".into(),
+                port: 22,
+                username: "dev".into(),
+            },
+        );
+        let adb = make_target(
+            "t-adb",
+            TargetKind::Adb,
+            ConnectionConfig::Adb {
+                serial: Some("emulator-5554".into()),
+                transport: Some("serial".into()),
+            },
+        );
+        let serial = make_target(
+            "t-serial",
+            TargetKind::Serial,
+            ConnectionConfig::Serial {
+                device: "/dev/tty.usbmodem01".into(),
+                baud_rate: 115200,
+            },
+        );
+        let docker = make_target(
+            "t-docker",
+            TargetKind::Docker,
+            ConnectionConfig::Docker {
+                container: "busybox".into(),
+                context: None,
+            },
+        );
+
+        assert_eq!(
+            terminal_target_family_for(&ssh),
+            Some(TerminalTargetFamily::Terminal)
+        );
+        assert_eq!(
+            terminal_target_family_for(&adb),
+            Some(TerminalTargetFamily::Terminal)
+        );
+        assert_eq!(
+            terminal_target_family_for(&serial),
+            Some(TerminalTargetFamily::Terminal)
+        );
+        assert_eq!(terminal_target_family_for(&docker), None);
+
+        assert_eq!(
+            terminal_concurrency_policy_for(&ssh),
+            Some(TerminalConcurrencyPolicy::Multiplexed)
+        );
+        assert_eq!(
+            terminal_concurrency_policy_for(&adb),
+            Some(TerminalConcurrencyPolicy::Multiplexed)
+        );
+        assert_eq!(
+            terminal_concurrency_policy_for(&serial),
+            Some(TerminalConcurrencyPolicy::Exclusive)
+        );
+        assert_eq!(terminal_concurrency_policy_for(&docker), None);
+    }
+
+    #[test]
+    fn metadata_can_override_terminal_family_and_concurrency_policy() {
+        let mut target = TargetProfile {
+            id: "t-localshell".into(),
+            name: "future-localshell".into(),
+            kind: TargetKind::Other("localshell".into()),
+            connection: ConnectionConfig::Custom {
+                description: "future localshell transport".into(),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: MetadataMap::new(),
+            toolchains: MetadataMap::new(),
+        };
+        target.metadata.insert(
+            TARGET_TERMINAL_FAMILY_METADATA_KEY.to_string(),
+            "terminal".into(),
+        );
+        target.metadata.insert(
+            TARGET_TERMINAL_CONCURRENCY_METADATA_KEY.to_string(),
+            "exclusive".into(),
+        );
+
+        assert_eq!(
+            terminal_target_family_for(&target),
+            Some(TerminalTargetFamily::Terminal)
+        );
+        assert_eq!(
+            terminal_concurrency_policy_for(&target),
+            Some(TerminalConcurrencyPolicy::Exclusive)
+        );
+        assert!(is_terminal_target(&target));
     }
 }

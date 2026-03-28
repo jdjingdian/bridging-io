@@ -58,6 +58,20 @@ Cross-platform implementation rules:
 - target shell dialect selection is independent from host platform; do not
   infer remote dialect from local OS semantics.
 
+Terminal target family baseline:
+
+- `ssh` and `adb` are terminal-family targets and use the shared
+  `TerminalConnector` contract for one-shot, interactive, probe, and invocation
+  diagnostics paths.
+- terminal family metadata uses `targets.terminal.family` and
+  `targets.terminal.concurrency_policy` (or profile metadata equivalents).
+- default concurrency policy is `multiplexed` for SSH/ADB and `exclusive` for
+  serial-like targets.
+- `exclusive` targets use target-wide lease semantics in metadata/runtime:
+  concurrent holders must get explicit busy/conflict errors.
+- future `localshell` is treated as a target transport in the same
+  target/session/channel/audit flow, not as a shortcut bypassing target models.
+
 Out of current MVP:
 
 - serial, docker, HTTP/Postman-style debug, OpenGrok, Gerrit

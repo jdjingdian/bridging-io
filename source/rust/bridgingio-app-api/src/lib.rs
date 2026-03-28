@@ -3,6 +3,8 @@ use std::time::SystemTime;
 use bridgingio_domain::{
     ApprovalRequestRecord, ArtifactRecord, ConnectionConfig, CredentialRef, PolicyProfile,
     SessionRecord, SessionReusePolicy, TargetKind, TargetProfile,
+    TARGET_TERMINAL_CONCURRENCY_METADATA_KEY, TARGET_TERMINAL_FAMILY_METADATA_KEY,
+    TARGET_TERMINAL_SHELL_METADATA_KEY,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +63,9 @@ pub struct ToolchainDiagnosticView {
     pub command: String,
     pub target_id: Option<String>,
     pub target_name: Option<String>,
+    pub target_terminal_family: Option<String>,
+    pub target_shell_dialect: Option<String>,
+    pub target_terminal_concurrency_policy: Option<String>,
     pub target_override_path: Option<String>,
     pub global_override_path: Option<String>,
     pub effective_scope: Option<String>,
@@ -421,6 +426,21 @@ impl AppApiLineCodec {
                 ));
                 if let Some(alias) = profile.metadata.get("alias") {
                     base.push_str(&format!("|target_alias={}", escape(alias)));
+                }
+                if let Some(shell) = profile.metadata.get(TARGET_TERMINAL_SHELL_METADATA_KEY) {
+                    base.push_str(&format!("|target_terminal_shell={}", escape(shell)));
+                }
+                if let Some(family) = profile.metadata.get(TARGET_TERMINAL_FAMILY_METADATA_KEY) {
+                    base.push_str(&format!("|target_terminal_family={}", escape(family)));
+                }
+                if let Some(policy) = profile
+                    .metadata
+                    .get(TARGET_TERMINAL_CONCURRENCY_METADATA_KEY)
+                {
+                    base.push_str(&format!(
+                        "|target_terminal_concurrency={}",
+                        escape(policy)
+                    ));
                 }
                 if let Some(notes) = profile.notes.as_ref() {
                     base.push_str(&format!("|notes={}", escape(notes)));
@@ -1041,6 +1061,27 @@ fn parse_profile_from_fields(
     if let Some(alias) = optional(map, "target_alias").map(unescape) {
         if !alias.trim().is_empty() {
             metadata.insert("alias".to_string(), alias);
+        }
+    }
+    if let Some(shell) = optional(map, "target_terminal_shell").map(unescape) {
+        let normalized = shell.trim().to_string();
+        if !normalized.is_empty() {
+            metadata.insert(TARGET_TERMINAL_SHELL_METADATA_KEY.to_string(), normalized);
+        }
+    }
+    if let Some(family) = optional(map, "target_terminal_family").map(unescape) {
+        let normalized = family.trim().to_string();
+        if !normalized.is_empty() {
+            metadata.insert(TARGET_TERMINAL_FAMILY_METADATA_KEY.to_string(), normalized);
+        }
+    }
+    if let Some(policy) = optional(map, "target_terminal_concurrency").map(unescape) {
+        let normalized = policy.trim().to_string();
+        if !normalized.is_empty() {
+            metadata.insert(
+                TARGET_TERMINAL_CONCURRENCY_METADATA_KEY.to_string(),
+                normalized,
+            );
         }
     }
 

@@ -12,7 +12,8 @@ use bridgingio_connectors::{
 };
 use bridgingio_domain::{PolicyProfile, SessionReusePolicy, TargetKind};
 use bridgingio_engine::{
-    CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile, TerminalProviderSection,
+    CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile, StandaloneTerminalSection,
+    TerminalProviderSection,
 };
 use bridgingio_mcp::{
     control_plane_socket_path, CoreHostMode, CoreRuntimeError, ModelPlaneHttpServer,
@@ -389,6 +390,7 @@ fn run_self_test() -> Result<(), String> {
         credential_ref: None,
         notes: Some("self-test synthetic local target".into()),
         connection: StandaloneConnectionSection::default(),
+        terminal: StandaloneTerminalSection::default(),
         toolchains: HashMap::new(),
         terminal_provider: TerminalProviderSection {
             enabled: true,

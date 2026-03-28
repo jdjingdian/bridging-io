@@ -8,7 +8,8 @@ use bridgingio_domain::{
     build_logical_session_key, AccessScope, ApprovalRequestRecord, ArtifactRecord, AuditEvent,
     ChannelKind, ChannelRecord, ChannelStatus, EnvironmentFingerprint, LogicalSessionRecord,
     LogicalSessionStatus, SessionRecord, SessionReusePolicy, TargetKind, TargetProfile,
-    TransportSessionRecord, TransportSessionStatus,
+    TerminalConcurrencyPolicy, TerminalTargetFamily, TransportSessionRecord,
+    TransportSessionStatus,
 };
 
 #[derive(Default)]
@@ -23,9 +24,31 @@ pub struct InMemoryMetadataStore {
     pub fingerprints: HashMap<String, EnvironmentFingerprint>,
     pub audit_events: Vec<AuditEvent>,
     pub approvals: HashMap<String, ApprovalRequestRecord>,
+    pub exclusive_target_leases: HashMap<String, String>,
     next_logical_session_seq: u64,
     next_transport_session_seq: u64,
     next_channel_seq: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetadataStoreError {
+    TargetBusy {
+        target_id: String,
+        holder_transport_session_id: String,
+    },
+}
+
+impl MetadataStoreError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::TargetBusy {
+                target_id,
+                holder_transport_session_id,
+            } => format!(
+                "target `{target_id}` is busy; held by transport session `{holder_transport_session_id}`"
+            ),
+        }
+    }
 }
 
 impl InMemoryMetadataStore {
@@ -133,7 +156,42 @@ impl InMemoryMetadataStore {
         resolved_executable_path: Option<String>,
         resolved_executable_source: Option<String>,
         now: SystemTime,
-    ) -> TransportSessionRecord {
+    ) -> Result<TransportSessionRecord, MetadataStoreError> {
+        let exclusive_mode = self
+            .profiles
+            .get(target_id)
+            .and_then(bridgingio_domain::terminal_concurrency_policy_for)
+            == Some(TerminalConcurrencyPolicy::Exclusive);
+        if exclusive_mode {
+            self.exclusive_target_leases.retain(|_, holder_id| {
+                self.transport_sessions
+                    .get(holder_id)
+                    .map(|record| transport_status_is_active(&record.status))
+                    .unwrap_or(false)
+            });
+            if let Some(holder) = self.exclusive_target_leases.get(target_id) {
+                return Err(MetadataStoreError::TargetBusy {
+                    target_id: target_id.to_string(),
+                    holder_transport_session_id: holder.clone(),
+                });
+            }
+            if let Some(existing) = self
+                .transport_sessions
+                .values()
+                .find(|record| {
+                    record.target_id == target_id && transport_status_is_active(&record.status)
+                })
+                .map(|record| record.transport_session_id.clone())
+            {
+                self.exclusive_target_leases
+                    .insert(target_id.to_string(), existing.clone());
+                return Err(MetadataStoreError::TargetBusy {
+                    target_id: target_id.to_string(),
+                    holder_transport_session_id: existing,
+                });
+            }
+        }
+
         let transport_session_id = allocate_id(&mut self.next_transport_session_seq, "ts");
         let record = TransportSessionRecord {
             transport_session_id: transport_session_id.clone(),
@@ -158,7 +216,11 @@ impl InMemoryMetadataStore {
         }
         self.transport_sessions
             .insert(transport_session_id, record.clone());
-        record
+        if exclusive_mode {
+            self.exclusive_target_leases
+                .insert(target_id.to_string(), record.transport_session_id.clone());
+        }
+        Ok(record)
     }
 
     pub fn open_channel(
@@ -207,6 +269,27 @@ impl InMemoryMetadataStore {
         Some(channel.clone())
     }
 
+    pub fn close_transport_session(
+        &mut self,
+        transport_session_id: &str,
+        reason: impl Into<String>,
+        now: SystemTime,
+    ) -> Option<TransportSessionRecord> {
+        let record = self.transport_sessions.get_mut(transport_session_id)?;
+        record.status = TransportSessionStatus::Closed;
+        record.last_activity_at = now;
+        record.close_reason = Some(reason.into());
+        if self
+            .exclusive_target_leases
+            .get(&record.target_id)
+            .map(|holder| holder == transport_session_id)
+            .unwrap_or(false)
+        {
+            self.exclusive_target_leases.remove(&record.target_id);
+        }
+        Some(record.clone())
+    }
+
     pub fn channels_for_logical_session(&self, logical_session_id: &str) -> Vec<ChannelRecord> {
         let mut channels: Vec<_> = self
             .channels
@@ -236,6 +319,15 @@ impl InMemoryMetadataStore {
 fn allocate_id(counter: &mut u64, prefix: &str) -> String {
     *counter += 1;
     format!("{prefix}-{:06}", *counter)
+}
+
+fn transport_status_is_active(status: &TransportSessionStatus) -> bool {
+    matches!(
+        status,
+        TransportSessionStatus::Connecting
+            | TransportSessionStatus::Connected
+            | TransportSessionStatus::Degraded
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,6 +421,7 @@ pub struct StandaloneTargetProfile {
     pub credential_ref: Option<String>,
     pub notes: Option<String>,
     pub connection: StandaloneConnectionSection,
+    pub terminal: StandaloneTerminalSection,
     pub toolchains: HashMap<String, ToolchainSection>,
     pub terminal_provider: TerminalProviderSection,
     pub git_repositories: Vec<GitRepositorySection>,
@@ -342,6 +435,12 @@ pub struct StandaloneConnectionSection {
     pub known_hosts_policy: Option<String>,
     pub selector_kind: Option<String>,
     pub selector_value: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct StandaloneTerminalSection {
+    pub family: Option<String>,
+    pub concurrency_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -432,6 +531,7 @@ impl CoreSettings {
             PoliciesDefaults,
             Target,
             TargetConnection,
+            TargetTerminalConfig,
             TargetToolchain(String),
             TargetTerminal,
             TargetGitRepo,
@@ -503,6 +603,7 @@ impl CoreSettings {
                             credential_ref: None,
                             notes: None,
                             connection: StandaloneConnectionSection::default(),
+                            terminal: StandaloneTerminalSection::default(),
                             toolchains: HashMap::new(),
                             terminal_provider: TerminalProviderSection {
                                 enabled: false,
@@ -547,6 +648,7 @@ impl CoreSettings {
                     "model_plane.http.auth" => Section::ModelPlaneHttpAuth,
                     "policies.defaults" => Section::PoliciesDefaults,
                     "targets.connection" => Section::TargetConnection,
+                    "targets.terminal" => Section::TargetTerminalConfig,
                     _ if section_name.starts_with("targets.toolchains.") => {
                         let name = section_name
                             .trim_start_matches("targets.toolchains.")
@@ -695,6 +797,18 @@ impl CoreSettings {
                             target.connection.selector_value = Some(parse_string(key, value)?)
                         }
                         _ => return Err(invalid_field(key, "targets.connection")),
+                    }
+                }
+                Section::TargetTerminalConfig => {
+                    let target = targets
+                        .last_mut()
+                        .ok_or(ConfigError::MissingSection("targets"))?;
+                    match key {
+                        "family" => target.terminal.family = Some(parse_string(key, value)?),
+                        "concurrency_policy" => {
+                            target.terminal.concurrency_policy = Some(parse_string(key, value)?)
+                        }
+                        _ => return Err(invalid_field(key, "targets.terminal")),
                     }
                 }
                 Section::TargetToolchain(name) => {
@@ -864,6 +978,22 @@ impl CoreSettings {
             if target.display_name.trim().is_empty() {
                 return Err(ConfigError::MissingField("targets[].display_name"));
             }
+            if let Some(family) = target.terminal.family.as_deref() {
+                if TerminalTargetFamily::parse(family).is_none() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "targets.terminal.family".into(),
+                        reason: format!("unsupported terminal family: {family}"),
+                    });
+                }
+            }
+            if let Some(policy) = target.terminal.concurrency_policy.as_deref() {
+                if TerminalConcurrencyPolicy::parse(policy).is_none() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "targets.terminal.concurrency_policy".into(),
+                        reason: format!("unsupported terminal concurrency policy: {policy}"),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -942,6 +1072,14 @@ impl CoreSettings {
             ConfigFieldDescription {
                 path: "targets[].credential_ref",
                 description: "凭据引用，只允许引用，不允许明文敏感字段。",
+            },
+            ConfigFieldDescription {
+                path: "targets.terminal.family",
+                description: "target terminal family 元数据，首轮支持 terminal。",
+            },
+            ConfigFieldDescription {
+                path: "targets.terminal.concurrency_policy",
+                description: "target terminal 并发策略，支持 multiplexed 或 exclusive。",
             },
         ]
     }
@@ -1083,6 +1221,17 @@ impl CoreSettings {
                 lines.push(format!("selector_value = {}", toml_quote(selector_value)));
             }
             lines.push(String::new());
+
+            if target.terminal.family.is_some() || target.terminal.concurrency_policy.is_some() {
+                lines.push("[targets.terminal]".to_string());
+                if let Some(family) = target.terminal.family.as_ref() {
+                    lines.push(format!("family = {}", toml_quote(family)));
+                }
+                if let Some(policy) = target.terminal.concurrency_policy.as_ref() {
+                    lines.push(format!("concurrency_policy = {}", toml_quote(policy)));
+                }
+                lines.push(String::new());
+            }
 
             let mut target_toolchain_keys = target.toolchains.keys().cloned().collect::<Vec<_>>();
             target_toolchain_keys.sort();
@@ -1292,10 +1441,10 @@ mod tests {
 
     use bridgingio_domain::{
         AccessScope, ArtifactKind, ArtifactRecord, ChannelKind, ConnectionConfig, PolicyProfile,
-        SessionRecord, SessionReusePolicy, TargetKind,
+        SessionRecord, SessionReusePolicy, TargetKind, TARGET_TERMINAL_CONCURRENCY_METADATA_KEY,
     };
 
-    use super::InMemoryMetadataStore;
+    use super::{InMemoryMetadataStore, MetadataStoreError};
 
     #[test]
     fn stores_profile_session_and_artifact() {
@@ -1421,7 +1570,8 @@ mod tests {
             Some("/usr/bin/ssh".into()),
             Some("system_path".into()),
             now,
-        );
+        )
+        .expect("open transport session");
 
         let command_channel = store.open_channel(
             &logical.logical_session_id,
@@ -1443,6 +1593,144 @@ mod tests {
         assert_ne!(command_channel.channel_id, log_channel.channel_id);
         let channels = store.channels_for_logical_session(&logical.logical_session_id);
         assert_eq!(channels.len(), 2);
+    }
+
+    #[test]
+    fn multiplexed_target_allows_multiple_active_transport_sessions() {
+        let mut store = InMemoryMetadataStore::default();
+        store.upsert_profile(bridgingio_domain::TargetProfile {
+            id: "target-ssh".into(),
+            name: "ssh".into(),
+            kind: TargetKind::Ssh,
+            connection: ConnectionConfig::Ssh {
+                host: "127.0.0.1".into(),
+                port: 22,
+                username: "dev".into(),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: Default::default(),
+            toolchains: Default::default(),
+        });
+
+        let now = SystemTime::now();
+        let logical = store.resolve_logical_session(
+            &scope("agent-a", "client-1"),
+            "target-ssh",
+            SessionReusePolicy::ReuseIfAlive,
+            now,
+        );
+
+        let first = store
+            .open_transport_session(
+                &logical.logical_session_id,
+                "target-ssh",
+                TargetKind::Ssh,
+                Some("/usr/bin/ssh".into()),
+                Some("system_path".into()),
+                now,
+            )
+            .expect("first transport session");
+        let second = store
+            .open_transport_session(
+                &logical.logical_session_id,
+                "target-ssh",
+                TargetKind::Ssh,
+                Some("/usr/bin/ssh".into()),
+                Some("system_path".into()),
+                now,
+            )
+            .expect("second transport session");
+
+        assert_ne!(first.transport_session_id, second.transport_session_id);
+    }
+
+    #[test]
+    fn exclusive_target_lease_is_target_wide_and_releases_after_close() {
+        let mut store = InMemoryMetadataStore::default();
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            TARGET_TERMINAL_CONCURRENCY_METADATA_KEY.to_string(),
+            "exclusive".to_string(),
+        );
+        store.upsert_profile(bridgingio_domain::TargetProfile {
+            id: "target-localshell".into(),
+            name: "future localshell".into(),
+            kind: TargetKind::Other("localshell".into()),
+            connection: ConnectionConfig::Custom {
+                description: "future localshell transport".into(),
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata,
+            toolchains: Default::default(),
+        });
+
+        let now = SystemTime::now();
+        let logical_a = store.resolve_logical_session(
+            &scope("agent-a", "client-a"),
+            "target-localshell",
+            SessionReusePolicy::ReuseIfAlive,
+            now,
+        );
+        let held_transport = store
+            .open_transport_session(
+                &logical_a.logical_session_id,
+                "target-localshell",
+                TargetKind::Other("localshell".into()),
+                Some("/usr/bin/env".into()),
+                Some("system_path".into()),
+                now,
+            )
+            .expect("first exclusive transport");
+
+        let logical_b = store.resolve_logical_session(
+            &scope("agent-b", "client-b"),
+            "target-localshell",
+            SessionReusePolicy::ReuseIfAlive,
+            now,
+        );
+        let err = store
+            .open_transport_session(
+                &logical_b.logical_session_id,
+                "target-localshell",
+                TargetKind::Other("localshell".into()),
+                Some("/usr/bin/env".into()),
+                Some("system_path".into()),
+                now,
+            )
+            .expect_err("exclusive target should reject concurrent holder");
+        assert_eq!(
+            err,
+            MetadataStoreError::TargetBusy {
+                target_id: "target-localshell".into(),
+                holder_transport_session_id: held_transport.transport_session_id.clone(),
+            }
+        );
+
+        let closed = store.close_transport_session(
+            &held_transport.transport_session_id,
+            "interactive shell closed",
+            now,
+        );
+        assert!(closed.is_some());
+
+        let next_transport = store
+            .open_transport_session(
+                &logical_b.logical_session_id,
+                "target-localshell",
+                TargetKind::Other("localshell".into()),
+                Some("/usr/bin/env".into()),
+                Some("system_path".into()),
+                now,
+            )
+            .expect("lease should be acquirable after release");
+        assert_ne!(
+            next_transport.transport_session_id,
+            held_transport.transport_session_id
+        );
     }
 }
 
@@ -1481,6 +1769,30 @@ mod config_tests {
         );
         assert_eq!(config.model_plane.http.host, "127.0.0.1");
         assert_eq!(config.storage.artifacts.backend, "filesystem");
+    }
+
+    #[test]
+    fn accepts_future_localshell_target_with_terminal_metadata() {
+        let text = format!(
+            "{}\n\n[[targets]]\nid = \"workspace-shell\"\ndisplay_name = \"Workspace LocalShell\"\nkind = \"localshell\"\nenabled = true\naliases = [\"ws\"]\n\n[targets.connection]\n\n[targets.terminal]\nfamily = \"terminal\"\nconcurrency_policy = \"exclusive\"\n\n[targets.providers.terminal]\nenabled = true\nshell = \"bash\"\n",
+            CoreSettings::minimal_example()
+        );
+
+        let parsed = CoreSettings::from_toml_str(&text).expect("parse localshell style target");
+        let target = parsed
+            .targets
+            .iter()
+            .find(|entry| entry.id == "workspace-shell")
+            .expect("workspace-shell target");
+        assert_eq!(
+            target.kind,
+            bridgingio_domain::TargetKind::Other("localshell".into())
+        );
+        assert_eq!(target.terminal.family.as_deref(), Some("terminal"));
+        assert_eq!(
+            target.terminal.concurrency_policy.as_deref(),
+            Some("exclusive")
+        );
     }
 
     #[test]

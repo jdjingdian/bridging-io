@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use bridgingio_domain::{
     ChannelKind, ChannelRecord, ChannelStatus, ConnectionConfig, SessionRecord, SessionState,
-    TargetKind, TargetProfile,
+    TargetKind, TargetProfile, TerminalConcurrencyPolicy, TerminalTargetFamily,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,7 +266,9 @@ fn distribution_prefixes(kind: &BuiltInDistributionKind) -> Vec<PathBuf> {
     }
 }
 
-pub const TARGET_TERMINAL_SHELL_METADATA_KEY: &str = "terminal.shell";
+pub use bridgingio_domain::TARGET_TERMINAL_CONCURRENCY_METADATA_KEY;
+pub use bridgingio_domain::TARGET_TERMINAL_FAMILY_METADATA_KEY;
+pub use bridgingio_domain::TARGET_TERMINAL_SHELL_METADATA_KEY;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvocationKind {
@@ -342,6 +344,8 @@ pub struct InvocationDiagnosticsView {
     pub mode: String,
     pub program: String,
     pub args: Vec<String>,
+    pub target_terminal_family: String,
+    pub target_terminal_concurrency_policy: String,
     pub target_shell_dialect: String,
     pub dialect_support: String,
     pub target_override_path: Option<String>,
@@ -395,11 +399,23 @@ pub fn target_shell_dialect_for(target: &TargetProfile) -> TargetShellDialect {
     }
 }
 
+pub fn terminal_target_family_for(target: &TargetProfile) -> TerminalTargetFamily {
+    bridgingio_domain::terminal_target_family_for(target)
+        .unwrap_or_else(|| TerminalTargetFamily::Other("unknown".to_string()))
+}
+
+pub fn terminal_concurrency_policy_for(target: &TargetProfile) -> TerminalConcurrencyPolicy {
+    bridgingio_domain::terminal_concurrency_policy_for(target)
+        .unwrap_or(TerminalConcurrencyPolicy::Multiplexed)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandInvocation {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub invocation_kind: InvocationKind,
+    pub target_terminal_family: TerminalTargetFamily,
+    pub target_terminal_concurrency_policy: TerminalConcurrencyPolicy,
     pub target_shell_dialect: TargetShellDialect,
     pub resolution: InvocationResolution,
     pub quoting_boundary: InvocationQuotingBoundary,
@@ -423,6 +439,11 @@ impl CommandInvocation {
             mode: self.invocation_kind.as_str().to_string(),
             program: self.program.to_string_lossy().to_string(),
             args: self.args.clone(),
+            target_terminal_family: self.target_terminal_family.as_str().to_string(),
+            target_terminal_concurrency_policy: self
+                .target_terminal_concurrency_policy
+                .as_str()
+                .to_string(),
             target_shell_dialect: self.target_shell_dialect.as_str().to_string(),
             dialect_support: self.target_shell_dialect.support_level().to_string(),
             target_override_path: self.resolution.target_override_path.clone(),
@@ -451,6 +472,34 @@ fn host_shell_quote(value: &str) -> String {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnvironmentProbePlan {
     pub commands: Vec<String>,
+}
+
+pub trait TerminalConnector {
+    fn connector_name(&self) -> &'static str;
+    fn toolchain_command(&self) -> &'static str;
+    fn connect(&self, target: &TargetProfile, now: SystemTime) -> Result<SessionRecord, ResolveError>;
+    fn build_exec_invocation(
+        &self,
+        target: &TargetProfile,
+        command: &str,
+    ) -> Result<CommandInvocation, ResolveError>;
+    fn build_interactive_invocation(
+        &self,
+        target: &TargetProfile,
+    ) -> Result<CommandInvocation, ResolveError>;
+    fn environment_probe_plan(&self) -> EnvironmentProbePlan;
+
+    fn target_shell_dialect(&self, target: &TargetProfile) -> TargetShellDialect {
+        target_shell_dialect_for(target)
+    }
+
+    fn target_family(&self, target: &TargetProfile) -> TerminalTargetFamily {
+        terminal_target_family_for(target)
+    }
+
+    fn target_concurrency_policy(&self, target: &TargetProfile) -> TerminalConcurrencyPolicy {
+        terminal_concurrency_policy_for(target)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -579,6 +628,8 @@ impl SshConnector {
                 command.to_string(),
             ],
             invocation_kind: InvocationKind::OneShot,
+            target_terminal_family: terminal_target_family_for(target),
+            target_terminal_concurrency_policy: terminal_concurrency_policy_for(target),
             target_shell_dialect: target_shell_dialect_for(target),
             resolution: InvocationResolution::default(),
             quoting_boundary: InvocationQuotingBoundary::default(),
@@ -613,6 +664,8 @@ impl SshConnector {
             program: self.executable.clone(),
             args: vec!["-p".into(), port.to_string(), format!("{username}@{host}")],
             invocation_kind: InvocationKind::Interactive,
+            target_terminal_family: terminal_target_family_for(target),
+            target_terminal_concurrency_policy: terminal_concurrency_policy_for(target),
             target_shell_dialect: target_shell_dialect_for(target),
             resolution: InvocationResolution::default(),
             quoting_boundary: InvocationQuotingBoundary::default(),
@@ -664,6 +717,39 @@ impl SshConnector {
 
     pub fn list_channels(&self, logical_session_id: &str) -> Vec<ChannelRecord> {
         self.channel_tracker.list_channels(logical_session_id)
+    }
+}
+
+impl TerminalConnector for SshConnector {
+    fn connector_name(&self) -> &'static str {
+        "ssh"
+    }
+
+    fn toolchain_command(&self) -> &'static str {
+        "ssh"
+    }
+
+    fn connect(&self, target: &TargetProfile, now: SystemTime) -> Result<SessionRecord, ResolveError> {
+        SshConnector::connect(self, target, now)
+    }
+
+    fn build_exec_invocation(
+        &self,
+        target: &TargetProfile,
+        command: &str,
+    ) -> Result<CommandInvocation, ResolveError> {
+        SshConnector::build_exec_invocation(self, target, command)
+    }
+
+    fn build_interactive_invocation(
+        &self,
+        target: &TargetProfile,
+    ) -> Result<CommandInvocation, ResolveError> {
+        SshConnector::build_interactive_invocation(self, target)
+    }
+
+    fn environment_probe_plan(&self) -> EnvironmentProbePlan {
+        SshConnector::environment_probe_plan(self)
     }
 }
 
@@ -722,6 +808,8 @@ impl AdbConnector {
             program: self.executable.clone(),
             args,
             invocation_kind: InvocationKind::OneShot,
+            target_terminal_family: terminal_target_family_for(target),
+            target_terminal_concurrency_policy: terminal_concurrency_policy_for(target),
             target_shell_dialect: target_shell_dialect_for(target),
             resolution: InvocationResolution::default(),
             quoting_boundary: InvocationQuotingBoundary::default(),
@@ -752,6 +840,8 @@ impl AdbConnector {
             program: self.executable.clone(),
             args,
             invocation_kind: InvocationKind::Interactive,
+            target_terminal_family: terminal_target_family_for(target),
+            target_terminal_concurrency_policy: terminal_concurrency_policy_for(target),
             target_shell_dialect: target_shell_dialect_for(target),
             resolution: InvocationResolution::default(),
             quoting_boundary: InvocationQuotingBoundary::default(),
@@ -803,6 +893,39 @@ impl AdbConnector {
 
     pub fn list_channels(&self, logical_session_id: &str) -> Vec<ChannelRecord> {
         self.channel_tracker.list_channels(logical_session_id)
+    }
+}
+
+impl TerminalConnector for AdbConnector {
+    fn connector_name(&self) -> &'static str {
+        "adb"
+    }
+
+    fn toolchain_command(&self) -> &'static str {
+        "adb"
+    }
+
+    fn connect(&self, target: &TargetProfile, now: SystemTime) -> Result<SessionRecord, ResolveError> {
+        AdbConnector::connect(self, target, now)
+    }
+
+    fn build_exec_invocation(
+        &self,
+        target: &TargetProfile,
+        command: &str,
+    ) -> Result<CommandInvocation, ResolveError> {
+        AdbConnector::build_exec_invocation(self, target, command)
+    }
+
+    fn build_interactive_invocation(
+        &self,
+        target: &TargetProfile,
+    ) -> Result<CommandInvocation, ResolveError> {
+        AdbConnector::build_interactive_invocation(self, target)
+    }
+
+    fn environment_probe_plan(&self) -> EnvironmentProbePlan {
+        AdbConnector::environment_probe_plan(self)
     }
 }
 

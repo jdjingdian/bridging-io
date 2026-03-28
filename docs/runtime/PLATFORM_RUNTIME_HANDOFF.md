@@ -21,6 +21,24 @@ UI responsibilities:
 - user-facing diagnostics rendering and recovery UX
 - platform packaging/distribution specifics outside core contract
 
+## Terminal Family Boundary
+
+Core/runtime maintainers must keep three dimensions explicitly separated:
+
+- host runtime capability: `HostPlatformAdapter` and `local_shell_runtime`
+  define how local processes are launched and IO is driven.
+- target transport capability: target profiles (`ssh`, `adb`, future
+  `localshell`, future `serial`) enter the same target/session/channel/audit
+  model.
+- target shell semantics: shell dialect and quoting behavior are target-side
+  attributes, independent from host OS/runtime details.
+
+Terminal-family concurrency contract:
+
+- `multiplexed`: same target may have multiple active transports/channels.
+- `exclusive`: same target must enforce one active holder with explicit
+  busy/conflict semantics.
+
 ## Workflow Ownership And Review Boundary (A/B/C)
 
 ### Workflow A: `host-platform-foundation`
@@ -92,10 +110,15 @@ Before archive, all items must be true:
 
 - Design assumptions:
   - structured invocation is the only execution truth source
+  - host runtime and target transport boundaries stay separated (no localshell
+    shortcut path bypassing target/session/channel/audit)
+  - terminal-family concurrency policy remains explicit (`multiplexed` /
+    `exclusive`)
 - Affected modules:
   - connectors/providers/mcp terminal pipeline
 - Test requirements:
-  - dialect unit tests and interactive lifecycle integration tests
+  - dialect unit tests, concurrency-policy validation, and interactive lifecycle
+    integration tests
 - Rollback boundary:
   - rollback invocation path as a unit; avoid partial rollback that reintroduces dual truth sources
 
@@ -109,4 +132,3 @@ Before archive, all items must be true:
   - matrix record includes retries/jitter fields for flaky observation
 - Rollback boundary:
   - rollback only reporting/automation wrapper if needed; keep contract semantics and required suites intact
-

@@ -15,8 +15,10 @@ use bridgingio_artifacts::{
     ArtifactStore, ArtifactStoreConfig,
 };
 use bridgingio_connectors::{
-    target_shell_dialect_for, AdbConnector, CommandInvocation, ExecutableSource,
-    InvocationResolution, SshConnector, ToolchainResolver, TARGET_TERMINAL_SHELL_METADATA_KEY,
+    target_shell_dialect_for, terminal_concurrency_policy_for, terminal_target_family_for,
+    AdbConnector, CommandInvocation, ExecutableSource, InvocationResolution, SshConnector,
+    TerminalConnector, ToolchainResolver, TARGET_TERMINAL_CONCURRENCY_METADATA_KEY,
+    TARGET_TERMINAL_FAMILY_METADATA_KEY, TARGET_TERMINAL_SHELL_METADATA_KEY,
 };
 use bridgingio_domain::{
     AccessScope, ArtifactRecord, CapabilitySummary, ChannelKind, ChannelStatus, ConnectionConfig,
@@ -24,7 +26,7 @@ use bridgingio_domain::{
 };
 use bridgingio_engine::{
     CoreSettings, CoreSettingsStore, StandaloneConnectionSection, StandaloneTargetProfile,
-    ToolchainSection,
+    StandaloneTerminalSection, ToolchainSection,
 };
 use bridgingio_platform::{
     detect_host_platform_adapter, CapabilityStatus, HostPlatformAdapter, RuntimeLogCategory,
@@ -500,14 +502,21 @@ impl McpToolHandler {
             context.reuse_policy.clone(),
             now,
         );
-        let transport = self.metadata.open_transport_session(
+        let transport = match self.metadata.open_transport_session(
             &logical.logical_session_id,
             &target_id,
             target_kind,
             None,
             None,
             now,
-        );
+        ) {
+            Ok(record) => record,
+            Err(err) => {
+                return ToolResult::Error {
+                    message: err.message(),
+                };
+            }
+        };
         let channel = self.metadata.open_channel(
             &logical.logical_session_id,
             &transport.transport_session_id,
@@ -518,14 +527,28 @@ impl McpToolHandler {
         );
 
         let policy = bridgingio_domain::PolicyProfile::default();
-        match self.terminal_provider.exec_local(
+        let execution_result = self.terminal_provider.exec_local(
             &logical.logical_session_id,
             Some(&channel.channel_id),
             Some(&transport.transport_session_id),
             &command,
             &artifact_id,
             &policy,
-        ) {
+        );
+        let completed_at = SystemTime::now();
+        let _ = self.metadata.update_channel_status(
+            &channel.channel_id,
+            ChannelStatus::Closed,
+            Some("one-shot execution completed".into()),
+            completed_at,
+        );
+        let _ = self.metadata.close_transport_session(
+            &transport.transport_session_id,
+            "one-shot execution completed",
+            completed_at,
+        );
+
+        match execution_result {
             Ok(record) => {
                 let canonical_record = self
                     .artifact_service
@@ -705,6 +728,7 @@ struct InteractiveShellOwner {
     scope_id: String,
     logical_session_id: String,
     channel_id: String,
+    transport_session_id: String,
     target_id: String,
 }
 
@@ -1139,7 +1163,8 @@ impl StandaloneCoreRuntime {
             resolved_path,
             resolved_source,
             now,
-        );
+        )
+        .map_err(|err| CoreRuntimeError::Config(err.message()))?;
         let channel = self.tool_handler.metadata_mut().open_channel(
             &logical.logical_session_id,
             &transport.transport_session_id,
@@ -1148,7 +1173,7 @@ impl StandaloneCoreRuntime {
             Some("terminal.interactive".into()),
             now,
         );
-        let shell = self
+        let shell = match self
             .tool_handler
             .terminal_provider
             .open_interactive_shell_with_command(
@@ -1157,8 +1182,24 @@ impl StandaloneCoreRuntime {
                 Some(&transport.transport_session_id),
                 &target_kind_label(&target.kind),
                 launch_command.as_deref(),
-            )
-            .map_err(|err| CoreRuntimeError::Config(err.message))?;
+            ) {
+            Ok(shell) => shell,
+            Err(err) => {
+                let failed_at = SystemTime::now();
+                let _ = self.tool_handler.metadata_mut().update_channel_status(
+                    &channel.channel_id,
+                    ChannelStatus::Failed,
+                    Some(format!("interactive shell open failed: {}", err.message)),
+                    failed_at,
+                );
+                let _ = self.tool_handler.metadata_mut().close_transport_session(
+                    &transport.transport_session_id,
+                    "interactive shell open failed",
+                    failed_at,
+                );
+                return Err(CoreRuntimeError::Config(err.message));
+            }
+        };
         if shell.launch_fallback_applied {
             if let Some(invocation_ref) = invocation.as_mut() {
                 invocation_ref
@@ -1173,6 +1214,7 @@ impl StandaloneCoreRuntime {
                 scope_id: scope.scope_id,
                 logical_session_id: logical.logical_session_id.clone(),
                 channel_id: channel.channel_id.clone(),
+                transport_session_id: transport.transport_session_id.clone(),
                 target_id: target.id.clone(),
             },
         );
@@ -1311,6 +1353,11 @@ impl StandaloneCoreRuntime {
             Some("interactive shell closed".into()),
             now,
         );
+        let _ = self.tool_handler.metadata_mut().close_transport_session(
+            &owner.transport_session_id,
+            "interactive shell closed",
+            now,
+        );
         let state = self
             .tool_handler
             .terminal_provider
@@ -1368,32 +1415,14 @@ impl StandaloneCoreRuntime {
     ) -> Result<Option<CommandInvocation>, CoreRuntimeError> {
         let diagnostic = self.toolchain_diagnostic_for_target(target);
         let dialect = target_shell_dialect_for(target);
-        let mut invocation = match &target.kind {
-            TargetKind::Ssh => {
-                let executable = diagnostic
-                    .as_ref()
-                    .and_then(|value| value.effective_path.as_deref())
-                    .unwrap_or("ssh");
-                let connector = SshConnector::new(PathBuf::from(executable));
-                Some(
-                    connector
-                        .build_exec_invocation(target, command)
-                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
-                )
-            }
-            TargetKind::Adb => {
-                let executable = diagnostic
-                    .as_ref()
-                    .and_then(|value| value.effective_path.as_deref())
-                    .unwrap_or("adb");
-                let connector = AdbConnector::new(PathBuf::from(executable));
-                Some(
-                    connector
-                        .build_exec_invocation(target, command)
-                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
-                )
-            }
-            _ => None,
+        let mut invocation = if let Some(connector) = terminal_connector_for_target(target, &diagnostic) {
+            Some(
+                connector
+                    .build_exec_invocation(target, command)
+                    .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
+            )
+        } else {
+            None
         };
 
         if let Some(invocation_ref) = invocation.as_mut() {
@@ -1412,32 +1441,14 @@ impl StandaloneCoreRuntime {
     ) -> Result<Option<CommandInvocation>, CoreRuntimeError> {
         let diagnostic = self.toolchain_diagnostic_for_target(target);
         let dialect = target_shell_dialect_for(target);
-        let mut invocation = match &target.kind {
-            TargetKind::Ssh => {
-                let executable = diagnostic
-                    .as_ref()
-                    .and_then(|value| value.effective_path.as_deref())
-                    .unwrap_or("ssh");
-                let connector = SshConnector::new(PathBuf::from(executable));
-                Some(
-                    connector
-                        .build_interactive_invocation(target)
-                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
-                )
-            }
-            TargetKind::Adb => {
-                let executable = diagnostic
-                    .as_ref()
-                    .and_then(|value| value.effective_path.as_deref())
-                    .unwrap_or("adb");
-                let connector = AdbConnector::new(PathBuf::from(executable));
-                Some(
-                    connector
-                        .build_interactive_invocation(target)
-                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
-                )
-            }
-            _ => None,
+        let mut invocation = if let Some(connector) = terminal_connector_for_target(target, &diagnostic) {
+            Some(
+                connector
+                    .build_interactive_invocation(target)
+                    .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
+            )
+        } else {
+            None
         };
 
         if let Some(invocation_ref) = invocation.as_mut() {
@@ -1583,6 +1594,11 @@ impl StandaloneCoreRuntime {
             command: command.to_string(),
             target_id: Some(profile.id.clone()),
             target_name: Some(profile.name.clone()),
+            target_terminal_family: Some(terminal_target_family_for(profile).as_str().to_string()),
+            target_shell_dialect: Some(target_shell_dialect_for(profile).as_str().to_string()),
+            target_terminal_concurrency_policy: Some(
+                terminal_concurrency_policy_for(profile).as_str().to_string(),
+            ),
             target_override_path,
             global_override_path,
             effective_scope,
@@ -2622,6 +2638,29 @@ fn toolchain_command_for_kind(kind: &TargetKind) -> Option<&'static str> {
     }
 }
 
+fn terminal_connector_for_target(
+    target: &TargetProfile,
+    diagnostic: &Option<ToolchainDiagnosticView>,
+) -> Option<Box<dyn TerminalConnector>> {
+    match &target.kind {
+        TargetKind::Ssh => {
+            let executable = diagnostic
+                .as_ref()
+                .and_then(|value| value.effective_path.as_deref())
+                .unwrap_or("ssh");
+            Some(Box::new(SshConnector::new(PathBuf::from(executable))))
+        }
+        TargetKind::Adb => {
+            let executable = diagnostic
+                .as_ref()
+                .and_then(|value| value.effective_path.as_deref())
+                .unwrap_or("adb");
+            Some(Box::new(AdbConnector::new(PathBuf::from(executable))))
+        }
+        _ => None,
+    }
+}
+
 fn toolchain_cache_key(target_id: &str, command: &str) -> String {
     format!("{target_id}:{command}")
 }
@@ -2727,6 +2766,10 @@ fn invocation_json(invocation: Option<&CommandInvocation>) -> Value {
         "mode": view.mode,
         "program": view.program,
         "args": view.args,
+        "target_terminal": {
+            "family": view.target_terminal_family,
+            "concurrency_policy": view.target_terminal_concurrency_policy
+        },
         "target_shell_dialect": {
             "name": view.target_shell_dialect,
             "support": view.dialect_support
@@ -2873,6 +2916,30 @@ fn to_target_profile(
         metadata.insert(
             TARGET_TERMINAL_SHELL_METADATA_KEY.to_string(),
             shell.to_string(),
+        );
+    }
+    if let Some(family) = configured
+        .terminal
+        .family
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        metadata.insert(
+            TARGET_TERMINAL_FAMILY_METADATA_KEY.to_string(),
+            family.to_string(),
+        );
+    }
+    if let Some(policy) = configured
+        .terminal
+        .concurrency_policy
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        metadata.insert(
+            TARGET_TERMINAL_CONCURRENCY_METADATA_KEY.to_string(),
+            policy.to_string(),
         );
     }
     let toolchains = configured
@@ -3027,6 +3094,14 @@ fn to_standalone_target_profile(
             .map(|value| value.id.clone()),
         notes: profile.notes.clone(),
         connection,
+        terminal: StandaloneTerminalSection {
+            family: Some(terminal_target_family_for(profile).as_str().to_string()),
+            concurrency_policy: Some(
+                terminal_concurrency_policy_for(profile)
+                    .as_str()
+                    .to_string(),
+            ),
+        },
         toolchains,
         terminal_provider: bridgingio_engine::TerminalProviderSection {
             enabled: false,
@@ -3049,6 +3124,10 @@ fn target_profile_json_value(profile: &TargetProfile) -> Value {
         .metadata
         .get(TARGET_TERMINAL_SHELL_METADATA_KEY)
         .cloned();
+    let target_family = terminal_target_family_for(profile).as_str().to_string();
+    let target_concurrency = terminal_concurrency_policy_for(profile)
+        .as_str()
+        .to_string();
     let target_dialect = target_shell_dialect_for(profile);
     let (connection_kind, connection_json) = match &profile.connection {
         ConnectionConfig::Ssh {
@@ -3109,6 +3188,8 @@ fn target_profile_json_value(profile: &TargetProfile) -> Value {
         "connection": connection_json,
         "terminal_provider": {
             "shell": target_shell,
+            "target_terminal_family": target_family,
+            "target_terminal_concurrency_policy": target_concurrency,
             "target_shell_dialect": target_dialect.as_str(),
             "dialect_support": target_dialect.support_level()
         },
@@ -4918,6 +4999,73 @@ mod tests {
     }
 
     #[test]
+    fn terminal_exec_returns_busy_error_for_exclusive_target_conflict() {
+        let mut handler = McpToolHandler::default();
+        handler.metadata.upsert_profile(TargetProfile {
+            id: "serial-console-01".into(),
+            name: "serial console".into(),
+            kind: TargetKind::Serial,
+            connection: ConnectionConfig::Serial {
+                device: "/dev/tty.usbmodem01".into(),
+                baud_rate: 115200,
+            },
+            credential_ref: None,
+            default_policy: PolicyProfile::default(),
+            notes: None,
+            metadata: BTreeMap::new(),
+            toolchains: BTreeMap::new(),
+        });
+
+        let now = SystemTime::now();
+        let holder = context(
+            "agent-holder",
+            "run-holder",
+            "client-holder",
+            bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+        );
+        let holder_scope = super::build_scope(&holder, now);
+        let logical = handler.metadata.resolve_logical_session(
+            &holder_scope,
+            "serial-console-01",
+            holder.reuse_policy.clone(),
+            now,
+        );
+        let held_transport = handler
+            .metadata
+            .open_transport_session(
+                &logical.logical_session_id,
+                "serial-console-01",
+                TargetKind::Serial,
+                None,
+                None,
+                now,
+            )
+            .expect("hold exclusive transport");
+
+        let contender = context(
+            "agent-contender",
+            "run-contender",
+            "client-contender",
+            bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+        );
+        let result = handler.run_terminal(
+            "serial-console-01".into(),
+            TargetKind::Serial,
+            contender,
+            "echo ping".into(),
+            "artifact-contender".into(),
+        );
+        match result {
+            ToolResult::Error { message } => {
+                assert!(message.contains("busy"));
+                assert!(message.contains("serial-console-01"));
+                assert!(message.contains(&held_transport.transport_session_id));
+            }
+            other => panic!("expected busy error result, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn standalone_runtime_loads_minimal_config() {
         let config = bridgingio_engine::CoreSettings::from_toml_str(
             &bridgingio_engine::CoreSettings::minimal_example().replace("port = 19718", "port = 0"),
@@ -5074,6 +5222,42 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("host shell"));
+    }
+
+    #[test]
+    fn invocation_json_separates_host_runtime_and_target_terminal_dimensions() {
+        let root = temp_dir("invocation-dimension-separation");
+        let settings =
+            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
+                .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        let invocation = runtime
+            .resolve_structured_exec_invocation(&target, "pwd")
+            .expect("resolve invocation")
+            .expect("ssh invocation");
+        let view = super::invocation_json(Some(&invocation));
+
+        assert!(view["quoting_boundary"]["host_shell_runtime"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("host shell"));
+        assert_eq!(view["target_terminal"]["family"].as_str(), Some("terminal"));
+        assert_eq!(
+            view["target_terminal"]["concurrency_policy"].as_str(),
+            Some("multiplexed")
+        );
+        assert_eq!(
+            view["target_shell_dialect"]["name"].as_str(),
+            Some("ssh-posix")
+        );
     }
 
     #[test]
