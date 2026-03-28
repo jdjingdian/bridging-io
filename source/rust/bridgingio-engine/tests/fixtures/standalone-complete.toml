@@ -2,16 +2,16 @@ schema_version = 1
 
 [core]
 instance_name = "bridgingio-local"
-data_dir = "~/.bridgingio"
+data_dir = "auto"
 log_level = "info"
 
 [storage]
 metadata_backend = "sqlite"
-metadata_path = "~/.bridgingio/state/metadata.sqlite3"
+metadata_path = "auto"
 
 [storage.artifacts]
 backend = "filesystem"
-root = "~/.bridgingio/artifacts"
+root = "auto"
 max_bytes = 1073741824
 eviction_policy = "lru"
 
@@ -39,7 +39,7 @@ path_override = ""
 prefer_builtin_fallback = false
 
 [toolchains.adb]
-path_override = "/opt/homebrew/bin/adb"
+path_override = "__GLOBAL_ADB_OVERRIDE__"
 prefer_builtin_fallback = true
 
 [policies.defaults]
@@ -64,7 +64,6 @@ known_hosts_policy = "system-default"
 
 [targets.providers.terminal]
 enabled = true
-shell = "/bin/bash"
 
 [[targets.providers.git.repositories]]
 id = "bridgingio"
@@ -90,7 +89,7 @@ selector_kind = "serial"
 selector_value = "emulator-5554"
 
 [targets.toolchains.adb]
-path_override = "/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb"
+path_override = "__TARGET_ADB_OVERRIDE__"
 prefer_builtin_fallback = false
 
 [targets.providers.terminal]

@@ -6,6 +6,7 @@ members = [
     "bridgingio-artifacts",
     "bridgingio-policy",
     "bridgingio-secrets",
+    "bridgingio-platform",
     "bridgingio-connectors",
     "bridgingio-providers",
     "bridgingio-mcp",
@@ -16,4 +17,3 @@ members = [
 edition = "2021"
 license = "MIT"
 version = "0.1.0"
-

@@ -51,7 +51,7 @@ impl SecretVaultBackend for OsNativeVaultBackend {
 
     fn put(&mut self, reference: String, secret: String, label: String) -> SecretRecord {
         let mut record = self.inner.put(reference, secret, label);
-        record.backend = self.kind().to_string();
+        record.backend = "os-native(degraded-memory-shim)".to_string();
         record
     }
 

@@ -80,3 +80,6 @@ pubspec.lock
 local.properties
 captures/
 **/cxx/
+
+tmp/
+

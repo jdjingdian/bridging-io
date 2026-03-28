@@ -68,11 +68,16 @@ dependencies = [
  "bridgingio-connectors",
  "bridgingio-domain",
  "bridgingio-engine",
+ "bridgingio-platform",
  "bridgingio-policy",
  "bridgingio-providers",
  "bridgingio-secrets",
  "serde_json",
 ]
+
+[[package]]
+name = "bridgingio-platform"
+version = "0.1.0"
 
 [[package]]
 name = "bridgingio-policy"
@@ -87,6 +92,7 @@ version = "0.1.0"
 dependencies = [
  "bridgingio-artifacts",
  "bridgingio-domain",
+ "bridgingio-platform",
  "bridgingio-policy",
 ]
 

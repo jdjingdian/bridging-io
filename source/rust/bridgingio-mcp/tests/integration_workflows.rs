@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,9 +13,12 @@ use bridgingio_connectors::{
 };
 use bridgingio_domain::{SessionReusePolicy, TargetKind};
 use bridgingio_mcp::{
-    ControlPlaneIpcClient, ControlPlaneIpcServer, CoreHostMode, CoreRuntimeError, McpToolHandler,
-    ModelPlaneHttpServer, StandaloneCoreRuntime, ToolRequest, ToolRequestContext, ToolResult,
+    CoreHostMode, CoreRuntimeError, McpToolHandler, ModelPlaneHttpServer, StandaloneCoreRuntime,
+    ToolRequest, ToolRequestContext, ToolResult,
 };
+#[cfg(unix)]
+use bridgingio_mcp::{ControlPlaneIpcClient, ControlPlaneIpcServer};
+use bridgingio_platform::{detect_host_platform_adapter, HostPlatform};
 use bridgingio_policy::OperationKind;
 use serde_json::{json, Value};
 
@@ -38,17 +41,77 @@ fn temp_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    let path = PathBuf::from("/tmp").join(format!("bridgingio-mcp-{prefix}-{stamp}"));
+    let path = std::env::temp_dir().join(format!("bridgingio-mcp-{prefix}-{stamp}"));
     fs::create_dir_all(&path).expect("create temp dir");
     path
+}
+
+#[cfg(unix)]
+fn short_unix_socket_path(prefix: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    PathBuf::from("/tmp").join(format!("bridgingio-{prefix}-{stamp}.sock"))
 }
 
 fn toolchain_resolver(root: &PathBuf) -> ToolchainResolver {
     let ssh = root.join("ssh");
     let adb = root.join("adb");
-    fs::write(
-        &ssh,
-        r#"#!/bin/sh
+    #[cfg(windows)]
+    {
+        fs::write(
+            &ssh,
+            r#"@echo off
+if "%~1"=="-V" (
+  >&2 echo OpenSSH_mock
+  exit /b 0
+)
+if "%~1"=="-p" if not "%~4"=="" (
+  cmd /C "%~4"
+  exit /b %ERRORLEVEL%
+)
+cmd /Q
+"#,
+        )
+        .expect("write ssh");
+        fs::write(
+            &adb,
+            r#"@echo off
+set "arg1=%~1"
+if /I "%arg1%"=="-s" (
+  shift
+  shift
+  set "arg1=%~1"
+)
+if /I "%arg1%"=="-e" (
+  shift
+  set "arg1=%~1"
+)
+if /I "%arg1%"=="-d" (
+  shift
+  set "arg1=%~1"
+)
+if /I not "%arg1%"=="shell" (
+  >&2 echo unsupported adb mock invocation: %*
+  exit /b 1
+)
+shift
+if "%~1"=="" (
+  cmd /Q
+  exit /b %ERRORLEVEL%
+)
+cmd /C "%~1"
+exit /b %ERRORLEVEL%
+"#,
+        )
+        .expect("write adb");
+    }
+    #[cfg(not(windows))]
+    {
+        fs::write(
+            &ssh,
+            r#"#!/bin/sh
 if [ "${1:-}" = "-V" ]; then
   echo "OpenSSH_mock" >&2
   exit 0
@@ -60,11 +123,11 @@ if [ "${1:-}" = "-p" ] && [ "$#" -ge 4 ]; then
 fi
 exec /bin/sh -s
 "#,
-    )
-    .expect("write ssh");
-    fs::write(
-        &adb,
-        r#"#!/bin/sh
+        )
+        .expect("write ssh");
+        fs::write(
+            &adb,
+            r#"#!/bin/sh
 if [ "${1:-}" = "-s" ] || [ "${1:-}" = "-t" ]; then
   shift 2
 fi
@@ -82,8 +145,9 @@ if [ "$#" -gt 0 ]; then
 fi
 exec /bin/sh -s
 "#,
-    )
-    .expect("write adb");
+        )
+        .expect("write adb");
+    }
     #[cfg(unix)]
     {
         let mut ssh_perms = fs::metadata(&ssh).expect("ssh metadata").permissions();
@@ -143,6 +207,81 @@ fn post_json(addr: std::net::SocketAddr, path: &str, payload: &Value) -> String 
     read_http_response(&mut stream)
 }
 
+#[cfg(windows)]
+fn quote_shell_path(path: &Path) -> String {
+    format!("\"{}\"", path.to_string_lossy().replace('"', "\"\""))
+}
+
+#[cfg(not(windows))]
+fn quote_shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn command_info_boot_error_panic() -> &'static str {
+    "echo INFO boot&& echo ERROR panic"
+}
+
+#[cfg(not(windows))]
+fn command_info_boot_error_panic() -> &'static str {
+    "printf 'INFO boot\\nERROR panic\\n'"
+}
+
+fn command_shell_ok() -> &'static str {
+    "echo shell-ok"
+}
+
+#[cfg(windows)]
+fn command_system_server_netd() -> &'static str {
+    "echo system_server init&& echo netd ready"
+}
+
+#[cfg(not(windows))]
+fn command_system_server_netd() -> &'static str {
+    "printf 'system_server init\\nnetd ready\\n'"
+}
+
+fn command_ok() -> &'static str {
+    "echo ok"
+}
+
+fn command_alias_ok() -> &'static str {
+    "echo alias-ok"
+}
+
+fn command_read_cwd() -> &'static str {
+    #[cfg(windows)]
+    {
+        return "cd";
+    }
+    #[cfg(not(windows))]
+    {
+        "pwd"
+    }
+}
+
+fn command_change_cwd(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        return format!("cd /d {}", quote_shell_path(path));
+    }
+    #[cfg(not(windows))]
+    {
+        format!("cd {}", quote_shell_path(path))
+    }
+}
+
+fn long_running_interrupt_command() -> &'static str {
+    #[cfg(windows)]
+    {
+        return "ping -n 3 127.0.0.1 >NUL && echo done";
+    }
+    #[cfg(not(windows))]
+    {
+        "i=0; while [ $i -lt 500000 ]; do i=$((i+1)); done; echo done"
+    }
+}
+
 #[test]
 fn validates_ssh_adb_git_flow_with_artifacts_and_approval() {
     let mut handler = McpToolHandler::default();
@@ -157,7 +296,7 @@ fn validates_ssh_adb_git_flow_with_artifacts_and_approval() {
         target_id: "target-ssh".into(),
         target_kind: TargetKind::Ssh,
         context: ssh_context.clone(),
-        command: "printf 'INFO boot\\nERROR panic\\n'".into(),
+        command: command_info_boot_error_panic().into(),
         artifact_id: "artifact-ssh-raw".into(),
     });
     let ssh_artifact = match ssh_exec {
@@ -190,7 +329,7 @@ fn validates_ssh_adb_git_flow_with_artifacts_and_approval() {
         target_id: "target-ssh".into(),
         target_kind: TargetKind::Ssh,
         context: ssh_context,
-        command: "rm -rf /tmp/demo".into(),
+        command: "echo dangerous-delete".into(),
         artifact_id: "artifact-ssh-delete".into(),
         operation: OperationKind::Delete,
     });
@@ -205,7 +344,7 @@ fn validates_ssh_adb_git_flow_with_artifacts_and_approval() {
             "client-adb",
             SessionReusePolicy::ReuseIfAlive,
         ),
-        command: "printf 'shell-ok\\n'".into(),
+        command: command_shell_ok().into(),
         artifact_id: "artifact-adb-raw".into(),
     });
     assert!(matches!(adb_exec, ToolResult::Execution { .. }));
@@ -241,7 +380,7 @@ fn validates_cross_target_artifact_reanalysis_without_ssh_adb_semantics() {
             "client-http",
             SessionReusePolicy::ReuseIfAlive,
         ),
-        command: "printf 'system_server init\\nnetd ready\\n'".into(),
+        command: command_system_server_netd().into(),
         artifact_id: "artifact-http-raw".into(),
     });
     let source_artifact_id = match exec {
@@ -290,7 +429,7 @@ fn validates_multi_agent_isolation_resume_and_multi_channel() {
             target_id: "target-shared".into(),
             target_kind: TargetKind::Ssh,
             context: context(agent, "run-1", "client-shared", reuse_policy),
-            command: "printf 'ok\\n'".into(),
+            command: command_ok().into(),
             artifact_id: artifact_id.into(),
         }
     };
@@ -355,7 +494,7 @@ fn validates_shared_state_between_ipc_control_plane_and_http_model_plane() {
         .expect("runtime")
         .shared();
 
-    let socket_path = root.join("control-plane.sock");
+    let socket_path = short_unix_socket_path("shared-state");
     let ipc_server = match ControlPlaneIpcServer::bind(runtime.clone(), &socket_path) {
         Ok(server) => server,
         Err(CoreRuntimeError::Io(message)) if message.contains("Operation not permitted") => {
@@ -406,7 +545,7 @@ fn validates_headless_smoke_with_standalone_sample_config() {
     fs::write(&adb_override, "binary").expect("write adb");
 
     let config_text = bridgingio_engine::CoreSettings::complete_example()
-        .replace("/opt/homebrew/bin/adb", &adb_override.to_string_lossy())
+        .replace("__GLOBAL_ADB_OVERRIDE__", &adb_override.to_string_lossy())
         .replace("port = 19718", "port = 0");
     fs::write(&config_path, config_text).expect("write config");
 
@@ -442,7 +581,7 @@ fn validates_headless_smoke_with_standalone_sample_config() {
         },
         command: AppCommand::Execute {
             session_id,
-            command: "printf 'smoke-ok\\n'".into(),
+            command: command_shell_ok().into(),
             stream: false,
         },
     });
@@ -465,7 +604,7 @@ fn validates_ui_managed_mode_gates_mcp_until_attach() {
     .expect("runtime")
     .shared();
 
-    let socket_path = root.join("control-plane.sock");
+    let socket_path = short_unix_socket_path("ui-managed");
     let ipc_server = match ControlPlaneIpcServer::bind(runtime.clone(), &socket_path) {
         Ok(server) => server,
         Err(CoreRuntimeError::Io(message)) if message.contains("Operation not permitted") => {
@@ -645,15 +784,15 @@ fn validates_mcp_http_jsonrpc_entry_and_alias_exec() {
         "id": 5,
         "method": "tools/call",
         "params": {
-            "name": "bridgingio.terminal.exec",
-            "arguments": {
-                "target": "local",
-                "command": "ssh -V >/dev/null 2>&1; printf 'alias-ok\\n'",
-                "agent_id": "agent-mcp",
-                "run_id": "run-mcp-1",
-                "client_session_id": "client-mcp",
-                "reuse_policy": "reuse_if_alive"
-            }
+                "name": "bridgingio.terminal.exec",
+                "arguments": {
+                    "target": "local",
+                    "command": command_alias_ok(),
+                    "agent_id": "agent-mcp",
+                    "run_id": "run-mcp-1",
+                    "client_session_id": "client-mcp",
+                    "reuse_policy": "reuse_if_alive"
+                }
         }
     });
     let call_client = thread::spawn(move || post_json(addr, "/mcp", &call_exec));
@@ -699,7 +838,11 @@ fn validates_mcp_http_jsonrpc_entry_and_alias_exec() {
     let (status, body) = parse_http_response(&refine_client.join().expect("join refine"));
     assert_eq!(status, 200);
     let payload: Value = serde_json::from_str(&body).expect("refine json");
-    assert_eq!(payload["result"]["isError"].as_bool(), Some(false));
+    assert_eq!(
+        payload["result"]["isError"].as_bool(),
+        Some(false),
+        "payload={payload}"
+    );
     assert_eq!(
         payload["result"]["structuredContent"]["requested_processing_mode"].as_str(),
         Some("source")
@@ -828,6 +971,13 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
         .expect("runtime")
         .shared();
     let http_server = ModelPlaneHttpServer::bind(runtime, &settings).expect("bind http");
+    let interactive_cwd = temp_dir("interactive-shell-cwd");
+    let change_cwd_command = command_change_cwd(&interactive_cwd);
+    let read_cwd_command = command_read_cwd();
+    let cwd_hint = interactive_cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| interactive_cwd.to_string_lossy().to_ascii_lowercase());
 
     let addr = http_server.local_addr().expect("http addr");
     let open = json!({
@@ -853,6 +1003,14 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
         .as_str()
         .expect("shell id")
         .to_string();
+    assert_eq!(
+        payload["result"]["structuredContent"]["launch_strategy"].as_str(),
+        Some("structured_interactive_invocation")
+    );
+    assert_eq!(
+        payload["result"]["structuredContent"]["launch_fallback_applied"].as_bool(),
+        Some(false)
+    );
 
     let addr = http_server.local_addr().expect("http addr");
     let write_export = json!({
@@ -863,7 +1021,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
             "name": "bridgingio.terminal.shell.write",
             "arguments": {
                 "shell_id": shell_id.clone(),
-                "input": "cd /tmp",
+                "input": change_cwd_command,
                 "agent_id": "agent-a",
                 "run_id": "run-1",
                 "client_session_id": "client-1",
@@ -886,7 +1044,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
             "name": "bridgingio.terminal.shell.write",
             "arguments": {
                 "shell_id": shell_id.clone(),
-                "input": "pwd",
+                "input": read_cwd_command,
                 "agent_id": "agent-a",
                 "run_id": "run-1",
                 "client_session_id": "client-1",
@@ -901,7 +1059,8 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
     assert!(payload["result"]["structuredContent"]["output"]
         .as_str()
         .unwrap_or_default()
-        .contains("/tmp"));
+        .to_ascii_lowercase()
+        .contains(&cwd_hint));
 
     let addr = http_server.local_addr().expect("http addr");
     let open_second = json!({
@@ -938,7 +1097,7 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
             "name": "bridgingio.terminal.shell.write",
             "arguments": {
                 "shell_id": shell_2.clone(),
-                "input": "pwd",
+                "input": read_cwd_command,
                 "agent_id": "agent-a",
                 "run_id": "run-1",
                 "client_session_id": "client-1",
@@ -953,7 +1112,8 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
     assert!(!payload["result"]["structuredContent"]["output"]
         .as_str()
         .unwrap_or_default()
-        .contains("/tmp"));
+        .to_ascii_lowercase()
+        .contains(&cwd_hint));
 
     let addr = http_server.local_addr().expect("http addr");
     let read = json!({
@@ -980,11 +1140,22 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
     let lines = payload["result"]["structuredContent"]["lines"]
         .as_array()
         .expect("lines array");
-    assert!(lines.iter().any(|line| {
-        line.as_str()
-            .unwrap_or_default()
-            .contains("cd /tmp")
-    }));
+    assert_eq!(
+        payload["result"]["structuredContent"]["running"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        payload["result"]["structuredContent"]["closed"].as_bool(),
+        Some(false)
+    );
+    assert!(lines
+        .iter()
+        .any(|line| {
+            line.as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains(&cwd_hint)
+        }));
 
     let addr = http_server.local_addr().expect("http addr");
     let cross_scope_read = json!({
@@ -1038,6 +1209,14 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
         payload["result"]["structuredContent"]["interrupted"].as_bool(),
         Some(true)
     );
+    assert_eq!(
+        payload["result"]["structuredContent"]["running"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        payload["result"]["structuredContent"]["closed"].as_bool(),
+        Some(false)
+    );
 
     let addr = http_server.local_addr().expect("http addr");
     let close = json!({
@@ -1062,6 +1241,10 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
     assert_eq!(
         payload["result"]["structuredContent"]["closed"].as_bool(),
         Some(true)
+    );
+    assert_eq!(
+        payload["result"]["structuredContent"]["running"].as_bool(),
+        Some(false)
     );
 
     let addr = http_server.local_addr().expect("http addr");
@@ -1133,6 +1316,14 @@ fn validates_interactive_shell_long_running_interrupt_flow() {
         .as_str()
         .expect("shell id")
         .to_string();
+    assert_eq!(
+        payload["result"]["structuredContent"]["launch_strategy"].as_str(),
+        Some("structured_interactive_invocation")
+    );
+    assert_eq!(
+        payload["result"]["structuredContent"]["launch_fallback_applied"].as_bool(),
+        Some(false)
+    );
 
     let addr = http_server.local_addr().expect("http addr");
     let write = json!({
@@ -1143,7 +1334,7 @@ fn validates_interactive_shell_long_running_interrupt_flow() {
             "name": "bridgingio.terminal.shell.write",
             "arguments": {
                 "shell_id": shell_id.clone(),
-                "input": "sleep 1; echo done",
+                "input": long_running_interrupt_command(),
                 "agent_id": "agent-i",
                 "run_id": "run-1",
                 "client_session_id": "client-1",
@@ -1185,5 +1376,92 @@ fn validates_interactive_shell_long_running_interrupt_flow() {
             payload["result"]["structuredContent"]["running"].as_bool(),
             Some(false)
         );
+    } else {
+        assert!(
+            payload["result"]["structuredContent"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("done"),
+            "expected completed output to contain done marker"
+        );
+    }
+}
+
+#[test]
+fn validates_platform_matrix_contract_for_transport_paths_and_toolchain_fallback() {
+    let root = temp_dir("platform-matrix-contract");
+    let bundled_root = root.join("bundled");
+    fs::create_dir_all(&bundled_root).expect("create bundled root");
+    let _ = toolchain_resolver(&bundled_root);
+
+    let empty_system_path = root.join("system-empty");
+    fs::create_dir_all(&empty_system_path).expect("create empty system path");
+
+    let mut config_text = bridgingio_engine::CoreSettings::complete_example().to_string();
+    config_text = config_text.replace("__GLOBAL_ADB_OVERRIDE__", "");
+    config_text = config_text.replace("__TARGET_ADB_OVERRIDE__", "");
+    let config_path = root.join("matrix.toml");
+    fs::write(&config_path, config_text).expect("write matrix config");
+
+    let resolver = ToolchainResolver::new(
+        ExecutableResolver::with_search_paths(vec![empty_system_path]),
+        &bundled_root,
+        vec![
+            BuiltInBinarySpec {
+                command: "ssh".into(),
+                relative_path: PathBuf::from("ssh"),
+                distribution: BuiltInDistributionKind::StandalonePackage,
+            },
+            BuiltInBinarySpec {
+                command: "adb".into(),
+                relative_path: PathBuf::from("adb"),
+                distribution: BuiltInDistributionKind::StandalonePackage,
+            },
+        ],
+    );
+    let mut runtime =
+        StandaloneCoreRuntime::from_config_file(&config_path, resolver).expect("runtime");
+    let diagnostics = runtime.handle_app_request(ApiRequest {
+        request_id: "diag-matrix".into(),
+        context: ApiRequestContext {
+            agent_id: "agent-matrix".into(),
+            run_id: "run-matrix-1".into(),
+            client_session_id: "client-matrix".into(),
+            reuse_policy: SessionReusePolicy::ReuseIfAlive,
+        },
+        command: AppCommand::GetToolchainDiagnostics,
+    });
+    let adb_diag = match diagnostics {
+        ApiResponse::Diagnostics { items, .. } => items
+            .into_iter()
+            .find(|item| {
+                item.target_id.as_deref() == Some("android-emulator") && item.command == "adb"
+            })
+            .expect("adb diagnostics for android-emulator"),
+        other => panic!("unexpected diagnostics response: {other:?}"),
+    };
+    assert_eq!(adb_diag.effective_scope.as_deref(), Some("builtin_fallback"));
+    assert_eq!(adb_diag.effective_source.as_deref(), Some("builtin_fallback"));
+
+    let adapter = detect_host_platform_adapter("info");
+    let runtime_root = root.join("runtime-root");
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    let runtime_paths = adapter
+        .runtime_paths()
+        .runtime_paths("bridgingio-matrix", &runtime_root);
+    let endpoint = adapter
+        .control_plane_transport()
+        .endpoint_semantics("bridgingio-matrix", &runtime_paths)
+        .endpoint;
+    assert!(!endpoint.is_empty(), "transport endpoint should not be empty");
+    match adapter.host_platform() {
+        HostPlatform::Windows => assert!(
+            endpoint.starts_with(r"\\.\pipe\bridgingio-"),
+            "windows endpoint should use named-pipe contract, got {endpoint}"
+        ),
+        HostPlatform::Unix | HostPlatform::Unknown => assert!(
+            endpoint.ends_with("control-plane.sock"),
+            "unix/unknown endpoint should end with control-plane.sock, got {endpoint}"
+        ),
     }
 }

@@ -968,7 +968,10 @@ impl CoreSettings {
                 "metadata_backend = {}",
                 toml_quote(&self.storage.metadata_backend)
             ),
-            format!("metadata_path = {}", toml_quote(&self.storage.metadata_path)),
+            format!(
+                "metadata_path = {}",
+                toml_quote(&self.storage.metadata_path)
+            ),
             String::new(),
             "[storage.artifacts]".to_string(),
             format!("backend = {}", toml_quote(&self.storage.artifacts.backend)),
@@ -1009,7 +1012,10 @@ impl CoreSettings {
                 "reuse_policy = {}",
                 toml_quote(reuse_policy_to_str(&self.policies.reuse_policy))
             ),
-            format!("approval_mode = {}", toml_quote(&self.policies.approval_mode)),
+            format!(
+                "approval_mode = {}",
+                toml_quote(&self.policies.approval_mode)
+            ),
             format!(
                 "capture_env_fingerprint = {}",
                 self.policies.capture_env_fingerprint
@@ -1078,8 +1084,7 @@ impl CoreSettings {
             }
             lines.push(String::new());
 
-            let mut target_toolchain_keys =
-                target.toolchains.keys().cloned().collect::<Vec<_>>();
+            let mut target_toolchain_keys = target.toolchains.keys().cloned().collect::<Vec<_>>();
             target_toolchain_keys.sort();
             for key in target_toolchain_keys {
                 let section = target
@@ -1472,7 +1477,7 @@ mod config_tests {
                 .toolchains
                 .get("adb")
                 .map(|section| section.path_override.as_str()),
-            Some("/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb")
+            Some("__TARGET_ADB_OVERRIDE__")
         );
         assert_eq!(config.model_plane.http.host, "127.0.0.1");
         assert_eq!(config.storage.artifacts.backend, "filesystem");
@@ -1490,7 +1495,7 @@ mod config_tests {
                 .toolchains
                 .get("adb")
                 .map(|section| section.path_override.as_str()),
-            Some("/opt/homebrew/bin/adb")
+            Some("__GLOBAL_ADB_OVERRIDE__")
         );
 
         let adb_target = reparsed
@@ -1503,7 +1508,7 @@ mod config_tests {
                 .toolchains
                 .get("adb")
                 .map(|section| section.path_override.as_str()),
-            Some("/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb")
+            Some("__TARGET_ADB_OVERRIDE__")
         );
     }
 

@@ -43,6 +43,21 @@ Terminal provider runtime notes:
   `stty`); if PTY allocation fails it falls back to pipe backend and emits a
   transcript-level runtime hint.
 
+Cross-platform architecture references:
+
+- core platform contract: `docs/testing/CORE_PLATFORM_CONTRACT.md`
+- runtime root layout contract: `docs/runtime/RUNTIME_ROOT_LAYOUT.md`
+- platform handoff and workflow boundaries: `docs/runtime/PLATFORM_RUNTIME_HANDOFF.md`
+
+Cross-platform implementation rules:
+
+- `HostPlatformAdapter` is the only boundary for host-local shell, IPC, paths,
+  toolchain locator, vault binding, logger, and decoder capabilities.
+- structured invocation from connectors is the execution truth source for
+  one-shot, interactive, and diagnostics paths.
+- target shell dialect selection is independent from host platform; do not
+  infer remote dialect from local OS semantics.
+
 Out of current MVP:
 
 - serial, docker, HTTP/Postman-style debug, OpenGrok, Gerrit
@@ -72,6 +87,12 @@ Default test command:
 ```bash
 cd source/rust
 cargo test
+```
+
+Cross-platform contract baseline:
+
+```bash
+scripts/testing/run-core-platform-contract.sh
 ```
 
 ## Standalone Core Quick Start
@@ -189,6 +210,7 @@ Bundled lifecycle contract (`ui-managed-ephemeral`):
 
 - Core opens local control-plane first.
 - Core owns `config/managed-core.toml` under runtime root and performs load-or-create on startup.
+- Core reserves `state/`, `artifacts/`, and `logs/` under runtime root; UI should treat them as core-owned internals.
 - Default model-plane listener is `127.0.0.1:19718` in freshly initialized runtime root config.
 - UI must attach through control-plane (`attach_ui`) before model-plane is considered ready.
 - Before UI attach succeeds, `/mcp` and equivalent model-plane entrypoints return explicit not-ready semantics.
@@ -205,6 +227,10 @@ Standalone lifecycle contract (`run` and `-d`):
 Future extension point:
 
 - Keep lifecycle ownership in a host adapter layer so we can later switch from UI child-process hosting to system service hosting (for example `SMAppService`/`SMJobBless`-style paths) without changing control-plane or MCP protocol boundaries.
+
+Runtime root layout contract:
+
+- See `docs/runtime/RUNTIME_ROOT_LAYOUT.md` for core-reserved directories, UI read boundaries, and bootstrap write checks.
 
 ## Archive Handoff Requirements
 

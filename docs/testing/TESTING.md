@@ -30,3 +30,22 @@ The default run plan is:
 cd source/rust
 cargo test
 ```
+
+## Core Platform Contract
+
+Cross-platform core verification must follow:
+
+- `docs/testing/CORE_PLATFORM_CONTRACT.md`
+- `scripts/testing/run-core-platform-contract.sh`
+
+Recommended matrix baseline (macOS, Windows, Linux):
+
+```bash
+scripts/testing/run-core-platform-contract.sh
+```
+
+The script emits a JSONL execution record under `tmp/` and includes:
+
+- per-suite status
+- retries/jitter observation fields for flaky tracking
+- command-level trace for manual/CI parity

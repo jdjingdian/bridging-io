@@ -15,7 +15,12 @@ use bridgingio_engine::{
     CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile, TerminalProviderSection,
 };
 use bridgingio_mcp::{
-    control_plane_socket_path, CoreHostMode, ModelPlaneHttpServer, StandaloneCoreRuntime,
+    control_plane_socket_path, CoreHostMode, CoreRuntimeError, ModelPlaneHttpServer,
+    StandaloneCoreRuntime,
+};
+use bridgingio_platform::{
+    detect_host_platform_adapter, CapabilityStatus, HostPlatform, RuntimeLogCategory,
+    RuntimeLogLevel,
 };
 use bridgingio_providers::TerminalProvider;
 
@@ -105,7 +110,7 @@ fn run_self_test() -> Result<(), String> {
     let marker_runtime = "BRIDGINGIO_SELFTEST_RUNTIME_OK";
     let cwd_hint = "bridgingio selftest cwd";
 
-    println!("self-test [1/5] validating terminal provider one-shot execution...");
+    println!("self-test [1/6] validating terminal provider one-shot execution...");
     let mut provider = TerminalProvider::default();
     let one_shot_artifact = provider
         .exec_local(
@@ -128,13 +133,15 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("self-test [ok] terminal provider one-shot execution");
 
-    println!("self-test [2/5] validating interactive shell open/write/read/interrupt/close...");
-    let shell = provider.open_interactive_shell(
-        "self-test-session",
-        "self-test-channel-interactive",
-        Some("self-test-transport-interactive"),
-        "self-test",
-    );
+    println!("self-test [2/6] validating interactive shell open/write/read/interrupt/close...");
+    let shell = provider
+        .open_interactive_shell(
+            "self-test-session",
+            "self-test-channel-interactive",
+            Some("self-test-transport-interactive"),
+            "self-test",
+        )
+        .map_err(|err| format!("interactive open failed: {}", err.message))?;
     let write = provider
         .write_interactive_shell(
             &shell.shell_id,
@@ -151,7 +158,7 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("self-test [ok] interactive shell lifecycle");
 
-    println!("self-test [3/5] validating interactive cwd/env semantics...");
+    println!("self-test [3/6] validating interactive cwd/env semantics...");
     let interactive_cwd = self_test_root.join(cwd_hint);
     fs::create_dir_all(&interactive_cwd)
         .map_err(|err| format!("create self-test cwd dir failed: {err}"))?;
@@ -176,11 +183,7 @@ fn run_self_test() -> Result<(), String> {
                 &PolicyProfile::default(),
             )
             .map_err(|err| format!("interactive cwd read failed: {}", err.message))?;
-        if !cwd_output
-            .output
-            .to_ascii_lowercase()
-            .contains(cwd_hint)
-        {
+        if !cwd_output.output.to_ascii_lowercase().contains(cwd_hint) {
             return Err(format!(
                 "interactive cwd output missing expected folder hint ({cwd_hint}): {}",
                 cwd_output.output
@@ -263,7 +266,7 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("self-test [ok] interactive cwd/env semantics");
 
-    println!("self-test [4/5] validating space-containing path/argument handling...");
+    println!("self-test [4/6] validating space-containing path/argument handling...");
     let spaced_file = interactive_cwd.join("file with space.txt");
     fs::write(&spaced_file, format!("{marker_space}\n"))
         .map_err(|err| format!("write self-test spaced file failed: {err}"))?;
@@ -346,14 +349,17 @@ fn run_self_test() -> Result<(), String> {
     let transcript = provider
         .read_interactive_transcript(&shell.shell_id, 0, 50)
         .map_err(|err| format!("interactive transcript read failed: {}", err.message))?;
-    if !transcript.iter().any(|line| line.contains(marker_interactive)) {
+    if !transcript
+        .iter()
+        .any(|line| line.contains(marker_interactive))
+    {
         return Err(format!(
             "interactive transcript missing marker {marker_interactive}: {transcript:?}"
         ));
     }
     println!("self-test [ok] interactive transcript/checkpoint");
 
-    println!("self-test [5/5] validating standalone runtime execute path without config file...");
+    println!("self-test [5/6] validating standalone runtime execute path without config file...");
     let runtime_root = self_test_root.join("runtime");
     let state_dir = runtime_root.join("state");
     let artifacts_dir = runtime_root.join("artifacts");
@@ -445,7 +451,9 @@ fn run_self_test() -> Result<(), String> {
     });
     let artifact_id = match execution {
         ApiResponse::Execution { artifact, .. } => artifact.id,
-        ApiResponse::Error { error, .. } => return Err(format!("execute failed: {}", error.message)),
+        ApiResponse::Error { error, .. } => {
+            return Err(format!("execute failed: {}", error.message))
+        }
         other => return Err(format!("unexpected response for execute: {other:?}")),
     };
 
@@ -460,7 +468,11 @@ fn run_self_test() -> Result<(), String> {
     });
     match artifact {
         ApiResponse::Artifact { artifact, .. } => {
-            if !artifact.chunks.iter().any(|line| line.contains(marker_runtime)) {
+            if !artifact
+                .chunks
+                .iter()
+                .any(|line| line.contains(marker_runtime))
+            {
                 return Err(format!(
                     "runtime execute output missing marker {marker_runtime}: {:?}",
                     artifact.chunks
@@ -473,8 +485,77 @@ fn run_self_test() -> Result<(), String> {
         other => return Err(format!("unexpected response for read artifact: {other:?}")),
     }
 
-    let _ = fs::remove_dir_all(&self_test_root);
     println!("self-test [ok] standalone runtime execute path");
+
+    println!("self-test [6/6] validating host platform contract snapshot...");
+    let host_platform_adapter = detect_host_platform_adapter("info");
+    let snapshot = host_platform_adapter.snapshot();
+    if snapshot.host_platform == HostPlatform::Unknown {
+        return Err("host platform is unknown in self-test contract snapshot".to_string());
+    }
+    if snapshot.control_plane_transport_status == CapabilityStatus::Unsupported
+        && snapshot.host_platform != HostPlatform::Unknown
+    {
+        return Err(format!(
+            "unexpected unsupported control-plane transport status on host platform {:?}",
+            snapshot.host_platform
+        ));
+    }
+    let contract_paths = host_platform_adapter
+        .runtime_paths()
+        .runtime_paths("bridgingio-self-test", &runtime_root);
+    match snapshot.host_platform {
+        HostPlatform::Windows => {
+            if !contract_paths
+                .control_plane_endpoint
+                .starts_with(r"\\.\pipe\bridgingio-")
+            {
+                return Err(format!(
+                    "windows control-plane endpoint contract mismatch: {}",
+                    contract_paths.control_plane_endpoint
+                ));
+            }
+        }
+        HostPlatform::Unix => {
+            if !contract_paths
+                .control_plane_endpoint
+                .ends_with("control-plane.sock")
+            {
+                return Err(format!(
+                    "unix control-plane endpoint contract mismatch: {}",
+                    contract_paths.control_plane_endpoint
+                ));
+            }
+        }
+        HostPlatform::Unknown => {}
+    }
+    if host_platform_adapter.native_vault_binding().backend_label() != "os-native" {
+        return Err("native vault backend label must remain os-native".to_string());
+    }
+    if !host_platform_adapter
+        .toolchain_locator()
+        .resolution_order()
+        .contains(&"builtin_fallback")
+    {
+        return Err("toolchain resolution order missing builtin_fallback".to_string());
+    }
+    host_platform_adapter.runtime_logger().log(
+        RuntimeLogLevel::Info,
+        RuntimeLogCategory::Decode,
+        "self-test validating platform output decoder",
+    );
+    let decoded = host_platform_adapter
+        .output_decoder()
+        .decode(b"line-1\r\nline-2\r");
+    if decoded.text != "line-1\nline-2\n" || !decoded.normalized_newlines {
+        return Err(format!(
+            "platform output decoder contract mismatch: {:?}",
+            decoded
+        ));
+    }
+    println!("self-test [ok] host platform contract snapshot");
+
+    let _ = fs::remove_dir_all(&self_test_root);
     println!("self-test passed");
     Ok(())
 }
@@ -497,23 +578,74 @@ fn run_core(
 ) -> Result<(), String> {
     let mut settings = CoreSettings::load_from_file(&config_path)
         .map_err(|err| format!("invalid config: {err:?}"))?;
+    let host_platform_adapter = detect_host_platform_adapter(&settings.core.log_level);
+    host_platform_adapter.runtime_logger().log(
+        RuntimeLogLevel::Info,
+        RuntimeLogCategory::Startup,
+        &format!(
+            "starting bridgingio-core (mode={mode:?}, host_mode={host_mode:?}, config={})",
+            config_path.to_string_lossy()
+        ),
+    );
     apply_control_plane_socket_override(&mut settings, control_plane_socket_override)?;
     let toolchain_resolver = default_toolchain_resolver(&settings, &config_path);
-    let runtime =
-        StandaloneCoreRuntime::from_settings_with_mode(settings.clone(), toolchain_resolver, host_mode)
-            .map_err(|err| format!("{err:?}"))?
-            .shared();
+    let runtime = StandaloneCoreRuntime::from_settings_with_mode(
+        settings.clone(),
+        toolchain_resolver,
+        host_mode,
+    )
+    .map_err(|err| format!("{err:?}"))?
+    .shared();
     {
         let mut locked = runtime
             .lock()
             .map_err(|_| "runtime lock poisoned while setting config path".to_string())?;
         locked.settings_store.runtime_metadata.config_path =
             Some(config_path.to_string_lossy().to_string());
+        settings = locked.settings_store.settings.clone();
+    }
+
+    let runtime_paths = host_platform_adapter.runtime_paths().runtime_paths(
+        &settings.core.instance_name,
+        Path::new(&settings.core.data_dir),
+    );
+    let transport = host_platform_adapter.control_plane_transport();
+    let transport_lifecycle = transport.lifecycle_semantics();
+    host_platform_adapter.runtime_logger().log(
+        RuntimeLogLevel::Info,
+        RuntimeLogCategory::Transport,
+        &format!(
+            "control-plane transport selected: kind={}, attach='{}', request_response='{}', lifecycle='{}'",
+            transport.transport_kind(),
+            transport_lifecycle.attach,
+            transport_lifecycle.request_response,
+            transport_lifecycle.lifecycle
+        ),
+    );
+    for diagnostic in transport.diagnostics(&settings.core.instance_name, &runtime_paths) {
+        let level = if diagnostic.status == bridgingio_platform::CapabilityStatus::Ready {
+            RuntimeLogLevel::Info
+        } else {
+            RuntimeLogLevel::Warn
+        };
+        host_platform_adapter.runtime_logger().log(
+            level,
+            RuntimeLogCategory::Transport,
+            &format!(
+                "[{}] {} (hint: {})",
+                diagnostic.code, diagnostic.message, diagnostic.recovery_hint
+            ),
+        );
     }
 
     let mut handles = Vec::new();
     if mcp_trace_enabled() {
         println!("mcp trace enabled via BRIDGINGIO_MCP_TRACE");
+        host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Info,
+            RuntimeLogCategory::Mcp,
+            "mcp trace enabled via BRIDGINGIO_MCP_TRACE",
+        );
     }
 
     if settings.model_plane.http.enabled {
@@ -529,38 +661,71 @@ fn run_core(
         );
         handles.push(thread::spawn(move || loop {
             if let Err(err) = server.serve_once() {
-                eprintln!("model-plane http stopped: {err:?}");
+                detect_host_platform_adapter("info").runtime_logger().log(
+                    RuntimeLogLevel::Warn,
+                    RuntimeLogCategory::Transport,
+                    &format!("model-plane http stopped: {err:?}"),
+                );
                 break;
             }
         }));
     } else {
         println!("model-plane http disabled by config");
+        host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Info,
+            RuntimeLogCategory::Transport,
+            "model-plane http disabled by config",
+        );
     }
 
     #[cfg(unix)]
     if settings.control_plane.enabled {
         let socket = control_plane_socket_path(&settings);
         let server = ControlPlaneIpcServer::bind(runtime.clone(), &socket)
-            .map_err(|err| format!("bind control-plane ipc failed: {err:?}"))?;
+            .map_err(|err| map_control_plane_bind_error(err, &socket))?;
         println!(
             "control-plane ipc listening on {}",
             socket.to_string_lossy()
         );
         handles.push(thread::spawn(move || loop {
             if let Err(err) = server.serve_once() {
-                eprintln!("control-plane ipc stopped: {err:?}");
+                detect_host_platform_adapter("info").runtime_logger().log(
+                    RuntimeLogLevel::Warn,
+                    RuntimeLogCategory::Transport,
+                    &format!("control-plane ipc stopped: {err:?}"),
+                );
                 break;
             }
         }));
     } else {
         println!("control-plane ipc disabled by config");
+        host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Info,
+            RuntimeLogCategory::Transport,
+            "control-plane ipc disabled by config",
+        );
     }
 
     #[cfg(not(unix))]
     if settings.control_plane.enabled {
-        println!(
-            "control-plane ipc requested, but current platform build has no unix socket support"
+        let endpoint_semantics = transport.endpoint_semantics(&settings.core.instance_name, &runtime_paths);
+        let message = format!(
+            "control-plane transport is not wired on this build (kind={}, endpoint={}, naming_rule={})",
+            transport.transport_kind(),
+            endpoint_semantics.endpoint,
+            endpoint_semantics.naming_rule
         );
+        println!("{message}");
+        host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Warn,
+            RuntimeLogCategory::Transport,
+            &message,
+        );
+        if host_mode == CoreHostMode::UiManagedEphemeral {
+            return Err(
+                "ui-managed-ephemeral requires local control-plane attach, but the current host transport is deferred. Recovery: run on unix host for now or switch to standalone run mode.".to_string(),
+            );
+        }
     }
 
     if handles.is_empty() {
@@ -576,6 +741,13 @@ fn run_core(
     println!(
         "bridgingio-core started in mode={:?} (host_mode={:?}, readiness={})",
         mode, host_mode, startup_state
+    );
+    host_platform_adapter.runtime_logger().log(
+        RuntimeLogLevel::Info,
+        RuntimeLogCategory::Startup,
+        &format!(
+            "bridgingio-core started (mode={mode:?}, host_mode={host_mode:?}, readiness={startup_state})"
+        ),
     );
     if host_mode == CoreHostMode::UiManagedEphemeral {
         println!("waiting for ui attach before model-plane becomes ready");
@@ -593,10 +765,36 @@ fn run_core(
         };
         if shutdown_requested {
             println!("shutdown requested from control-plane, exiting core process");
+            host_platform_adapter.runtime_logger().log(
+                RuntimeLogLevel::Info,
+                RuntimeLogCategory::Startup,
+                "shutdown requested from control-plane; exiting core process",
+            );
             break;
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn map_control_plane_bind_error(err: CoreRuntimeError, endpoint: &Path) -> String {
+    let detail = format!("{err:?}");
+    if detail.contains("Permission denied") || detail.contains("Operation not permitted") {
+        return format!(
+            "bind control-plane ipc failed at {}: {detail}. Recovery: choose a writable runtime root or use --control-plane-socket-override to point to a writable location.",
+            endpoint.display()
+        );
+    }
+    if detail.contains("Address already in use") {
+        return format!(
+            "bind control-plane ipc failed at {}: {detail}. Recovery: stop the existing core process or use --control-plane-socket-override with a different endpoint.",
+            endpoint.display()
+        );
+    }
+    format!(
+        "bind control-plane ipc failed at {}: {detail}",
+        endpoint.display()
+    )
 }
 
 fn spawn_detached_child(
@@ -611,9 +809,7 @@ fn spawn_detached_child(
         .arg(config_path)
         .arg("--detached-child");
     if let Some(path) = control_plane_socket_override {
-        command
-            .arg("--control-plane-socket-override")
-            .arg(path);
+        command.arg("--control-plane-socket-override").arg(path);
     }
     let child = command
         .stdin(Stdio::null())
@@ -729,9 +925,9 @@ where
                 runtime_root = Some(PathBuf::from(path));
             }
             "--control-plane-socket-override" => {
-                let path = iter.next().ok_or_else(|| {
-                    "--control-plane-socket-override requires a path".to_string()
-                })?;
+                let path = iter
+                    .next()
+                    .ok_or_else(|| "--control-plane-socket-override requires a path".to_string())?;
                 control_plane_socket_override = Some(PathBuf::from(path));
             }
             "--help" | "-h" => {
@@ -794,7 +990,7 @@ fn print_usage() {
     eprintln!("  bridgingio-core -d --config <path-to-standalone.toml>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --runtime-root <runtime-root-dir>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-managed-core.toml>");
-    eprintln!("  optional for all modes: --control-plane-socket-override <path-to.sock>");
+    eprintln!("  optional for all modes: --control-plane-socket-override <path-or-endpoint>");
 }
 
 fn resolve_config_path(args: &CliArgs) -> Result<PathBuf, String> {
@@ -810,45 +1006,39 @@ fn resolve_config_path(args: &CliArgs) -> Result<PathBuf, String> {
 }
 
 fn ensure_runtime_root_layout(runtime_root: &Path) -> Result<PathBuf, String> {
-    fs::create_dir_all(runtime_root)
-        .map_err(|err| format!("runtime root unavailable: {} ({err})", runtime_root.display()))?;
-    if !runtime_root.is_dir() {
+    ensure_runtime_dir(runtime_root, "runtime root")?;
+    let host_platform_adapter = detect_host_platform_adapter("info");
+    let runtime_paths = host_platform_adapter
+        .runtime_paths()
+        .runtime_paths("bridgingio-ui-managed", runtime_root);
+    let config_dir = runtime_root.join("config");
+    let state_dir = runtime_paths.state_dir.clone();
+    let artifacts_dir = runtime_paths.artifact_root.clone();
+    let logs_dir = runtime_paths.logs_dir.clone();
+    ensure_runtime_dir(&config_dir, "config dir")?;
+    ensure_runtime_dir(&state_dir, "state dir")?;
+    ensure_runtime_dir(&artifacts_dir, "artifacts dir")?;
+    ensure_runtime_dir(&logs_dir, "logs dir")?;
+
+    if let Some(parent) = runtime_paths.metadata_path.parent() {
+        ensure_runtime_dir(parent, "metadata parent dir")?;
+        ensure_writable_probe(parent, "metadata parent dir")?;
+    } else {
         return Err(format!(
-            "runtime root is not a directory: {}",
-            runtime_root.display()
+            "metadata path has no parent: {}. Recovery: choose a different runtime root.",
+            runtime_paths.metadata_path.display()
         ));
     }
-    let config_dir = runtime_root.join("config");
-    let state_dir = runtime_root.join("state");
-    let artifacts_dir = runtime_root.join("artifacts");
-    let logs_dir = runtime_root.join("logs");
-    fs::create_dir_all(&config_dir)
-        .map_err(|err| format!("create config dir failed: {} ({err})", config_dir.display()))?;
-    fs::create_dir_all(&state_dir)
-        .map_err(|err| format!("create state dir failed: {} ({err})", state_dir.display()))?;
-    fs::create_dir_all(&artifacts_dir).map_err(|err| {
-        format!(
-            "create artifacts dir failed: {} ({err})",
-            artifacts_dir.display()
-        )
-    })?;
-    fs::create_dir_all(&logs_dir)
-        .map_err(|err| format!("create logs dir failed: {} ({err})", logs_dir.display()))?;
-
-    let write_probe = logs_dir.join(".write-test");
-    fs::write(&write_probe, b"ok").map_err(|err| {
-        format!(
-            "runtime root is not writable: {} ({err})",
-            runtime_root.display()
-        )
-    })?;
-    let _ = fs::remove_file(&write_probe);
+    ensure_writable_probe(runtime_root, "runtime root")?;
+    ensure_writable_probe(&state_dir, "state dir")?;
+    ensure_writable_probe(&artifacts_dir, "artifacts dir")?;
+    ensure_writable_probe(&logs_dir, "logs dir")?;
 
     let config_path = config_dir.join("managed-core.toml");
     if !config_path.exists() {
         fs::write(
             &config_path,
-            default_managed_core_config(runtime_root, &state_dir, &artifacts_dir),
+            default_managed_core_config(runtime_root, &runtime_paths),
         )
         .map_err(|err| {
             format!(
@@ -860,15 +1050,41 @@ fn ensure_runtime_root_layout(runtime_root: &Path) -> Result<PathBuf, String> {
     Ok(config_path)
 }
 
+fn ensure_runtime_dir(path: &Path, label: &str) -> Result<(), String> {
+    if path.exists() && !path.is_dir() {
+        return Err(format!(
+            "{label} is not a directory: {}. Recovery: remove/rename this path or choose another runtime root.",
+            path.display()
+        ));
+    }
+    fs::create_dir_all(path).map_err(|err| {
+        format!(
+            "create {label} failed: {} ({err}). Recovery: choose a writable runtime root and retry.",
+            path.display()
+        )
+    })
+}
+
+fn ensure_writable_probe(path: &Path, label: &str) -> Result<(), String> {
+    let probe = path.join(".bridgingio-write-probe");
+    fs::write(&probe, b"ok").map_err(|err| {
+        format!(
+            "{label} is not writable: {} ({err}). Recovery: grant write permission or choose another runtime root.",
+            path.display()
+        )
+    })?;
+    let _ = fs::remove_file(probe);
+    Ok(())
+}
+
 fn default_managed_core_config(
     runtime_root: &Path,
-    state_dir: &Path,
-    artifacts_dir: &Path,
+    runtime_paths: &bridgingio_platform::RuntimePaths,
 ) -> String {
     let data_dir = toml_escape_path(runtime_root);
-    let metadata_path = toml_escape_path(&state_dir.join("metadata.sqlite3"));
-    let artifacts_path = toml_escape_path(artifacts_dir);
-    let endpoint = toml_escape_path(&state_dir.join("control-plane.sock"));
+    let metadata_path = toml_escape_path(&runtime_paths.metadata_path);
+    let artifacts_path = toml_escape_path(&runtime_paths.artifact_root);
+    let endpoint = toml_escape_string(&runtime_paths.control_plane_endpoint);
     format!(
         r#"schema_version = 1
 
@@ -915,9 +1131,11 @@ capture_env_fingerprint = true
 }
 
 fn toml_escape_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
+    toml_escape_string(&path.to_string_lossy())
+}
+
+fn toml_escape_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -931,12 +1149,18 @@ mod tests {
     use super::{parse_args_from, CliArgs, LaunchMode};
 
     fn parse(items: &[&str]) -> LaunchMode {
-        let args = items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        let args = items
+            .iter()
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>();
         parse_args_from(args).expect("parse").mode
     }
 
     fn parse_cli(items: &[&str]) -> CliArgs {
-        let args = items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        let args = items
+            .iter()
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>();
         parse_args_from(args).expect("parse")
     }
 

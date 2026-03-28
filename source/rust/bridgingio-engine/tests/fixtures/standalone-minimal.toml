@@ -2,16 +2,16 @@ schema_version = 1
 
 [core]
 instance_name = "bridgingio-local"
-data_dir = "~/.bridgingio"
+data_dir = "auto"
 log_level = "info"
 
 [storage]
 metadata_backend = "sqlite"
-metadata_path = "~/.bridgingio/state/metadata.sqlite3"
+metadata_path = "auto"
 
 [storage.artifacts]
 backend = "memory"
-root = "~/.bridgingio/artifacts"
+root = "auto"
 max_bytes = 268435456
 eviction_policy = "lru"
 
@@ -54,4 +54,3 @@ username = "dev"
 
 [targets.providers.terminal]
 enabled = true
-shell = "/bin/sh"

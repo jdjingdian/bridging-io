@@ -14,7 +14,10 @@ use bridgingio_artifacts::{
     ArtifactCacheBackend, ArtifactEvictionPolicy, ArtifactReadResult, ArtifactRefineMode,
     ArtifactStore, ArtifactStoreConfig,
 };
-use bridgingio_connectors::{ExecutableSource, ToolchainResolver};
+use bridgingio_connectors::{
+    target_shell_dialect_for, AdbConnector, CommandInvocation, ExecutableSource,
+    InvocationResolution, SshConnector, ToolchainResolver, TARGET_TERMINAL_SHELL_METADATA_KEY,
+};
 use bridgingio_domain::{
     AccessScope, ArtifactRecord, CapabilitySummary, ChannelKind, ChannelStatus, ConnectionConfig,
     SessionRecord, SessionReusePolicy, SessionState, TargetKind, TargetProfile,
@@ -22,6 +25,10 @@ use bridgingio_domain::{
 use bridgingio_engine::{
     CoreSettings, CoreSettingsStore, StandaloneConnectionSection, StandaloneTargetProfile,
     ToolchainSection,
+};
+use bridgingio_platform::{
+    detect_host_platform_adapter, CapabilityStatus, HostPlatformAdapter, RuntimeLogCategory,
+    RuntimeLogLevel,
 };
 use bridgingio_policy::{evaluate, OperationKind, PolicyDecision};
 use bridgingio_providers::{GitProvider, TerminalProvider};
@@ -632,7 +639,8 @@ struct TargetCommandExecution {
     resolved_target_id: String,
     target_kind: String,
     command: String,
-    connector_command: String,
+    executed_command: String,
+    invocation: Option<CommandInvocation>,
     artifact_id: String,
     logical_session_id: String,
     channel_id: String,
@@ -648,6 +656,7 @@ struct TargetInspectionResult {
     username: String,
     artifacts: Vec<String>,
     logical_session_id: String,
+    invocation: Option<CommandInvocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -660,6 +669,10 @@ struct InteractiveShellHandle {
     channel_id: String,
     prompt: String,
     cwd: String,
+    invocation: Option<CommandInvocation>,
+    launch_strategy: String,
+    launch_fallback_applied: bool,
+    launch_diagnostics: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -702,6 +715,7 @@ pub struct StandaloneCoreRuntime {
     readiness_state: CoreReadinessState,
     attached_ui: Option<UiAttachment>,
     shutdown_requested: bool,
+    host_platform_adapter: Box<dyn HostPlatformAdapter>,
     pub settings_store: CoreSettingsStore,
     pub tool_handler: McpToolHandler,
     profiles: HashMap<String, TargetProfile>,
@@ -713,6 +727,7 @@ pub struct StandaloneCoreRuntime {
     next_timeline_seq: u64,
     next_internal_artifact_seq: u64,
     toolchain_diagnostics: Vec<ToolchainDiagnosticView>,
+    toolchain_diagnostics_by_target: HashMap<String, ToolchainDiagnosticView>,
     toolchain_resolver: ToolchainResolver,
     _vault_router: SecretVaultRouter,
 }
@@ -740,19 +755,26 @@ impl StandaloneCoreRuntime {
         settings: CoreSettings,
         toolchain_resolver: ToolchainResolver,
     ) -> Result<Self, CoreRuntimeError> {
-        Self::from_settings_with_mode(
-            settings,
-            toolchain_resolver,
-            CoreHostMode::StandaloneRun,
-        )
+        Self::from_settings_with_mode(settings, toolchain_resolver, CoreHostMode::StandaloneRun)
     }
 
     fn from_settings_with_mode_and_state(
-        settings: CoreSettings,
+        mut settings: CoreSettings,
         toolchain_resolver: ToolchainResolver,
         host_mode: CoreHostMode,
         readiness_state: CoreReadinessState,
     ) -> Result<Self, CoreRuntimeError> {
+        let host_platform_adapter = detect_host_platform_adapter(&settings.core.log_level);
+        resolve_runtime_path_defaults(&mut settings, host_platform_adapter.as_ref())?;
+        host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Info,
+            RuntimeLogCategory::Startup,
+            &format!(
+                "host platform adapter initialized (platform={})",
+                host_platform_adapter.host_platform().as_str()
+            ),
+        );
+
         let mut profiles = HashMap::new();
         let mut target_refs = HashMap::new();
         for configured in &settings.targets {
@@ -769,14 +791,27 @@ impl StandaloneCoreRuntime {
         vault_router
             .set_active_backend(&settings.vault.backend)
             .map_err(vault_error_to_runtime)?;
+        host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Info,
+            RuntimeLogCategory::Vault,
+            &format!(
+                "vault backend initialized: configured={} active={}",
+                settings.vault.backend,
+                vault_router.active_backend()
+            ),
+        );
 
-        let artifact_store = ArtifactStore::new(artifact_store_config_from_settings(&settings)?)
-            .map_err(|err| CoreRuntimeError::Config(err.message))?;
+        let artifact_store = ArtifactStore::new(artifact_store_config_from_settings(
+            &settings,
+            host_platform_adapter.as_ref(),
+        )?)
+        .map_err(|err| CoreRuntimeError::Config(err.message))?;
         let mut runtime = Self {
             host_mode,
             readiness_state,
             attached_ui: None,
             shutdown_requested: false,
+            host_platform_adapter,
             settings_store: CoreSettingsStore::from_settings(settings, None),
             tool_handler: McpToolHandler::with_artifact_store(artifact_store),
             profiles,
@@ -788,6 +823,7 @@ impl StandaloneCoreRuntime {
             next_timeline_seq: 0,
             next_internal_artifact_seq: 0,
             toolchain_diagnostics: Vec::new(),
+            toolchain_diagnostics_by_target: HashMap::new(),
             toolchain_resolver,
             _vault_router: vault_router,
         };
@@ -850,11 +886,77 @@ impl StandaloneCoreRuntime {
         None
     }
 
+    fn capability_health_snapshot_json(&self) -> Value {
+        let platform_snapshot = self.host_platform_adapter.snapshot();
+        let unresolved_toolchains = self
+            .toolchain_diagnostics
+            .iter()
+            .filter(|diag| diag.effective_path.is_none())
+            .map(|diag| {
+                let target = diag
+                    .target_id
+                    .clone()
+                    .unwrap_or_else(|| "global".to_string());
+                format!("{target}:{}", diag.command)
+            })
+            .collect::<Vec<_>>();
+        let toolchain_status = if unresolved_toolchains.is_empty() {
+            platform_snapshot.toolchain_locator_status
+        } else {
+            CapabilityStatus::Degraded
+        };
+        let statuses = [
+            toolchain_status,
+            platform_snapshot.native_vault_status,
+            platform_snapshot.runtime_logger_status,
+            platform_snapshot.output_decoder_status,
+        ];
+        json!({
+            "state": aggregate_health_state(&statuses),
+            "host_platform": platform_snapshot.host_platform.as_str(),
+            "toolchain": {
+                "status": toolchain_status.as_str(),
+                "source_label": self.host_platform_adapter.toolchain_locator().source_label(),
+                "resolution_order": self.host_platform_adapter.toolchain_locator().resolution_order(),
+                "unresolved_targets": unresolved_toolchains,
+            },
+            "vault": {
+                "status": platform_snapshot.native_vault_status.as_str(),
+                "configured_backend": self.settings_store.settings.vault.backend.clone(),
+                "binding_backend": self.host_platform_adapter.native_vault_binding().backend_label(),
+                "degraded_reason": "os-native backend currently runs as an explicit degraded-memory shim until platform-native bindings land",
+            },
+            "logger": {
+                "status": platform_snapshot.runtime_logger_status.as_str(),
+                "level": self.host_platform_adapter.runtime_logger().level().as_str(),
+                "categories": runtime_log_category_labels(),
+            },
+            "decoder": {
+                "status": platform_snapshot.output_decoder_status.as_str(),
+                "strategy": "platform-default decoding with UTF-8 fallback and newline normalization",
+                "decode_diagnostics_policy": "fallback/replacement/newline normalization events are logged under decode category",
+                "raw_bytes_canonical_future": {
+                    "status": "deferred",
+                    "impact": [
+                        "artifact storage must preserve canonical raw bytes and derive text views",
+                        "artifact API will need explicit raw/text read modes and metadata",
+                        "content digest and dedup boundaries should be defined on raw bytes"
+                    ],
+                },
+            },
+        })
+    }
+
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
     }
 
     fn request_shutdown(&mut self) {
+        self.host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Info,
+            RuntimeLogCategory::Startup,
+            "runtime shutdown requested",
+        );
         self.readiness_state = CoreReadinessState::ShuttingDown;
         self.shutdown_requested = true;
     }
@@ -900,14 +1002,27 @@ impl StandaloneCoreRuntime {
         let target = self
             .resolve_target_profile_by_ref(target_ref)
             .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
-        let (resolved_path, _resolved_source) = self.resolve_transport_executable_for_target(&target);
-        let connector_command = build_connector_command(&target, command, resolved_path.as_deref());
+        let invocation = self.resolve_structured_exec_invocation(&target, command)?;
+        let executed_command = invocation
+            .as_ref()
+            .map(CommandInvocation::to_host_shell_command)
+            .unwrap_or_else(|| command.to_string());
+        self.host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Debug,
+            RuntimeLogCategory::Terminal,
+            &format!(
+                "executing target command target_id={} kind={} command={}",
+                target.id,
+                target_kind_label(&target.kind),
+                command
+            ),
+        );
         let artifact_id = artifact_id.unwrap_or_else(|| self.next_internal_artifact_hint());
         let result = self.tool_handler.handle(ToolRequest::TerminalExec {
             target_id: target.id.clone(),
             target_kind: target.kind.clone(),
             context,
-            command: connector_command.clone(),
+            command: executed_command.clone(),
             artifact_id,
         });
 
@@ -918,6 +1033,14 @@ impl StandaloneCoreRuntime {
                 channel_id,
             } => (artifact_id, logical_session_id, channel_id),
             ToolResult::ApprovalRequired { reason } => {
+                self.host_platform_adapter.runtime_logger().log(
+                    RuntimeLogLevel::Warn,
+                    RuntimeLogCategory::Policy,
+                    &format!(
+                        "execution blocked by policy target_id={} reason={}",
+                        target.id, reason
+                    ),
+                );
                 return Err(CoreRuntimeError::Config(format!(
                     "command requires approval: {reason}"
                 )))
@@ -951,7 +1074,8 @@ impl StandaloneCoreRuntime {
             resolved_target_id: target.id.clone(),
             target_kind: target_kind_label(&target.kind),
             command: command.to_string(),
-            connector_command,
+            executed_command,
+            invocation,
             artifact_id,
             logical_session_id,
             channel_id,
@@ -975,6 +1099,7 @@ impl StandaloneCoreRuntime {
             username: first_data_line(&user.output),
             artifacts: vec![kernel.artifact_id, user.artifact_id],
             logical_session_id: user.logical_session_id,
+            invocation: kernel.invocation.or(user.invocation),
         })
     }
 
@@ -995,9 +1120,18 @@ impl StandaloneCoreRuntime {
             context.reuse_policy.clone(),
             now,
         );
-        let (resolved_path, resolved_source) = self.resolve_transport_executable_for_target(&target);
-        let launch_command =
-            build_interactive_connector_command(&target, resolved_path.as_deref());
+        let mut invocation = self.resolve_structured_interactive_invocation(&target)?;
+        let (resolved_path, resolved_source) = if let Some(invocation) = invocation.as_ref() {
+            (
+                invocation.resolution.effective_path.clone(),
+                invocation.resolution.effective_source.clone(),
+            )
+        } else {
+            self.resolve_transport_executable_for_target(&target)
+        };
+        let launch_command = invocation
+            .as_ref()
+            .map(CommandInvocation::to_host_shell_command);
         let transport = self.tool_handler.metadata_mut().open_transport_session(
             &logical.logical_session_id,
             &target.id,
@@ -1023,7 +1157,16 @@ impl StandaloneCoreRuntime {
                 Some(&transport.transport_session_id),
                 &target_kind_label(&target.kind),
                 launch_command.as_deref(),
-            );
+            )
+            .map_err(|err| CoreRuntimeError::Config(err.message))?;
+        if shell.launch_fallback_applied {
+            if let Some(invocation_ref) = invocation.as_mut() {
+                invocation_ref
+                    .resolution
+                    .warnings
+                    .extend(shell.launch_diagnostics.clone());
+            }
+        }
         self.interactive_shell_owners.insert(
             shell.shell_id.clone(),
             InteractiveShellOwner {
@@ -1043,6 +1186,10 @@ impl StandaloneCoreRuntime {
             channel_id: channel.channel_id,
             prompt: shell.prompt,
             cwd: shell.cwd,
+            invocation,
+            launch_strategy: shell.launch_strategy,
+            launch_fallback_applied: shell.launch_fallback_applied,
+            launch_diagnostics: shell.launch_diagnostics,
         })
     }
 
@@ -1128,11 +1275,12 @@ impl StandaloneCoreRuntime {
             .terminal_provider
             .interrupt_interactive_shell(shell_id)
             .map_err(|err| CoreRuntimeError::Config(err.message))?;
-        let state = self
+        let mut state = self
             .tool_handler
             .terminal_provider
             .get_interactive_shell(shell_id)
             .map_err(|err| CoreRuntimeError::Config(err.message))?;
+        state.running = false;
         Ok(InteractiveShellReadOutcome {
             shell_id: shell_id.to_string(),
             channel_id: owner.channel_id,
@@ -1213,10 +1361,109 @@ impl StandaloneCoreRuntime {
         (diagnostic.effective_path, diagnostic.effective_source)
     }
 
+    fn resolve_structured_exec_invocation(
+        &self,
+        target: &TargetProfile,
+        command: &str,
+    ) -> Result<Option<CommandInvocation>, CoreRuntimeError> {
+        let diagnostic = self.toolchain_diagnostic_for_target(target);
+        let dialect = target_shell_dialect_for(target);
+        let mut invocation = match &target.kind {
+            TargetKind::Ssh => {
+                let executable = diagnostic
+                    .as_ref()
+                    .and_then(|value| value.effective_path.as_deref())
+                    .unwrap_or("ssh");
+                let connector = SshConnector::new(PathBuf::from(executable));
+                Some(
+                    connector
+                        .build_exec_invocation(target, command)
+                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
+                )
+            }
+            TargetKind::Adb => {
+                let executable = diagnostic
+                    .as_ref()
+                    .and_then(|value| value.effective_path.as_deref())
+                    .unwrap_or("adb");
+                let connector = AdbConnector::new(PathBuf::from(executable));
+                Some(
+                    connector
+                        .build_exec_invocation(target, command)
+                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
+                )
+            }
+            _ => None,
+        };
+
+        if let Some(invocation_ref) = invocation.as_mut() {
+            invocation_ref.resolution = invocation_resolution_from_toolchain(
+                diagnostic.as_ref(),
+                dialect.support_level() == "deferred",
+                dialect.as_str(),
+            );
+        }
+        Ok(invocation)
+    }
+
+    fn resolve_structured_interactive_invocation(
+        &self,
+        target: &TargetProfile,
+    ) -> Result<Option<CommandInvocation>, CoreRuntimeError> {
+        let diagnostic = self.toolchain_diagnostic_for_target(target);
+        let dialect = target_shell_dialect_for(target);
+        let mut invocation = match &target.kind {
+            TargetKind::Ssh => {
+                let executable = diagnostic
+                    .as_ref()
+                    .and_then(|value| value.effective_path.as_deref())
+                    .unwrap_or("ssh");
+                let connector = SshConnector::new(PathBuf::from(executable));
+                Some(
+                    connector
+                        .build_interactive_invocation(target)
+                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
+                )
+            }
+            TargetKind::Adb => {
+                let executable = diagnostic
+                    .as_ref()
+                    .and_then(|value| value.effective_path.as_deref())
+                    .unwrap_or("adb");
+                let connector = AdbConnector::new(PathBuf::from(executable));
+                Some(
+                    connector
+                        .build_interactive_invocation(target)
+                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
+                )
+            }
+            _ => None,
+        };
+
+        if let Some(invocation_ref) = invocation.as_mut() {
+            invocation_ref.resolution = invocation_resolution_from_toolchain(
+                diagnostic.as_ref(),
+                dialect.support_level() == "deferred",
+                dialect.as_str(),
+            );
+        }
+        Ok(invocation)
+    }
+
+    fn toolchain_diagnostic_for_target(&self, target: &TargetProfile) -> Option<ToolchainDiagnosticView> {
+        let command = toolchain_command_for_kind(&target.kind)?;
+        let key = toolchain_cache_key(&target.id, command);
+        self.toolchain_diagnostics_by_target
+            .get(&key)
+            .cloned()
+            .or_else(|| Some(self.resolve_toolchain_diagnostic_for_target(target, command)))
+    }
+
     fn refresh_toolchain_diagnostics(&mut self) {
         let mut target_ids = self.profiles.keys().cloned().collect::<Vec<_>>();
         target_ids.sort();
         let mut diagnostics = Vec::new();
+        let mut diagnostics_by_target = HashMap::new();
         for target_id in target_ids {
             let Some(profile) = self.profiles.get(&target_id) else {
                 continue;
@@ -1224,9 +1471,12 @@ impl StandaloneCoreRuntime {
             let Some(command) = toolchain_command_for_kind(&profile.kind) else {
                 continue;
             };
-            diagnostics.push(self.resolve_toolchain_diagnostic_for_target(profile, command));
+            let resolved = self.resolve_toolchain_diagnostic_for_target(profile, command);
+            diagnostics_by_target.insert(toolchain_cache_key(&profile.id, command), resolved.clone());
+            diagnostics.push(resolved);
         }
         self.toolchain_diagnostics = diagnostics;
+        self.toolchain_diagnostics_by_target = diagnostics_by_target;
     }
 
     fn resolve_toolchain_diagnostic_for_target(
@@ -1234,6 +1484,10 @@ impl StandaloneCoreRuntime {
         profile: &TargetProfile,
         command: &str,
     ) -> ToolchainDiagnosticView {
+        let resolution_order = self
+            .host_platform_adapter
+            .toolchain_locator()
+            .resolution_order();
         let target_override_path = profile
             .toolchains
             .get(command)
@@ -1246,8 +1500,20 @@ impl StandaloneCoreRuntime {
             .get(command)
             .and_then(|section| non_empty_path(&section.path_override))
             .map(ToOwned::to_owned);
+        let target_override_allowed = resolution_order.contains(&"target_override");
+        let global_override_allowed = resolution_order.contains(&"global_override");
+        let target_override = if target_override_allowed {
+            target_override_path.as_deref()
+        } else {
+            None
+        };
+        let global_override = if global_override_allowed {
+            global_override_path.as_deref()
+        } else {
+            None
+        };
 
-        let (resolution, diagnostics, override_scope) = if let Some(path) = target_override_path.as_deref() {
+        let (resolution, diagnostics, override_scope) = if let Some(path) = target_override {
             let (target_resolution, target_diag) = self
                 .toolchain_resolver
                 .resolve_with_diagnostics(command, Some(Path::new(path)));
@@ -1256,16 +1522,15 @@ impl StandaloneCoreRuntime {
                     (target_resolution, target_diag, Some("target_override"))
                 }
                 _ => {
-                    let (fallback_resolution, fallback_diag) = self
-                        .toolchain_resolver
-                        .resolve_with_diagnostics(
+                    let (fallback_resolution, fallback_diag) =
+                        self.toolchain_resolver.resolve_with_diagnostics(
                             command,
-                            global_override_path.as_deref().map(Path::new),
+                            global_override.map(Path::new),
                         );
                     let scope = match &fallback_resolution {
                         Ok(selected)
                             if selected.source == ExecutableSource::UserOverride
-                                && global_override_path.is_some() =>
+                                && global_override.is_some() =>
                         {
                             Some("global_override")
                         }
@@ -1275,14 +1540,13 @@ impl StandaloneCoreRuntime {
                 }
             }
         } else {
-            let (fallback_resolution, fallback_diag) = self.toolchain_resolver.resolve_with_diagnostics(
-                command,
-                global_override_path.as_deref().map(Path::new),
-            );
+            let (fallback_resolution, fallback_diag) = self
+                .toolchain_resolver
+                .resolve_with_diagnostics(command, global_override.map(Path::new));
             let scope = match &fallback_resolution {
                 Ok(selected)
                     if selected.source == ExecutableSource::UserOverride
-                        && global_override_path.is_some() =>
+                        && global_override.is_some() =>
                 {
                     Some("global_override")
                 }
@@ -1306,6 +1570,14 @@ impl StandaloneCoreRuntime {
             .selected_path
             .as_ref()
             .map(|path| path.to_string_lossy().to_string());
+        self.host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Debug,
+            RuntimeLogCategory::Toolchain,
+            &format!(
+                "resolved toolchain command={} target_id={} scope={:?} source={:?} path={:?}",
+                command, profile.id, effective_scope, effective_source, effective_path
+            ),
+        );
 
         ToolchainDiagnosticView {
             command: command.to_string(),
@@ -1328,11 +1600,13 @@ impl StandaloneCoreRuntime {
             .settings
             .toolchains
             .iter()
-            .map(|(command, section)| bridgingio_app_api::ToolchainSettingsView {
-                command: command.clone(),
-                path_override: section.path_override.clone(),
-                prefer_builtin_fallback: section.prefer_builtin_fallback,
-            })
+            .map(
+                |(command, section)| bridgingio_app_api::ToolchainSettingsView {
+                    command: command.clone(),
+                    path_override: section.path_override.clone(),
+                    prefer_builtin_fallback: section.prefer_builtin_fallback,
+                },
+            )
             .collect::<Vec<_>>();
         toolchain_entries.sort_by(|a, b| a.command.cmp(&b.command));
         CoreSettingsView {
@@ -1519,6 +1793,7 @@ impl StandaloneCoreRuntime {
     fn clear_artifact_cache_live(&mut self) -> Result<(), CoreRuntimeError> {
         let store = ArtifactStore::new(artifact_store_config_from_settings(
             &self.settings_store.settings,
+            self.host_platform_adapter.as_ref(),
         )?)
         .map_err(|err| CoreRuntimeError::Config(err.message))?;
         self.tool_handler.artifact_service = ArtifactService::new(store);
@@ -1563,6 +1838,9 @@ impl StandaloneCoreRuntime {
                     "cwd": state.cwd,
                     "closed": state.closed,
                     "running": state.running,
+                    "launch_strategy": state.launch_strategy,
+                    "launch_fallback_applied": state.launch_fallback_applied,
+                    "launch_diagnostics": state.launch_diagnostics,
                 }))
             })
             .collect::<Vec<_>>();
@@ -1727,11 +2005,68 @@ impl StandaloneCoreRuntime {
             "state_dir": runtime_root_path.join("state").to_string_lossy().to_string(),
             "accessible": runtime_root_path.exists(),
         });
+        let platform_snapshot = self.host_platform_adapter.snapshot();
+        let runtime_paths = self.host_platform_adapter.runtime_paths().runtime_paths(
+            &self.settings_store.settings.core.instance_name,
+            Path::new(&self.settings_store.settings.core.data_dir),
+        );
+        let control_plane_transport = self.host_platform_adapter.control_plane_transport();
+        let control_plane_endpoint_semantics = control_plane_transport.endpoint_semantics(
+            &self.settings_store.settings.core.instance_name,
+            &runtime_paths,
+        );
+        let control_plane_lifecycle = control_plane_transport.lifecycle_semantics();
+        let control_plane_diagnostics = control_plane_transport
+            .diagnostics(&self.settings_store.settings.core.instance_name, &runtime_paths)
+            .into_iter()
+            .map(|item| {
+                json!({
+                    "code": item.code,
+                    "status": item.status.as_str(),
+                    "message": item.message,
+                    "recovery_hint": item.recovery_hint,
+                })
+            })
+            .collect::<Vec<_>>();
+        let platform_diagnostics = platform_snapshot
+            .diagnostics
+            .iter()
+            .map(|item| {
+                json!({
+                    "capability": item.capability,
+                    "status": item.status.as_str(),
+                    "message": item.message,
+                })
+            })
+            .collect::<Vec<_>>();
+        let capability_health = self.capability_health_snapshot_json();
 
         json!({
             "host_mode": self.host_mode.as_label(),
             "readiness_state": self.readiness_state_label(),
             "model_plane_ready": self.model_plane_ready(),
+            "capability_health": capability_health,
+            "host_platform_adapter": {
+                "host_platform": platform_snapshot.host_platform.as_str(),
+                "local_shell_runtime": platform_snapshot.local_shell_runtime_status.as_str(),
+                "control_plane_transport": platform_snapshot.control_plane_transport_status.as_str(),
+                "runtime_paths": platform_snapshot.runtime_paths_status.as_str(),
+                "toolchain_locator": platform_snapshot.toolchain_locator_status.as_str(),
+                "native_vault_binding": platform_snapshot.native_vault_status.as_str(),
+                "runtime_logger": platform_snapshot.runtime_logger_status.as_str(),
+                "output_decoder": platform_snapshot.output_decoder_status.as_str(),
+                "control_plane_transport_detail": {
+                    "kind": control_plane_transport.transport_kind(),
+                    "endpoint": control_plane_endpoint_semantics.endpoint,
+                    "naming_rule": control_plane_endpoint_semantics.naming_rule,
+                    "local_only": control_plane_endpoint_semantics.local_only,
+                    "attach_semantics": control_plane_lifecycle.attach,
+                    "request_response_semantics": control_plane_lifecycle.request_response,
+                    "lifecycle_semantics": control_plane_lifecycle.lifecycle,
+                    "diagnostics": control_plane_diagnostics,
+                },
+                "diagnostics": platform_diagnostics,
+            },
             "targets": targets_json,
             "profiles": profiles_json,
             "sessions": sessions_json,
@@ -1991,11 +2326,9 @@ impl StandaloneCoreRuntime {
                         request_id: request.request_id,
                         apply_strategy: Some(apply_strategy),
                     },
-                    Err(CoreRuntimeError::Config(message)) => error_response(
-                        request.request_id,
-                        ApiErrorCode::ValidationFailed,
-                        &message,
-                    ),
+                    Err(CoreRuntimeError::Config(message)) => {
+                        error_response(request.request_id, ApiErrorCode::ValidationFailed, &message)
+                    }
                     Err(err) => error_response(
                         request.request_id,
                         ApiErrorCode::Internal,
@@ -2032,11 +2365,9 @@ impl StandaloneCoreRuntime {
                         request_id: request.request_id,
                         apply_strategy: Some(apply_strategy),
                     },
-                    Err(CoreRuntimeError::Config(message)) => error_response(
-                        request.request_id,
-                        ApiErrorCode::ValidationFailed,
-                        &message,
-                    ),
+                    Err(CoreRuntimeError::Config(message)) => {
+                        error_response(request.request_id, ApiErrorCode::ValidationFailed, &message)
+                    }
                     Err(err) => error_response(
                         request.request_id,
                         ApiErrorCode::Internal,
@@ -2049,11 +2380,9 @@ impl StandaloneCoreRuntime {
                     request_id: request.request_id,
                     apply_strategy: Some("live_applied".to_string()),
                 },
-                Err(CoreRuntimeError::Config(message)) => error_response(
-                    request.request_id,
-                    ApiErrorCode::ValidationFailed,
-                    &message,
-                ),
+                Err(CoreRuntimeError::Config(message)) => {
+                    error_response(request.request_id, ApiErrorCode::ValidationFailed, &message)
+                }
                 Err(err) => error_response(
                     request.request_id,
                     ApiErrorCode::Internal,
@@ -2293,6 +2622,38 @@ fn toolchain_command_for_kind(kind: &TargetKind) -> Option<&'static str> {
     }
 }
 
+fn toolchain_cache_key(target_id: &str, command: &str) -> String {
+    format!("{target_id}:{command}")
+}
+
+fn aggregate_health_state(statuses: &[CapabilityStatus]) -> &'static str {
+    if statuses
+        .iter()
+        .any(|status| *status == CapabilityStatus::Unsupported)
+    {
+        "unsupported"
+    } else if statuses
+        .iter()
+        .any(|status| *status == CapabilityStatus::Degraded || *status == CapabilityStatus::Fallback)
+    {
+        "degraded"
+    } else {
+        "ready"
+    }
+}
+
+fn runtime_log_category_labels() -> Vec<&'static str> {
+    vec![
+        RuntimeLogCategory::Startup.as_str(),
+        RuntimeLogCategory::Transport.as_str(),
+        RuntimeLogCategory::Terminal.as_str(),
+        RuntimeLogCategory::Toolchain.as_str(),
+        RuntimeLogCategory::Vault.as_str(),
+        RuntimeLogCategory::Decode.as_str(),
+        RuntimeLogCategory::Policy.as_str(),
+    ]
+}
+
 fn non_empty_path(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2327,144 +2688,62 @@ fn system_time_to_unix_millis(ts: SystemTime) -> u128 {
         .unwrap_or(0)
 }
 
-fn build_interactive_connector_command(
-    target: &TargetProfile,
-    resolved_executable_path: Option<&str>,
-) -> Option<String> {
-    let resolved_executable = |default: &str| {
-        resolved_executable_path
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(shell_single_quote)
-            .unwrap_or_else(|| default.to_string())
-    };
-
-    match (&target.kind, &target.connection) {
-        (TargetKind::Adb, ConnectionConfig::Adb { serial, transport }) => {
-            let mut tokens = vec![resolved_executable("adb")];
-            let selector = serial
-                .as_ref()
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string);
-            let transport = transport
-                .as_ref()
-                .map(|v| v.trim().to_ascii_lowercase())
-                .filter(|v| !v.is_empty());
-            match (transport.as_deref(), selector.as_deref()) {
-                (Some("transport-id"), Some(value)) => {
-                    tokens.push("-t".to_string());
-                    tokens.push(value.to_string());
-                }
-                (_, Some(value)) => {
-                    tokens.push("-s".to_string());
-                    tokens.push(value.to_string());
-                }
-                (Some("emulator"), None) => tokens.push("-e".to_string()),
-                (Some("device"), None) | (Some("usb"), None) => tokens.push("-d".to_string()),
-                _ => {}
+fn invocation_resolution_from_toolchain(
+    diagnostic: Option<&ToolchainDiagnosticView>,
+    dialect_deferred: bool,
+    dialect: &str,
+) -> InvocationResolution {
+    let mut warnings = diagnostic
+        .map(|value| {
+            if value.effective_path.is_none() {
+                vec!["no resolved executable path; connector default is used".to_string()]
+            } else {
+                Vec::new()
             }
-            tokens.push("shell".to_string());
-            Some(tokens.join(" "))
-        }
-        (
-            TargetKind::Ssh,
-            ConnectionConfig::Ssh {
-                host,
-                port,
-                username,
-            },
-        ) => {
-            let user_host = format!("{username}@{host}");
-            Some(format!(
-                "{} -p {} {}",
-                resolved_executable("ssh"),
-                port,
-                shell_single_quote(&user_host)
-            ))
-        }
-        _ => None,
+        })
+        .unwrap_or_default();
+    if dialect_deferred {
+        warnings.push(format!(
+            "target shell dialect `{dialect}` is deferred; connector invocation remains baseline-compatible"
+        ));
+    }
+
+    InvocationResolution {
+        target_override_path: diagnostic.and_then(|value| value.target_override_path.clone()),
+        global_override_path: diagnostic.and_then(|value| value.global_override_path.clone()),
+        effective_scope: diagnostic.and_then(|value| value.effective_scope.clone()),
+        effective_source: diagnostic.and_then(|value| value.effective_source.clone()),
+        effective_path: diagnostic.and_then(|value| value.effective_path.clone()),
+        warnings,
     }
 }
 
-fn build_connector_command(
-    target: &TargetProfile,
-    command: &str,
-    resolved_executable_path: Option<&str>,
-) -> String {
-    let resolved_executable = |default: &str| {
-        resolved_executable_path
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(shell_single_quote)
-            .unwrap_or_else(|| default.to_string())
+fn invocation_json(invocation: Option<&CommandInvocation>) -> Value {
+    let Some(invocation) = invocation else {
+        return Value::Null;
     };
-
-    match (&target.kind, &target.connection) {
-        (TargetKind::Adb, ConnectionConfig::Adb { serial, transport }) => {
-            if command.trim_start().starts_with("adb ") {
-                return command.to_string();
-            }
-            let mut tokens = vec![resolved_executable("adb")];
-            let selector = serial
-                .as_ref()
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string);
-            let transport = transport
-                .as_ref()
-                .map(|v| v.trim().to_ascii_lowercase())
-                .filter(|v| !v.is_empty());
-            match (transport.as_deref(), selector.as_deref()) {
-                (Some("transport-id"), Some(value)) => {
-                    tokens.push("-t".to_string());
-                    tokens.push(value.to_string());
-                }
-                (_, Some(value)) => {
-                    tokens.push("-s".to_string());
-                    tokens.push(value.to_string());
-                }
-                (Some("emulator"), None) => tokens.push("-e".to_string()),
-                (Some("device"), None) | (Some("usb"), None) => tokens.push("-d".to_string()),
-                _ => {}
-            }
-            tokens.push("shell".to_string());
-            tokens.push(shell_single_quote(command));
-            tokens.join(" ")
+    let view = invocation.diagnostics_view();
+    json!({
+        "mode": view.mode,
+        "program": view.program,
+        "args": view.args,
+        "target_shell_dialect": {
+            "name": view.target_shell_dialect,
+            "support": view.dialect_support
+        },
+        "toolchain_resolution": {
+            "target_override_path": view.target_override_path,
+            "global_override_path": view.global_override_path,
+            "effective_scope": view.effective_scope,
+            "effective_source": view.effective_source,
+            "effective_path": view.effective_path
+        },
+        "warnings": view.warnings,
+        "quoting_boundary": {
+            "host_shell_runtime": view.quoting_host_shell_runtime,
+            "target_shell_dialect": view.quoting_target_shell_dialect
         }
-        (
-            TargetKind::Ssh,
-            ConnectionConfig::Ssh {
-                host,
-                port,
-                username,
-            },
-        ) => {
-            if command.trim_start().starts_with("ssh ") {
-                return command.to_string();
-            }
-            let user_host = format!("{username}@{host}");
-            format!(
-                "{} -p {} {} {}",
-                resolved_executable("ssh"),
-                port,
-                shell_single_quote(&user_host),
-                shell_single_quote(command)
-            )
-        }
-        _ => command.to_string(),
-    }
-}
-
-fn shell_single_quote(value: &str) -> String {
-    #[cfg(windows)]
-    {
-        value.to_string()
-    }
-    #[cfg(not(windows))]
-    {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
+    })
 }
 
 fn first_data_line(output: &str) -> String {
@@ -2483,6 +2762,7 @@ fn first_data_line(output: &str) -> String {
 
 fn artifact_store_config_from_settings(
     settings: &CoreSettings,
+    host_platform_adapter: &dyn HostPlatformAdapter,
 ) -> Result<ArtifactStoreConfig, CoreRuntimeError> {
     let backend = ArtifactCacheBackend::parse(&settings.storage.artifacts.backend)
         .map_err(|err| CoreRuntimeError::Config(err.message))?;
@@ -2491,24 +2771,80 @@ fn artifact_store_config_from_settings(
             .map_err(|err| CoreRuntimeError::Config(err.message))?;
     Ok(ArtifactStoreConfig {
         backend,
-        root: expand_tilde_path(&settings.storage.artifacts.root),
+        root: host_platform_adapter
+            .runtime_paths()
+            .expand_user_path(&settings.storage.artifacts.root),
         max_bytes: settings.storage.artifacts.max_bytes,
         eviction_policy,
     })
 }
 
-fn expand_tilde_path(raw: &str) -> PathBuf {
-    if raw == "~" {
-        return std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(raw));
+fn resolve_runtime_path_defaults(
+    settings: &mut CoreSettings,
+    host_platform_adapter: &dyn HostPlatformAdapter,
+) -> Result<(), CoreRuntimeError> {
+    let runtime_paths_adapter = host_platform_adapter.runtime_paths();
+    let data_dir = if is_auto_value(&settings.core.data_dir) {
+        runtime_paths_adapter.default_data_dir(&settings.core.instance_name)
+    } else {
+        runtime_paths_adapter.expand_user_path(&settings.core.data_dir)
+    };
+    if data_dir.as_os_str().is_empty() {
+        return Err(CoreRuntimeError::Config(
+            "core.data_dir resolved to an empty path".into(),
+        ));
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+
+    let runtime_paths = runtime_paths_adapter.runtime_paths(&settings.core.instance_name, &data_dir);
+    settings.core.data_dir = data_dir.to_string_lossy().to_string();
+    settings.storage.metadata_path = resolve_path_with_host_default(
+        &settings.storage.metadata_path,
+        &runtime_paths.metadata_path,
+        runtime_paths_adapter,
+    );
+    settings.storage.artifacts.root = resolve_path_with_host_default(
+        &settings.storage.artifacts.root,
+        &runtime_paths.artifact_root,
+        runtime_paths_adapter,
+    );
+    if settings.control_plane.transport == "platform-ipc" {
+        settings.control_plane.endpoint = if is_auto_value(&settings.control_plane.endpoint) {
+            host_platform_adapter
+                .control_plane_transport()
+                .endpoint(&settings.core.instance_name, &runtime_paths)
+        } else if looks_like_named_pipe_endpoint(&settings.control_plane.endpoint) {
+            settings.control_plane.endpoint.trim().to_string()
+        } else {
+            runtime_paths_adapter
+                .expand_user_path(&settings.control_plane.endpoint)
+                .to_string_lossy()
+                .to_string()
+        };
     }
-    PathBuf::from(raw)
+    Ok(())
+}
+
+fn resolve_path_with_host_default(
+    raw: &str,
+    host_default: &Path,
+    runtime_paths_adapter: &dyn bridgingio_platform::RuntimePathsAdapter,
+) -> String {
+    if is_auto_value(raw) {
+        host_default.to_string_lossy().to_string()
+    } else {
+        runtime_paths_adapter
+            .expand_user_path(raw)
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+fn is_auto_value(raw: &str) -> bool {
+    raw.trim().eq_ignore_ascii_case("auto")
+}
+
+fn looks_like_named_pipe_endpoint(endpoint: &str) -> bool {
+    endpoint.trim().starts_with(r"\\.\pipe\")
 }
 
 fn to_target_profile(
@@ -2526,6 +2862,18 @@ fn to_target_profile(
     let mut metadata = bridgingio_domain::MetadataMap::new();
     if let Some(alias) = configured.aliases.first() {
         metadata.insert("alias".to_string(), alias.clone());
+    }
+    if let Some(shell) = configured
+        .terminal_provider
+        .shell
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        metadata.insert(
+            TARGET_TERMINAL_SHELL_METADATA_KEY.to_string(),
+            shell.to_string(),
+        );
     }
     let toolchains = configured
         .toolchains
@@ -2585,7 +2933,9 @@ fn to_adb_connection(
     }
 }
 
-fn to_serial_connection(connection: &StandaloneConnectionSection) -> bridgingio_domain::ConnectionConfig {
+fn to_serial_connection(
+    connection: &StandaloneConnectionSection,
+) -> bridgingio_domain::ConnectionConfig {
     let device = connection
         .selector_value
         .clone()
@@ -2598,7 +2948,9 @@ fn to_serial_connection(connection: &StandaloneConnectionSection) -> bridgingio_
     bridgingio_domain::ConnectionConfig::Serial { device, baud_rate }
 }
 
-fn to_docker_connection(connection: &StandaloneConnectionSection) -> bridgingio_domain::ConnectionConfig {
+fn to_docker_connection(
+    connection: &StandaloneConnectionSection,
+) -> bridgingio_domain::ConnectionConfig {
     let container = connection
         .selector_value
         .clone()
@@ -2669,13 +3021,19 @@ fn to_standalone_target_profile(
             .get("alias")
             .map(|alias| vec![alias.clone()])
             .unwrap_or_default(),
-        credential_ref: profile.credential_ref.as_ref().map(|value| value.id.clone()),
+        credential_ref: profile
+            .credential_ref
+            .as_ref()
+            .map(|value| value.id.clone()),
         notes: profile.notes.clone(),
         connection,
         toolchains,
         terminal_provider: bridgingio_engine::TerminalProviderSection {
             enabled: false,
-            shell: None,
+            shell: profile
+                .metadata
+                .get(TARGET_TERMINAL_SHELL_METADATA_KEY)
+                .map(|value| value.to_string()),
         },
         git_repositories: Vec::new(),
     })
@@ -2687,6 +3045,11 @@ fn target_profile_payload_json(profile: &TargetProfile) -> String {
 
 fn target_profile_json_value(profile: &TargetProfile) -> Value {
     let alias = profile.metadata.get("alias").cloned().unwrap_or_default();
+    let target_shell = profile
+        .metadata
+        .get(TARGET_TERMINAL_SHELL_METADATA_KEY)
+        .cloned();
+    let target_dialect = target_shell_dialect_for(profile);
     let (connection_kind, connection_json) = match &profile.connection {
         ConnectionConfig::Ssh {
             host,
@@ -2744,6 +3107,11 @@ fn target_profile_json_value(profile: &TargetProfile) -> Value {
         }).collect::<Vec<_>>(),
         "connection_kind": connection_kind,
         "connection": connection_json,
+        "terminal_provider": {
+            "shell": target_shell,
+            "target_shell_dialect": target_dialect.as_str(),
+            "dialect_support": target_dialect.support_level()
+        },
     })
 }
 
@@ -2752,10 +3120,28 @@ fn vault_error_to_runtime(err: VaultError) -> CoreRuntimeError {
 }
 
 pub fn control_plane_socket_path(settings: &CoreSettings) -> PathBuf {
-    if settings.control_plane.endpoint == "auto" {
-        std::env::temp_dir().join(format!("bridgingio-{}.sock", settings.core.instance_name))
+    let host_platform_adapter = detect_host_platform_adapter(&settings.core.log_level);
+    let mut resolved = settings.clone();
+    if resolve_runtime_path_defaults(&mut resolved, host_platform_adapter.as_ref()).is_ok() {
+        return PathBuf::from(resolved.control_plane.endpoint);
+    }
+
+    if looks_like_named_pipe_endpoint(&settings.control_plane.endpoint) {
+        PathBuf::from(settings.control_plane.endpoint.trim())
+    } else if is_auto_value(&settings.control_plane.endpoint) {
+        let runtime_paths = host_platform_adapter.runtime_paths().runtime_paths(
+            &settings.core.instance_name,
+            Path::new(&settings.core.data_dir),
+        );
+        PathBuf::from(
+            host_platform_adapter
+                .control_plane_transport()
+                .endpoint(&settings.core.instance_name, &runtime_paths),
+        )
     } else {
-        PathBuf::from(&settings.control_plane.endpoint)
+        host_platform_adapter
+            .runtime_paths()
+            .expand_user_path(&settings.control_plane.endpoint)
     }
 }
 
@@ -2919,15 +3305,27 @@ fn handle_http_connection(
     stream: &mut TcpStream,
     runtime: &SharedRuntime,
 ) -> Result<(), CoreRuntimeError> {
-    let (method, path, body) = read_http_request(stream)?;
-    trace_mcp(format!(
+    let (method, path, body) = read_http_request(stream, Some(runtime))?;
+    trace_mcp(Some(runtime), format!(
         "http request method={} path={} body_len={}",
         method,
         path,
         body.len()
     ));
     let (status, content_type, response_body) = match (method.as_str(), path.as_str()) {
-        ("GET", "/health") => (200, "text/plain", "ok".to_string()),
+        ("GET", "/health") => {
+            let runtime = runtime.lock().map_err(|_| CoreRuntimeError::LockPoisoned)?;
+            (
+                200,
+                "application/json",
+                json!({
+                    "readiness_state": runtime.readiness_state_label(),
+                    "model_plane_ready": runtime.model_plane_ready(),
+                    "capability_health": runtime.capability_health_snapshot_json(),
+                })
+                .to_string(),
+            )
+        }
         ("GET", "/state/sessions") => {
             let runtime = runtime.lock().map_err(|_| CoreRuntimeError::LockPoisoned)?;
             (
@@ -2956,13 +3354,13 @@ fn handle_http_connection(
                     format!("result=not_ready|reason={reason}"),
                 )
             } else {
-            let params = parse_kv_body(&body);
-            let mut runtime = runtime.lock().map_err(|_| CoreRuntimeError::LockPoisoned)?;
-            let target_ref = optional_param(&params, "target_ref")
-                .or_else(|| optional_param(&params, "target"))
-                .or_else(|| optional_param(&params, "target_id"))
-                .ok_or_else(|| CoreRuntimeError::Config("missing param target_id".into()))?;
-            match runtime.execute_target_command(
+                let params = parse_kv_body(&body);
+                let mut runtime = runtime.lock().map_err(|_| CoreRuntimeError::LockPoisoned)?;
+                let target_ref = optional_param(&params, "target_ref")
+                    .or_else(|| optional_param(&params, "target"))
+                    .or_else(|| optional_param(&params, "target_id"))
+                    .ok_or_else(|| CoreRuntimeError::Config("missing param target_id".into()))?;
+                match runtime.execute_target_command(
                 target_ref,
                 ToolRequestContext {
                     agent_id: required_param(&params, "agent_id")?.to_string(),
@@ -3007,7 +3405,7 @@ fn handle_http_connection(
         }
         _ => (404, "text/plain", "not found".to_string()),
     };
-    trace_mcp(format!(
+    trace_mcp(Some(runtime), format!(
         "http response method={} path={} status={} content_type={} body_len={}",
         method,
         path,
@@ -3065,12 +3463,12 @@ fn handle_mcp_http_request(
             .and_then(|map| map.get("name"))
             .and_then(Value::as_str)
             .unwrap_or("<missing>");
-        trace_mcp(format!(
+        trace_mcp(Some(runtime), format!(
             "mcp request id={} method={} tool={}",
             id_brief, method, tool_name
         ));
     } else {
-        trace_mcp(format!("mcp request id={} method={}", id_brief, method));
+        trace_mcp(Some(runtime), format!("mcp request id={} method={}", id_brief, method));
     }
     let params = request_value.get("params").cloned().unwrap_or(Value::Null);
 
@@ -3117,7 +3515,7 @@ fn handle_mcp_http_request(
         Ok(payload) => jsonrpc_success(id.clone(), payload),
         Err(error_body) => normalize_jsonrpc_error_id(error_body, &id),
     };
-    trace_mcp(format!(
+    trace_mcp(Some(runtime), format!(
         "mcp response id={} method={} body_len={}",
         id_brief,
         method,
@@ -3694,7 +4092,8 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
                 "logical_session_id": outcome.logical_session_id,
                 "channel_id": outcome.channel_id,
                 "command": outcome.command,
-                "connector_command": outcome.connector_command,
+                "executed_command": outcome.executed_command,
+                "invocation": invocation_json(outcome.invocation.as_ref()),
                 "output": outcome.output
             });
             Ok(json!({
@@ -3908,7 +4307,11 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
                 "logical_session_id": handle.logical_session_id,
                 "channel_id": handle.channel_id,
                 "prompt": handle.prompt,
-                "cwd": handle.cwd
+                "cwd": handle.cwd,
+                "launch_strategy": handle.launch_strategy,
+                "launch_fallback_applied": handle.launch_fallback_applied,
+                "launch_diagnostics": handle.launch_diagnostics,
+                "invocation": invocation_json(handle.invocation.as_ref())
             });
             Ok(json!({
                 "content": [
@@ -4073,7 +4476,8 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
                 "kernel_version": result.kernel_version,
                 "username": result.username,
                 "logical_session_id": result.logical_session_id,
-                "artifacts": result.artifacts
+                "artifacts": result.artifacts,
+                "invocation": invocation_json(result.invocation.as_ref())
             });
             Ok(json!({
                 "content": [
@@ -4205,11 +4609,23 @@ fn normalize_jsonrpc_error_id(error_body: String, request_id: &Value) -> String 
     payload.to_string()
 }
 
-fn trace_mcp(message: impl AsRef<str>) {
+fn trace_mcp(runtime: Option<&SharedRuntime>, message: impl AsRef<str>) {
     if !mcp_trace_enabled() {
         return;
     }
-    eprintln!("[bridgingio-mcp] {}", message.as_ref());
+    if let Some(runtime) = runtime {
+        if let Ok(locked) = runtime.lock() {
+            locked.host_platform_adapter.runtime_logger().log(
+                RuntimeLogLevel::Trace,
+                RuntimeLogCategory::Mcp,
+                message.as_ref(),
+            );
+            return;
+        }
+    }
+    detect_host_platform_adapter("trace")
+        .runtime_logger()
+        .log(RuntimeLogLevel::Trace, RuntimeLogCategory::Mcp, message.as_ref());
 }
 
 fn mcp_trace_enabled() -> bool {
@@ -4238,7 +4654,10 @@ fn jsonrpc_id_brief(id: &Value) -> String {
     id.to_string()
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<(String, String, String), CoreRuntimeError> {
+fn read_http_request(
+    stream: &mut TcpStream,
+    runtime: Option<&SharedRuntime>,
+) -> Result<(String, String, String), CoreRuntimeError> {
     let mut buffer = Vec::<u8>::new();
     let mut header_end = None;
     loop {
@@ -4257,7 +4676,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(String, String, String),
     }
     let header_end =
         header_end.ok_or_else(|| CoreRuntimeError::Io("invalid http request".into()))?;
-    let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let header_text = decode_network_text(runtime, &buffer[..header_end], "http_headers");
     let mut lines = header_text.lines();
     let request_line = lines
         .next()
@@ -4294,8 +4713,43 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(String, String, String),
         }
         body_bytes.extend_from_slice(&chunk[..read]);
     }
-    let body = String::from_utf8_lossy(&body_bytes).to_string();
+    let body = decode_network_text(runtime, &body_bytes, "http_body");
     Ok((method, path, body))
+}
+
+fn decode_network_text(runtime: Option<&SharedRuntime>, bytes: &[u8], surface: &str) -> String {
+    if let Some(runtime) = runtime {
+        if let Ok(locked) = runtime.lock() {
+            let decoded = locked.host_platform_adapter.output_decoder().decode(bytes);
+            if decoded.used_fallback || decoded.had_replacement_char || decoded.normalized_newlines {
+                locked.host_platform_adapter.runtime_logger().log(
+                    RuntimeLogLevel::Warn,
+                    RuntimeLogCategory::Decode,
+                    &format!(
+                        "decode diagnostics surface={} fallback={} replacement_char={} normalized_newlines={}",
+                        surface,
+                        decoded.used_fallback,
+                        decoded.had_replacement_char,
+                        decoded.normalized_newlines
+                    ),
+                );
+            }
+            return decoded.text;
+        }
+    }
+    let adapter = detect_host_platform_adapter("info");
+    let decoded = adapter.output_decoder().decode(bytes);
+    if decoded.used_fallback || decoded.had_replacement_char || decoded.normalized_newlines {
+        adapter.runtime_logger().log(
+            RuntimeLogLevel::Warn,
+            RuntimeLogCategory::Decode,
+            &format!(
+                "decode diagnostics surface={} fallback={} replacement_char={} normalized_newlines={}",
+                surface, decoded.used_fallback, decoded.had_replacement_char, decoded.normalized_newlines
+            ),
+        );
+    }
+    decoded.text
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -4365,6 +4819,8 @@ fn parse_reuse_policy(value: &str) -> Result<SessionReusePolicy, CoreRuntimeErro
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4519,7 +4975,11 @@ mod tests {
         let root = PathBuf::from("/tmp").join(format!("bridgingio-update-settings-{stamp}"));
         fs::create_dir_all(&root).expect("create root");
         let config_path = root.join("managed-core.toml");
-        fs::write(&config_path, bridgingio_engine::CoreSettings::minimal_example()).expect("write config");
+        fs::write(
+            &config_path,
+            bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("write config");
 
         let settings = bridgingio_engine::CoreSettings::load_from_file(&config_path).expect("load");
         let resolver = super::ToolchainResolver::new(
@@ -4564,8 +5024,12 @@ mod tests {
         }
 
         let persisted = fs::read_to_string(&config_path).expect("read persisted");
-        assert!(persisted.contains("port = 19719"), "persisted config: {persisted}");
-        let reloaded = bridgingio_engine::CoreSettings::load_from_file(&config_path).expect("reload");
+        assert!(
+            persisted.contains("port = 19719"),
+            "persisted config: {persisted}"
+        );
+        let reloaded =
+            bridgingio_engine::CoreSettings::load_from_file(&config_path).expect("reload");
         assert_eq!(reloaded.model_plane.http.port, 19719);
     }
 
@@ -4581,76 +5045,235 @@ mod tests {
     }
 
     #[test]
-    fn shell_single_quote_is_platform_compatible() {
-        let value = "hello world";
-        #[cfg(windows)]
-        assert_eq!(super::shell_single_quote(value), "hello world");
-        #[cfg(not(windows))]
-        assert_eq!(super::shell_single_quote(value), "'hello world'");
-    }
-
-    #[test]
-    fn connector_command_uses_resolved_adb_executable_path() {
-        let target = TargetProfile {
-            id: "adb-target".into(),
-            name: "adb-target".into(),
-            kind: TargetKind::Adb,
-            connection: ConnectionConfig::Adb {
-                serial: Some("emulator-5554".into()),
-                transport: Some("usb".into()),
-            },
-            credential_ref: None,
-            default_policy: PolicyProfile::default(),
-            notes: None,
-            metadata: BTreeMap::new(),
-            toolchains: BTreeMap::new(),
-        };
-        let command = super::build_connector_command(
-            &target,
-            "uname -r",
-            Some("/opt/homebrew/bin/adb"),
+    fn structured_exec_invocation_uses_unified_pipeline() {
+        let root = temp_dir("structured-exec-invocation");
+        let settings =
+            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
+                .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
         );
-        #[cfg(windows)]
-        assert_eq!(command, "/opt/homebrew/bin/adb -s emulator-5554 shell uname -r");
-        #[cfg(not(windows))]
+        let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        let invocation = runtime
+            .resolve_structured_exec_invocation(&target, "uname -r")
+            .expect("resolve invocation")
+            .expect("ssh invocation");
+        assert_eq!(invocation.target_shell_dialect.as_str(), "ssh-posix");
+        let view = super::invocation_json(Some(&invocation));
+        assert_eq!(view["mode"].as_str(), Some("one_shot"));
         assert_eq!(
-            command,
-            "'/opt/homebrew/bin/adb' -s emulator-5554 shell 'uname -r'"
+            view["target_shell_dialect"]["name"].as_str(),
+            Some("ssh-posix")
         );
+        assert!(view["quoting_boundary"]["host_shell_runtime"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("host shell"));
     }
 
     #[test]
-    fn connector_command_prefers_serial_selector_over_usb_transport() {
-        let target = TargetProfile {
-            id: "adb-target".into(),
-            name: "adb-target".into(),
-            kind: TargetKind::Adb,
-            connection: ConnectionConfig::Adb {
-                serial: Some("emulator-5554".into()),
-                transport: Some("usb".into()),
-            },
-            credential_ref: None,
-            default_policy: PolicyProfile::default(),
-            notes: None,
-            metadata: BTreeMap::new(),
-            toolchains: BTreeMap::new(),
-        };
-        let command = super::build_connector_command(&target, "uname -r", None);
+    fn target_terminal_shell_config_selects_future_dialect_with_deferred_semantics() {
+        let root = temp_dir("target-shell-override");
+        let mut settings =
+            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
+                .expect("parse settings");
+        let target = settings
+            .targets
+            .iter_mut()
+            .find(|entry| entry.id == "local-ssh")
+            .expect("local-ssh target");
+        target.terminal_provider.shell = Some("powershell".to_string());
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        let invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("ssh invocation");
+        let view = invocation.diagnostics_view();
+        assert_eq!(view.target_shell_dialect, "ssh-powershell");
+        assert_eq!(view.dialect_support, "deferred");
+        assert!(view
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("deferred")));
+    }
+
+    #[test]
+    fn interactive_shell_open_carries_structured_invocation() {
+        let root = temp_dir("interactive-invocation");
         #[cfg(windows)]
-        assert_eq!(command, "adb -s emulator-5554 shell uname -r");
+        let ssh_mock = root.join("ssh.bat");
         #[cfg(not(windows))]
-        assert_eq!(command, "adb -s emulator-5554 shell 'uname -r'");
+        let ssh_mock = root.join("ssh");
+        #[cfg(windows)]
+        fs::write(
+            &ssh_mock,
+            r#"@echo off
+if "%~1"=="-p" (
+  shift
+  shift
+  shift
+)
+cmd /Q
+"#,
+        )
+        .expect("write ssh mock");
+        #[cfg(not(windows))]
+        fs::write(
+            &ssh_mock,
+            r#"#!/bin/sh
+if [ "${1:-}" = "-p" ]; then
+  shift
+  shift
+  shift
+fi
+exec /bin/sh -s
+"#,
+        )
+        .expect("write ssh mock");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&ssh_mock).expect("ssh metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&ssh_mock, perms).expect("chmod ssh");
+        }
+        let settings =
+            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
+                .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(vec![root.clone()]),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let handle = runtime
+            .open_interactive_shell(
+                "local",
+                context(
+                    "agent-int",
+                    "run-int",
+                    "client-int",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+            )
+            .expect("open interactive shell");
+        assert_eq!(
+            handle.launch_strategy,
+            "structured_interactive_invocation"
+        );
+        assert!(!handle.launch_fallback_applied);
+        assert!(handle.launch_diagnostics.is_empty());
+        let invocation = handle.invocation.expect("invocation");
+        assert_eq!(invocation.invocation_kind.as_str(), "interactive");
+        assert_eq!(invocation.target_shell_dialect.as_str(), "ssh-posix");
     }
 
     #[test]
-    fn connector_command_uses_resolved_ssh_executable_path() {
-        let target = TargetProfile {
-            id: "ssh-target".into(),
-            name: "ssh-target".into(),
+    fn interactive_shell_structured_launch_fallback_keeps_lifecycle_state_deterministic() {
+        let root = temp_dir("interactive-fallback-lifecycle");
+        #[cfg(windows)]
+        let failing_ssh = root.join("ssh.bat");
+        #[cfg(not(windows))]
+        let failing_ssh = root.join("ssh");
+        #[cfg(windows)]
+        fs::write(
+            &failing_ssh,
+            r#"@echo off
+echo forced ssh failure>&2
+exit /b 1
+"#,
+        )
+        .expect("write failing ssh");
+        #[cfg(not(windows))]
+        fs::write(
+            &failing_ssh,
+            r#"#!/bin/sh
+echo "forced ssh failure" >&2
+exit 1
+"#,
+        )
+        .expect("write failing ssh");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&failing_ssh).expect("ssh metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&failing_ssh, perms).expect("chmod ssh");
+        }
+        let settings =
+            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
+                .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(vec![root.clone()]),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let open_context = context(
+            "agent-fb",
+            "run-fb",
+            "client-fb",
+            bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+        );
+        let handle = runtime
+            .open_interactive_shell("local", open_context.clone())
+            .expect("open interactive shell");
+        assert_eq!(
+            handle.launch_strategy,
+            "structured_interactive_invocation_with_host_baseline_fallback"
+        );
+        assert!(handle.launch_fallback_applied);
+        assert!(handle
+            .launch_diagnostics
+            .iter()
+            .any(|line| line.contains("structured interactive launch failed")));
+        let invocation = handle.invocation.expect("invocation");
+        assert!(invocation
+            .resolution
+            .warnings
+            .iter()
+            .any(|line| line.contains("structured interactive launch failed")));
+
+        let read = runtime
+            .read_interactive_shell(&handle.shell_id, 0, 20, open_context.clone())
+            .expect("read interactive");
+        assert!(!read.running);
+        assert!(!read.closed);
+
+        let interrupted = runtime
+            .interrupt_interactive_shell(&handle.shell_id, open_context.clone())
+            .expect("interrupt interactive");
+        assert!(interrupted.interrupted);
+        assert!(!interrupted.running);
+        assert!(!interrupted.closed);
+
+        let closed = runtime
+            .close_interactive_shell(&handle.shell_id, open_context)
+            .expect("close interactive");
+        assert!(closed.closed);
+        assert!(!closed.running);
+    }
+
+    #[test]
+    fn target_terminal_shell_setting_roundtrips_via_profile_metadata() {
+        let mut target = TargetProfile {
+            id: "t-ssh".into(),
+            name: "ssh-host".into(),
             kind: TargetKind::Ssh,
             connection: ConnectionConfig::Ssh {
                 host: "10.1.1.8".into(),
-                port: 2222,
+                port: 22,
                 username: "root".into(),
             },
             credential_ref: None,
@@ -4659,128 +5282,15 @@ mod tests {
             metadata: BTreeMap::new(),
             toolchains: BTreeMap::new(),
         };
-        let command = super::build_connector_command(
-            &target,
-            "uname -r",
-            Some("/opt/homebrew/bin/ssh"),
+        target.metadata.insert(
+            super::TARGET_TERMINAL_SHELL_METADATA_KEY.to_string(),
+            "powershell".to_string(),
         );
-        #[cfg(windows)]
-        assert_eq!(command, "/opt/homebrew/bin/ssh -p 2222 root@10.1.1.8 uname -r");
-        #[cfg(not(windows))]
-        assert_eq!(
-            command,
-            "'/opt/homebrew/bin/ssh' -p 2222 'root@10.1.1.8' 'uname -r'"
-        );
-    }
 
-    #[test]
-    fn connector_command_builds_ssh_command_from_target_connection() {
-        let target = TargetProfile {
-            id: "ssh-target".into(),
-            name: "ssh-target".into(),
-            kind: TargetKind::Ssh,
-            connection: ConnectionConfig::Ssh {
-                host: "192.168.56.2".into(),
-                port: 22,
-                username: "ubuntu".into(),
-            },
-            credential_ref: None,
-            default_policy: PolicyProfile::default(),
-            notes: None,
-            metadata: BTreeMap::new(),
-            toolchains: BTreeMap::new(),
-        };
-        let command = super::build_connector_command(&target, "whoami", None);
-        #[cfg(windows)]
-        assert_eq!(command, "ssh -p 22 ubuntu@192.168.56.2 whoami");
-        #[cfg(not(windows))]
-        assert_eq!(command, "ssh -p 22 'ubuntu@192.168.56.2' 'whoami'");
-    }
-
-    #[test]
-    fn connector_command_keeps_explicit_ssh_invocation_unchanged() {
-        let target = TargetProfile {
-            id: "ssh-target".into(),
-            name: "ssh-target".into(),
-            kind: TargetKind::Ssh,
-            connection: ConnectionConfig::Ssh {
-                host: "192.168.56.2".into(),
-                port: 22,
-                username: "ubuntu".into(),
-            },
-            credential_ref: None,
-            default_policy: PolicyProfile::default(),
-            notes: None,
-            metadata: BTreeMap::new(),
-            toolchains: BTreeMap::new(),
-        };
-        let raw = "ssh -p 22 ubuntu@192.168.56.2 whoami";
-        let command = super::build_connector_command(&target, raw, Some("/opt/homebrew/bin/ssh"));
-        assert_eq!(command, raw);
-    }
-
-    #[test]
-    fn interactive_connector_command_uses_resolved_adb_path_and_selector() {
-        let target = TargetProfile {
-            id: "adb-target".into(),
-            name: "adb-target".into(),
-            kind: TargetKind::Adb,
-            connection: ConnectionConfig::Adb {
-                serial: Some("emulator-5554".into()),
-                transport: Some("usb".into()),
-            },
-            credential_ref: None,
-            default_policy: PolicyProfile::default(),
-            notes: None,
-            metadata: BTreeMap::new(),
-            toolchains: BTreeMap::new(),
-        };
-        let command = super::build_interactive_connector_command(
-            &target,
-            Some("/opt/homebrew/bin/adb"),
-        );
-        #[cfg(windows)]
+        let standalone = super::to_standalone_target_profile(&target).expect("standalone profile");
         assert_eq!(
-            command.as_deref(),
-            Some("/opt/homebrew/bin/adb -s emulator-5554 shell")
-        );
-        #[cfg(not(windows))]
-        assert_eq!(
-            command.as_deref(),
-            Some("'/opt/homebrew/bin/adb' -s emulator-5554 shell")
-        );
-    }
-
-    #[test]
-    fn interactive_connector_command_uses_resolved_ssh_path() {
-        let target = TargetProfile {
-            id: "ssh-target".into(),
-            name: "ssh-target".into(),
-            kind: TargetKind::Ssh,
-            connection: ConnectionConfig::Ssh {
-                host: "10.1.1.8".into(),
-                port: 2222,
-                username: "root".into(),
-            },
-            credential_ref: None,
-            default_policy: PolicyProfile::default(),
-            notes: None,
-            metadata: BTreeMap::new(),
-            toolchains: BTreeMap::new(),
-        };
-        let command = super::build_interactive_connector_command(
-            &target,
-            Some("/opt/homebrew/bin/ssh"),
-        );
-        #[cfg(windows)]
-        assert_eq!(
-            command.as_deref(),
-            Some("/opt/homebrew/bin/ssh -p 2222 root@10.1.1.8")
-        );
-        #[cfg(not(windows))]
-        assert_eq!(
-            command.as_deref(),
-            Some("'/opt/homebrew/bin/ssh' -p 2222 'root@10.1.1.8'")
+            standalone.terminal_provider.shell.as_deref(),
+            Some("powershell")
         );
     }
 
@@ -4800,9 +5310,9 @@ mod tests {
         fs::write(bundled_root.join("adb"), "binary").expect("write bundled adb");
 
         let mut text = bridgingio_engine::CoreSettings::complete_example().to_string();
-        text = text.replace("/opt/homebrew/bin/adb", &global_adb.to_string_lossy());
+        text = text.replace("__GLOBAL_ADB_OVERRIDE__", &global_adb.to_string_lossy());
         text = text.replace(
-            "/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb",
+            "__TARGET_ADB_OVERRIDE__",
             &target_adb.to_string_lossy(),
         );
         let config_path = root.join("managed-core.toml");
@@ -4828,8 +5338,7 @@ mod tests {
             ApiResponse::Diagnostics { items, .. } => items
                 .into_iter()
                 .find(|item| {
-                    item.target_id.as_deref() == Some("android-emulator")
-                        && item.command == "adb"
+                    item.target_id.as_deref() == Some("android-emulator") && item.command == "adb"
                 })
                 .expect("adb diagnostics for android-emulator"),
             other => panic!("unexpected diagnostics response: {other:?}"),
@@ -4881,8 +5390,7 @@ mod tests {
             ApiResponse::Diagnostics { items, .. } => items
                 .into_iter()
                 .find(|item| {
-                    item.target_id.as_deref() == Some("android-emulator")
-                        && item.command == "adb"
+                    item.target_id.as_deref() == Some("android-emulator") && item.command == "adb"
                 })
                 .expect("adb diagnostics after clearing target override"),
             other => panic!("unexpected diagnostics response: {other:?}"),
@@ -4923,8 +5431,7 @@ mod tests {
             ApiResponse::Diagnostics { items, .. } => items
                 .into_iter()
                 .find(|item| {
-                    item.target_id.as_deref() == Some("android-emulator")
-                        && item.command == "adb"
+                    item.target_id.as_deref() == Some("android-emulator") && item.command == "adb"
                 })
                 .expect("adb diagnostics after clearing global override"),
             other => panic!("unexpected diagnostics response: {other:?}"),
@@ -4947,9 +5454,9 @@ mod tests {
         fs::write(&bundled_adb, "binary").expect("write bundled adb");
 
         let mut text = bridgingio_engine::CoreSettings::complete_example().to_string();
-        text = text.replace("/opt/homebrew/bin/adb", "");
+        text = text.replace("__GLOBAL_ADB_OVERRIDE__", "");
         text = text.replace(
-            "/Applications/AndroidStudio.app/Contents/sdk/platform-tools/adb",
+            "__TARGET_ADB_OVERRIDE__",
             "",
         );
         let config_path = root.join("managed-core.toml");
@@ -4975,13 +5482,15 @@ mod tests {
             ApiResponse::Diagnostics { items, .. } => items
                 .into_iter()
                 .find(|item| {
-                    item.target_id.as_deref() == Some("android-emulator")
-                        && item.command == "adb"
+                    item.target_id.as_deref() == Some("android-emulator") && item.command == "adb"
                 })
                 .expect("adb diagnostics for android-emulator"),
             other => panic!("unexpected diagnostics response: {other:?}"),
         };
-        assert_eq!(adb_diag.effective_scope.as_deref(), Some("builtin_fallback"));
+        assert_eq!(
+            adb_diag.effective_scope.as_deref(),
+            Some("builtin_fallback")
+        );
         assert_eq!(
             adb_diag.effective_path.as_deref(),
             Some(bundled_adb.to_string_lossy().as_ref())

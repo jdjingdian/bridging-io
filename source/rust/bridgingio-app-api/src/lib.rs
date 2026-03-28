@@ -430,7 +430,10 @@ impl AppApiLineCodec {
                 }
                 let mut toolchain_entries = profile.toolchains.iter().collect::<Vec<_>>();
                 toolchain_entries.sort_by(|a, b| a.0.cmp(b.0));
-                base.push_str(&format!("|target_toolchain_count={}", toolchain_entries.len()));
+                base.push_str(&format!(
+                    "|target_toolchain_count={}",
+                    toolchain_entries.len()
+                ));
                 for (index, (command, path_override)) in toolchain_entries.iter().enumerate() {
                     base.push_str(&format!(
                         "|target_toolchain_{index}_command={}|target_toolchain_{index}_path_override={}",
@@ -473,10 +476,7 @@ impl AppApiLineCodec {
                         }
                     }
                     ConnectionConfig::Custom { description } => {
-                        base.push_str(&format!(
-                            "|custom_description={}",
-                            escape(description)
-                        ));
+                        base.push_str(&format!("|custom_description={}", escape(description)));
                     }
                 }
             }
@@ -552,11 +552,8 @@ impl AppApiLineCodec {
                     &map,
                     "artifact_cache_max_bytes",
                 ))?,
-                artifact_cache_eviction_policy: optional(
-                    &map,
-                    "artifact_cache_eviction_policy",
-                )
-                .map(unescape),
+                artifact_cache_eviction_policy: optional(&map, "artifact_cache_eviction_policy")
+                    .map(unescape),
                 tool_override_command: optional(&map, "tool_override_command").map(unescape),
                 tool_override_path: optional(&map, "tool_override_path").map(unescape),
             },
@@ -881,12 +878,14 @@ impl AppApiLineCodec {
                         let mut items = Vec::with_capacity(toolchain_count);
                         for index in 0..toolchain_count {
                             items.push(ToolchainSettingsView {
-                                command: unescape(required(&map, &format!(
-                                    "toolchain_{index}_command"
-                                ))?),
-                                path_override: unescape(required(&map, &format!(
-                                    "toolchain_{index}_path_override"
-                                ))?),
+                                command: unescape(required(
+                                    &map,
+                                    &format!("toolchain_{index}_command"),
+                                )?),
+                                path_override: unescape(required(
+                                    &map,
+                                    &format!("toolchain_{index}_path_override"),
+                                )?),
                                 prefer_builtin_fallback: required(
                                     &map,
                                     &format!("toolchain_{index}_prefer_builtin_fallback"),
@@ -962,10 +961,7 @@ fn required<'a>(
         .ok_or_else(|| invalid_request(&format!("missing field: {key}")))
 }
 
-fn optional<'a>(
-    map: &'a std::collections::HashMap<String, String>,
-    key: &str,
-) -> Option<&'a str> {
+fn optional<'a>(map: &'a std::collections::HashMap<String, String>, key: &str) -> Option<&'a str> {
     map.get(key).map(String::as_str)
 }
 
@@ -1062,7 +1058,9 @@ fn parse_profile_from_fields(
         let command = unescape(required(map, &command_key)?).trim().to_string();
         let path_override = unescape(required(map, &path_key)?).trim().to_string();
         if command.is_empty() {
-            return Err(invalid_request("target toolchain command must be non-empty"));
+            return Err(invalid_request(
+                "target toolchain command must be non-empty",
+            ));
         }
         toolchains.insert(command, path_override);
     }
@@ -1256,7 +1254,10 @@ mod tests {
     #[test]
     fn encodes_and_decodes_upsert_profile_with_target_toolchains() {
         let mut toolchains = BTreeMap::new();
-        toolchains.insert("adb".to_string(), "/Applications/AndroidStudio.app/adb".to_string());
+        toolchains.insert(
+            "adb".to_string(),
+            "/Applications/AndroidStudio.app/adb".to_string(),
+        );
         let request = ApiRequest {
             request_id: "req-upsert-profile".into(),
             context: ApiRequestContext {
@@ -1336,7 +1337,10 @@ mod tests {
             ApiResponse::Settings { settings, .. } => {
                 assert_eq!(settings.toolchains.len(), 1);
                 assert_eq!(settings.toolchains[0].command, "adb");
-                assert_eq!(settings.toolchains[0].path_override, "/opt/homebrew/bin/adb");
+                assert_eq!(
+                    settings.toolchains[0].path_override,
+                    "/opt/homebrew/bin/adb"
+                );
             }
             other => panic!("expected settings response, got {other:?}"),
         }
