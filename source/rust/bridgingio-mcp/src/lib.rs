@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -732,6 +732,103 @@ struct InteractiveShellOwner {
     target_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpTargetResolutionPolicy {
+    AutoExecute,
+    ConfirmIfFamily,
+    ConfirmIfRelated,
+    ConfirmAlways,
+}
+
+impl McpTargetResolutionPolicy {
+    fn parse(raw: &str) -> Result<Self, CoreRuntimeError> {
+        match raw.trim() {
+            "auto_execute" => Ok(Self::AutoExecute),
+            "confirm_if_family" => Ok(Self::ConfirmIfFamily),
+            "confirm_if_related" => Ok(Self::ConfirmIfRelated),
+            "confirm_always" => Ok(Self::ConfirmAlways),
+            other => Err(CoreRuntimeError::Config(format!(
+                "invalid MCP target resolution policy: {other}"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoExecute => "auto_execute",
+            Self::ConfirmIfFamily => "confirm_if_family",
+            Self::ConfirmIfRelated => "confirm_if_related",
+            Self::ConfirmAlways => "confirm_always",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct McpTargetDescriptor {
+    target_id: String,
+    enabled: bool,
+    display_name: String,
+    kind: TargetKind,
+    aliases: Vec<String>,
+    notes: Option<String>,
+    connection_summary: String,
+}
+
+impl McpTargetDescriptor {
+    fn references(&self) -> Vec<&str> {
+        let mut refs = Vec::with_capacity(2 + self.aliases.len());
+        refs.push(self.target_id.as_str());
+        refs.push(self.display_name.as_str());
+        for alias in &self.aliases {
+            refs.push(alias.as_str());
+        }
+        refs
+    }
+
+    fn related_references(&self) -> Vec<&str> {
+        let mut refs = Vec::with_capacity(1 + self.aliases.len());
+        refs.push(self.target_id.as_str());
+        for alias in &self.aliases {
+            refs.push(alias.as_str());
+        }
+        refs
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetResolutionResolved {
+    requested_target_ref: String,
+    resolved_target_id: String,
+    matched_via: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetResolutionCandidate {
+    target_id: String,
+    reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetResolutionConfirmation {
+    requested_target_ref: String,
+    policy: McpTargetResolutionPolicy,
+    policy_reason: String,
+    exact_match: Option<TargetResolutionCandidate>,
+    related_candidates: Vec<TargetResolutionCandidate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetResolutionNotFound {
+    requested_target_ref: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TargetResolutionResult {
+    Resolved(TargetResolutionResolved),
+    ConfirmationRequired(TargetResolutionConfirmation),
+    NotFound(TargetResolutionNotFound),
+}
+
 pub type SharedRuntime = Arc<Mutex<StandaloneCoreRuntime>>;
 
 pub struct StandaloneCoreRuntime {
@@ -744,6 +841,8 @@ pub struct StandaloneCoreRuntime {
     pub tool_handler: McpToolHandler,
     profiles: HashMap<String, TargetProfile>,
     target_refs: HashMap<String, String>,
+    target_descriptors: HashMap<String, McpTargetDescriptor>,
+    target_resolution_policy: McpTargetResolutionPolicy,
     sessions: HashMap<String, SessionRecord>,
     interactive_shell_owners: HashMap<String, InteractiveShellOwner>,
     timeline: Vec<TimelineEntry>,
@@ -799,17 +898,9 @@ impl StandaloneCoreRuntime {
             ),
         );
 
-        let mut profiles = HashMap::new();
-        let mut target_refs = HashMap::new();
-        for configured in &settings.targets {
-            let profile = to_target_profile(configured)?;
-            let target_id = profile.id.clone();
-            register_target_ref(&mut target_refs, &target_id, &target_id)?;
-            for alias in &configured.aliases {
-                register_target_ref(&mut target_refs, alias, &target_id)?;
-            }
-            profiles.insert(target_id, profile);
-        }
+        let (profiles, target_refs, target_descriptors) = build_target_runtime_indexes(&settings)?;
+        let target_resolution_policy =
+            McpTargetResolutionPolicy::parse(&settings.policies.mcp_target_resolution_policy)?;
 
         let mut vault_router = SecretVaultRouter::default();
         vault_router
@@ -840,6 +931,8 @@ impl StandaloneCoreRuntime {
             tool_handler: McpToolHandler::with_artifact_store(artifact_store),
             profiles,
             target_refs,
+            target_descriptors,
+            target_resolution_policy,
             sessions: HashMap::new(),
             interactive_shell_owners: HashMap::new(),
             timeline: Vec::new(),
@@ -1010,6 +1103,310 @@ impl StandaloneCoreRuntime {
         self.profiles.get(target_id).cloned()
     }
 
+    fn resolve_target_for_mcp(&self, target_ref: &str) -> TargetResolutionResult {
+        let requested_target_ref = target_ref.trim().to_string();
+        if requested_target_ref.is_empty() {
+            return TargetResolutionResult::NotFound(TargetResolutionNotFound {
+                requested_target_ref,
+            });
+        }
+
+        let normalized = normalize_target_ref(target_ref);
+        let relaxed = normalize_target_ref_relaxed(target_ref);
+        let mut descriptors = self
+            .target_descriptors
+            .values()
+            .filter(|descriptor| descriptor.enabled)
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+
+        let mut exact_ids = descriptors
+            .iter()
+            .filter(|descriptor| {
+                descriptor
+                    .references()
+                    .into_iter()
+                    .any(|reference| normalize_target_ref(reference) == normalized)
+            })
+            .map(|descriptor| descriptor.target_id.clone())
+            .collect::<Vec<_>>();
+        exact_ids.sort();
+        exact_ids.dedup();
+        if exact_ids.len() > 1 {
+            return TargetResolutionResult::ConfirmationRequired(TargetResolutionConfirmation {
+                requested_target_ref,
+                policy: self.target_resolution_policy,
+                policy_reason: "exact_match_ambiguous".into(),
+                exact_match: None,
+                related_candidates: exact_ids
+                    .into_iter()
+                    .map(|target_id| TargetResolutionCandidate {
+                        target_id,
+                        reasons: vec!["exact_match_ambiguous".into()],
+                    })
+                    .collect(),
+            });
+        }
+        let exact_match_id = exact_ids.first().cloned();
+
+        let mut relaxed_ids = descriptors
+            .iter()
+            .filter(|descriptor| {
+                !relaxed.is_empty()
+                    && descriptor
+                        .references()
+                        .into_iter()
+                        .any(|reference| normalize_target_ref_relaxed(reference) == relaxed)
+            })
+            .map(|descriptor| descriptor.target_id.clone())
+            .collect::<Vec<_>>();
+        relaxed_ids.sort();
+        relaxed_ids.dedup();
+
+        let (resolved_target_id, matched_via) = if let Some(exact) = exact_match_id.clone() {
+            (Some(exact), Some("exact".to_string()))
+        } else if relaxed_ids.len() == 1 {
+            (Some(relaxed_ids[0].clone()), Some("normalized".to_string()))
+        } else {
+            (None, None)
+        };
+
+        if resolved_target_id.is_none() && relaxed_ids.len() > 1 {
+            return TargetResolutionResult::ConfirmationRequired(TargetResolutionConfirmation {
+                requested_target_ref,
+                policy: self.target_resolution_policy,
+                policy_reason: "normalized_match_ambiguous".into(),
+                exact_match: None,
+                related_candidates: relaxed_ids
+                    .into_iter()
+                    .map(|target_id| TargetResolutionCandidate {
+                        target_id,
+                        reasons: vec!["normalized_match_ambiguous".into()],
+                    })
+                    .collect(),
+            });
+        }
+
+        let mut candidate_reasons: HashMap<String, HashSet<String>> = HashMap::new();
+        for descriptor in &descriptors {
+            if Some(descriptor.target_id.as_str()) == resolved_target_id.as_deref() {
+                continue;
+            }
+            if descriptor
+                .related_references()
+                .into_iter()
+                .any(|reference| is_family_related_reference(&normalized, reference))
+            {
+                candidate_reasons
+                    .entry(descriptor.target_id.clone())
+                    .or_default()
+                    .insert("family_related".to_string());
+            }
+            if descriptor
+                .related_references()
+                .into_iter()
+                .any(|reference| {
+                    is_typo_related_reference(
+                        &normalized,
+                        &relaxed,
+                        reference,
+                        Some(descriptor.target_id.as_str()) == exact_match_id.as_deref(),
+                    )
+                })
+            {
+                candidate_reasons
+                    .entry(descriptor.target_id.clone())
+                    .or_default()
+                    .insert("typo_related".to_string());
+            }
+        }
+
+        let mut related_candidates = candidate_reasons
+            .into_iter()
+            .map(|(target_id, reasons)| {
+                let mut reasons = reasons.into_iter().collect::<Vec<_>>();
+                reasons.sort();
+                TargetResolutionCandidate { target_id, reasons }
+            })
+            .collect::<Vec<_>>();
+        related_candidates.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+
+        let has_family_candidates = related_candidates.iter().any(|candidate| {
+            candidate
+                .reasons
+                .iter()
+                .any(|reason| reason == "family_related")
+        });
+
+        if let Some(resolved_target_id) = resolved_target_id {
+            let exact_match = exact_match_id.is_some();
+            let mut policy_related_candidates = related_candidates.clone();
+            if matches!(
+                self.target_resolution_policy,
+                McpTargetResolutionPolicy::ConfirmIfFamily
+            ) {
+                policy_related_candidates.retain(|candidate| {
+                    candidate
+                        .reasons
+                        .iter()
+                        .any(|reason| reason == "family_related")
+                });
+            }
+            let should_confirm = match self.target_resolution_policy {
+                McpTargetResolutionPolicy::AutoExecute => false,
+                McpTargetResolutionPolicy::ConfirmIfFamily => exact_match && has_family_candidates,
+                McpTargetResolutionPolicy::ConfirmIfRelated => {
+                    exact_match && !related_candidates.is_empty()
+                }
+                McpTargetResolutionPolicy::ConfirmAlways => {
+                    exact_match && !related_candidates.is_empty()
+                }
+            };
+
+            if should_confirm {
+                let policy_reason = match self.target_resolution_policy {
+                    McpTargetResolutionPolicy::AutoExecute => "policy_auto_execute",
+                    McpTargetResolutionPolicy::ConfirmIfFamily => "policy_confirm_if_family",
+                    McpTargetResolutionPolicy::ConfirmIfRelated => "policy_confirm_if_related",
+                    McpTargetResolutionPolicy::ConfirmAlways => "policy_confirm_always",
+                }
+                .to_string();
+                return TargetResolutionResult::ConfirmationRequired(
+                    TargetResolutionConfirmation {
+                        requested_target_ref,
+                        policy: self.target_resolution_policy,
+                        policy_reason,
+                        exact_match: Some(TargetResolutionCandidate {
+                            target_id: resolved_target_id,
+                            reasons: vec!["exact_match".into()],
+                        }),
+                        related_candidates: policy_related_candidates,
+                    },
+                );
+            }
+
+            return TargetResolutionResult::Resolved(TargetResolutionResolved {
+                requested_target_ref,
+                resolved_target_id,
+                matched_via: matched_via.unwrap_or_else(|| "exact".into()),
+            });
+        }
+
+        if !related_candidates.is_empty() {
+            return TargetResolutionResult::ConfirmationRequired(TargetResolutionConfirmation {
+                requested_target_ref,
+                policy: self.target_resolution_policy,
+                policy_reason: "related_candidates_found".into(),
+                exact_match: None,
+                related_candidates,
+            });
+        }
+
+        TargetResolutionResult::NotFound(TargetResolutionNotFound {
+            requested_target_ref,
+        })
+    }
+
+    fn target_candidate_summary_json(&self, candidate: &TargetResolutionCandidate) -> Value {
+        let descriptor = self.target_descriptors.get(&candidate.target_id);
+        let profile = self.profiles.get(&candidate.target_id);
+        let toolchain_summary = profile
+            .and_then(|target| self.toolchain_diagnostic_for_target(target))
+            .map(|diagnostic| {
+                json!({
+                    "command": diagnostic.command,
+                    "effective_path": diagnostic.effective_path,
+                    "effective_source": diagnostic.effective_source,
+                    "effective_scope": diagnostic.effective_scope,
+                })
+            })
+            .unwrap_or(Value::Null);
+
+        let metadata = self.tool_handler.metadata();
+        let active_logical_sessions = metadata
+            .logical_sessions
+            .values()
+            .filter(|record| record.target_id == candidate.target_id && record.status.is_alive())
+            .count();
+        let active_transport_sessions = metadata
+            .transport_sessions
+            .values()
+            .filter(|record| {
+                record.target_id == candidate.target_id
+                    && matches!(
+                        record.status,
+                        bridgingio_domain::TransportSessionStatus::Connecting
+                            | bridgingio_domain::TransportSessionStatus::Connected
+                            | bridgingio_domain::TransportSessionStatus::Degraded
+                    )
+            })
+            .count();
+        let active_channels = metadata
+            .channels
+            .values()
+            .filter(|record| {
+                record.target_id == candidate.target_id
+                    && !matches!(
+                        record.status,
+                        bridgingio_domain::ChannelStatus::Failed
+                            | bridgingio_domain::ChannelStatus::Closed
+                    )
+            })
+            .count();
+
+        json!({
+            "canonical_target_id": candidate.target_id,
+            "display_name": descriptor
+                .map(|item| item.display_name.clone())
+                .unwrap_or_else(|| candidate.target_id.clone()),
+            "kind": descriptor
+                .map(|item| target_kind_label(&item.kind))
+                .or_else(|| profile.map(|item| target_kind_label(&item.kind)))
+                .unwrap_or_else(|| "unknown".to_string()),
+            "enabled": descriptor.map(|item| item.enabled).unwrap_or(true),
+            "aliases": descriptor
+                .map(|item| item.aliases.clone())
+                .unwrap_or_default(),
+            "notes": descriptor.and_then(|item| item.notes.clone()),
+            "match_reasons": candidate.reasons,
+            "connection_summary": descriptor
+                .map(|item| item.connection_summary.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            "diagnostic_summary": toolchain_summary,
+            "session_summary": {
+                "active_logical_sessions": active_logical_sessions,
+                "active_transport_sessions": active_transport_sessions,
+                "active_channels": active_channels,
+            }
+        })
+    }
+
+    fn confirmation_payload_json(
+        &self,
+        confirmation: &TargetResolutionConfirmation,
+        tool_name: &str,
+    ) -> Value {
+        let exact_match = confirmation
+            .exact_match
+            .as_ref()
+            .map(|candidate| self.target_candidate_summary_json(candidate))
+            .unwrap_or(Value::Null);
+        let related_candidates = confirmation
+            .related_candidates
+            .iter()
+            .map(|candidate| self.target_candidate_summary_json(candidate))
+            .collect::<Vec<_>>();
+        json!({
+            "tool_name": tool_name,
+            "resolution_state": "confirmation_required",
+            "requested_target_ref": confirmation.requested_target_ref,
+            "policy": confirmation.policy.as_str(),
+            "policy_reason": confirmation.policy_reason,
+            "exact_match": exact_match,
+            "related_candidates": related_candidates,
+        })
+    }
+
     fn next_internal_artifact_hint(&mut self) -> String {
         self.next_internal_artifact_seq += 1;
         format!("tmp-artifact-{:06}", self.next_internal_artifact_seq)
@@ -1022,10 +1419,26 @@ impl StandaloneCoreRuntime {
         command: &str,
         artifact_id: Option<String>,
     ) -> Result<TargetCommandExecution, CoreRuntimeError> {
-        let requested_target_ref = target_ref.to_string();
         let target = self
             .resolve_target_profile_by_ref(target_ref)
             .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
+        self.execute_target_command_on_profile(
+            target_ref.to_string(),
+            target,
+            context,
+            command,
+            artifact_id,
+        )
+    }
+
+    fn execute_target_command_on_profile(
+        &mut self,
+        requested_target_ref: String,
+        target: TargetProfile,
+        context: ToolRequestContext,
+        command: &str,
+        artifact_id: Option<String>,
+    ) -> Result<TargetCommandExecution, CoreRuntimeError> {
         let invocation = self.resolve_structured_exec_invocation(&target, command)?;
         let executed_command = invocation
             .as_ref()
@@ -1067,7 +1480,7 @@ impl StandaloneCoreRuntime {
                 );
                 return Err(CoreRuntimeError::Config(format!(
                     "command requires approval: {reason}"
-                )))
+                )));
             }
             ToolResult::Error { message } => return Err(CoreRuntimeError::Config(message)),
             other => {
@@ -1107,16 +1520,29 @@ impl StandaloneCoreRuntime {
         })
     }
 
-    fn inspect_target_basic(
+    fn inspect_target_basic_with_profile(
         &mut self,
-        target_ref: &str,
+        requested_target_ref: String,
+        target: TargetProfile,
         context: ToolRequestContext,
     ) -> Result<TargetInspectionResult, CoreRuntimeError> {
-        let kernel = self.execute_target_command(target_ref, context.clone(), "uname -r", None)?;
-        let user = self.execute_target_command(target_ref, context, "whoami", None)?;
+        let kernel = self.execute_target_command_on_profile(
+            requested_target_ref.clone(),
+            target.clone(),
+            context.clone(),
+            "uname -r",
+            None,
+        )?;
+        let user = self.execute_target_command_on_profile(
+            requested_target_ref.clone(),
+            target,
+            context,
+            "whoami",
+            None,
+        )?;
 
         Ok(TargetInspectionResult {
-            requested_target_ref: target_ref.to_string(),
+            requested_target_ref,
             resolved_target_id: kernel.resolved_target_id.clone(),
             target_kind: kernel.target_kind.clone(),
             kernel_version: first_data_line(&kernel.output),
@@ -1127,15 +1553,24 @@ impl StandaloneCoreRuntime {
         })
     }
 
+    #[allow(dead_code)]
     fn open_interactive_shell(
         &mut self,
         target_ref: &str,
         context: ToolRequestContext,
     ) -> Result<InteractiveShellHandle, CoreRuntimeError> {
-        let requested_target_ref = target_ref.to_string();
         let target = self
             .resolve_target_profile_by_ref(target_ref)
             .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
+        self.open_interactive_shell_with_profile(target_ref.to_string(), target, context)
+    }
+
+    fn open_interactive_shell_with_profile(
+        &mut self,
+        requested_target_ref: String,
+        target: TargetProfile,
+        context: ToolRequestContext,
+    ) -> Result<InteractiveShellHandle, CoreRuntimeError> {
         let now = SystemTime::now();
         let scope = build_scope(&context, now);
         let logical = self.tool_handler.metadata_mut().resolve_logical_session(
@@ -1156,15 +1591,18 @@ impl StandaloneCoreRuntime {
         let launch_command = invocation
             .as_ref()
             .map(CommandInvocation::to_host_shell_command);
-        let transport = self.tool_handler.metadata_mut().open_transport_session(
-            &logical.logical_session_id,
-            &target.id,
-            target.kind.clone(),
-            resolved_path,
-            resolved_source,
-            now,
-        )
-        .map_err(|err| CoreRuntimeError::Config(err.message()))?;
+        let transport = self
+            .tool_handler
+            .metadata_mut()
+            .open_transport_session(
+                &logical.logical_session_id,
+                &target.id,
+                target.kind.clone(),
+                resolved_path,
+                resolved_source,
+                now,
+            )
+            .map_err(|err| CoreRuntimeError::Config(err.message()))?;
         let channel = self.tool_handler.metadata_mut().open_channel(
             &logical.logical_session_id,
             &transport.transport_session_id,
@@ -1415,15 +1853,16 @@ impl StandaloneCoreRuntime {
     ) -> Result<Option<CommandInvocation>, CoreRuntimeError> {
         let diagnostic = self.toolchain_diagnostic_for_target(target);
         let dialect = target_shell_dialect_for(target);
-        let mut invocation = if let Some(connector) = terminal_connector_for_target(target, &diagnostic) {
-            Some(
-                connector
-                    .build_exec_invocation(target, command)
-                    .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
-            )
-        } else {
-            None
-        };
+        let mut invocation =
+            if let Some(connector) = terminal_connector_for_target(target, &diagnostic) {
+                Some(
+                    connector
+                        .build_exec_invocation(target, command)
+                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
+                )
+            } else {
+                None
+            };
 
         if let Some(invocation_ref) = invocation.as_mut() {
             invocation_ref.resolution = invocation_resolution_from_toolchain(
@@ -1441,15 +1880,16 @@ impl StandaloneCoreRuntime {
     ) -> Result<Option<CommandInvocation>, CoreRuntimeError> {
         let diagnostic = self.toolchain_diagnostic_for_target(target);
         let dialect = target_shell_dialect_for(target);
-        let mut invocation = if let Some(connector) = terminal_connector_for_target(target, &diagnostic) {
-            Some(
-                connector
-                    .build_interactive_invocation(target)
-                    .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
-            )
-        } else {
-            None
-        };
+        let mut invocation =
+            if let Some(connector) = terminal_connector_for_target(target, &diagnostic) {
+                Some(
+                    connector
+                        .build_interactive_invocation(target)
+                        .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?,
+                )
+            } else {
+                None
+            };
 
         if let Some(invocation_ref) = invocation.as_mut() {
             invocation_ref.resolution = invocation_resolution_from_toolchain(
@@ -1461,7 +1901,10 @@ impl StandaloneCoreRuntime {
         Ok(invocation)
     }
 
-    fn toolchain_diagnostic_for_target(&self, target: &TargetProfile) -> Option<ToolchainDiagnosticView> {
+    fn toolchain_diagnostic_for_target(
+        &self,
+        target: &TargetProfile,
+    ) -> Option<ToolchainDiagnosticView> {
         let command = toolchain_command_for_kind(&target.kind)?;
         let key = toolchain_cache_key(&target.id, command);
         self.toolchain_diagnostics_by_target
@@ -1483,7 +1926,8 @@ impl StandaloneCoreRuntime {
                 continue;
             };
             let resolved = self.resolve_toolchain_diagnostic_for_target(profile, command);
-            diagnostics_by_target.insert(toolchain_cache_key(&profile.id, command), resolved.clone());
+            diagnostics_by_target
+                .insert(toolchain_cache_key(&profile.id, command), resolved.clone());
             diagnostics.push(resolved);
         }
         self.toolchain_diagnostics = diagnostics;
@@ -1533,11 +1977,9 @@ impl StandaloneCoreRuntime {
                     (target_resolution, target_diag, Some("target_override"))
                 }
                 _ => {
-                    let (fallback_resolution, fallback_diag) =
-                        self.toolchain_resolver.resolve_with_diagnostics(
-                            command,
-                            global_override.map(Path::new),
-                        );
+                    let (fallback_resolution, fallback_diag) = self
+                        .toolchain_resolver
+                        .resolve_with_diagnostics(command, global_override.map(Path::new));
                     let scope = match &fallback_resolution {
                         Ok(selected)
                             if selected.source == ExecutableSource::UserOverride
@@ -1597,7 +2039,9 @@ impl StandaloneCoreRuntime {
             target_terminal_family: Some(terminal_target_family_for(profile).as_str().to_string()),
             target_shell_dialect: Some(target_shell_dialect_for(profile).as_str().to_string()),
             target_terminal_concurrency_policy: Some(
-                terminal_concurrency_policy_for(profile).as_str().to_string(),
+                terminal_concurrency_policy_for(profile)
+                    .as_str()
+                    .to_string(),
             ),
             target_override_path,
             global_override_path,
@@ -1691,20 +2135,22 @@ impl StandaloneCoreRuntime {
     }
 
     fn rebuild_profile_cache_from_settings(&mut self) -> Result<(), CoreRuntimeError> {
-        let mut profiles = HashMap::new();
-        let mut target_refs = HashMap::new();
-        for configured in &self.settings_store.settings.targets {
-            let profile = to_target_profile(configured)?;
-            let target_id = profile.id.clone();
-            register_target_ref(&mut target_refs, &target_id, &target_id)?;
-            for alias in &configured.aliases {
-                register_target_ref(&mut target_refs, alias, &target_id)?;
-            }
-            profiles.insert(target_id, profile.clone());
+        let (profiles, target_refs, target_descriptors) =
+            build_target_runtime_indexes(&self.settings_store.settings)?;
+        self.tool_handler.metadata_mut().profiles.clear();
+        for profile in profiles.values().cloned() {
             self.tool_handler.metadata_mut().upsert_profile(profile);
         }
         self.profiles = profiles;
         self.target_refs = target_refs;
+        self.target_descriptors = target_descriptors;
+        self.target_resolution_policy = McpTargetResolutionPolicy::parse(
+            &self
+                .settings_store
+                .settings
+                .policies
+                .mcp_target_resolution_policy,
+        )?;
         Ok(())
     }
 
@@ -2033,7 +2479,10 @@ impl StandaloneCoreRuntime {
         );
         let control_plane_lifecycle = control_plane_transport.lifecycle_semantics();
         let control_plane_diagnostics = control_plane_transport
-            .diagnostics(&self.settings_store.settings.core.instance_name, &runtime_paths)
+            .diagnostics(
+                &self.settings_store.settings.core.instance_name,
+                &runtime_paths,
+            )
             .into_iter()
             .map(|item| {
                 json!({
@@ -2599,6 +3048,97 @@ fn normalize_target_ref(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+fn normalize_target_ref_relaxed(value: &str) -> String {
+    normalize_target_ref(value)
+        .chars()
+        .filter(|ch| !matches!(*ch, '-' | '_') && !ch.is_whitespace())
+        .collect::<String>()
+}
+
+fn is_family_related_reference(input_normalized: &str, reference: &str) -> bool {
+    if input_normalized.is_empty() {
+        return false;
+    }
+    let normalized_reference = normalize_target_ref(reference);
+    if normalized_reference.len() <= input_normalized.len() {
+        return false;
+    }
+    if !normalized_reference.starts_with(input_normalized) {
+        return false;
+    }
+    let mut tail = normalized_reference[input_normalized.len()..].chars();
+    let Some(boundary) = tail.next() else {
+        return false;
+    };
+    if !matches!(boundary, '-' | '_' | ' ') {
+        return false;
+    }
+    tail.any(|ch| !matches!(ch, '-' | '_' | ' '))
+}
+
+fn is_typo_related_reference(
+    input_normalized: &str,
+    input_relaxed: &str,
+    reference: &str,
+    is_exact_match: bool,
+) -> bool {
+    if is_exact_match {
+        return false;
+    }
+    let normalized_reference = normalize_target_ref(reference);
+    if normalized_reference.is_empty() || normalized_reference == input_normalized {
+        return false;
+    }
+    let relaxed_reference = normalize_target_ref_relaxed(reference);
+    if relaxed_reference.is_empty() || relaxed_reference == input_relaxed {
+        return false;
+    }
+    let max_distance = if input_relaxed.len() <= 4 { 1 } else { 2 };
+    levenshtein_with_limit(input_relaxed, &relaxed_reference, max_distance).is_some()
+}
+
+fn levenshtein_with_limit(left: &str, right: &str, max_distance: usize) -> Option<usize> {
+    if left == right {
+        return Some(0);
+    }
+    if left.is_empty() {
+        return (right.chars().count() <= max_distance).then_some(right.chars().count());
+    }
+    if right.is_empty() {
+        return (left.chars().count() <= max_distance).then_some(left.chars().count());
+    }
+
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let right_chars = right.chars().collect::<Vec<_>>();
+    if left_chars.len().abs_diff(right_chars.len()) > max_distance {
+        return None;
+    }
+
+    let mut prev_row = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current_row = vec![0usize; right_chars.len() + 1];
+
+    for (i, left_char) in left_chars.iter().enumerate() {
+        current_row[0] = i + 1;
+        let mut row_min = current_row[0];
+        for (j, right_char) in right_chars.iter().enumerate() {
+            let substitution_cost = if left_char == right_char { 0 } else { 1 };
+            let deletion = prev_row[j + 1] + 1;
+            let insertion = current_row[j] + 1;
+            let substitution = prev_row[j] + substitution_cost;
+            let cost = deletion.min(insertion).min(substitution);
+            current_row[j + 1] = cost;
+            row_min = row_min.min(cost);
+        }
+        if row_min > max_distance {
+            return None;
+        }
+        std::mem::swap(&mut prev_row, &mut current_row);
+    }
+
+    let distance = prev_row[right_chars.len()];
+    (distance <= max_distance).then_some(distance)
+}
+
 fn register_target_ref(
     map: &mut HashMap<String, String>,
     reference: &str,
@@ -2618,6 +3158,107 @@ fn register_target_ref(
         map.insert(normalized, target_id.to_string());
     }
     Ok(())
+}
+
+fn target_connection_summary(configured: &StandaloneTargetProfile) -> String {
+    match configured.kind {
+        TargetKind::Ssh => {
+            let host = configured
+                .connection
+                .host
+                .as_deref()
+                .unwrap_or("<missing-host>");
+            let port = configured.connection.port.unwrap_or(22);
+            let username = configured
+                .connection
+                .username
+                .as_deref()
+                .unwrap_or("<missing-user>");
+            format!("ssh://{username}@{host}:{port}")
+        }
+        TargetKind::Adb => {
+            let serial = configured
+                .connection
+                .selector_value
+                .as_deref()
+                .unwrap_or("<auto>");
+            let selector_kind = configured
+                .connection
+                .selector_kind
+                .as_deref()
+                .unwrap_or("serial");
+            format!("adb({selector_kind}={serial})")
+        }
+        TargetKind::Serial => {
+            let device = configured
+                .connection
+                .selector_value
+                .as_deref()
+                .unwrap_or("/dev/tty.usbmodem0");
+            let baud_rate = configured
+                .connection
+                .selector_kind
+                .as_deref()
+                .unwrap_or("115200");
+            format!("serial({device}@{baud_rate})")
+        }
+        TargetKind::Docker => {
+            let container = configured
+                .connection
+                .selector_value
+                .as_deref()
+                .unwrap_or("container");
+            let context = configured
+                .connection
+                .selector_kind
+                .as_deref()
+                .unwrap_or("default");
+            format!("docker({container}, context={context})")
+        }
+        TargetKind::Other(ref value) => format!("custom({value})"),
+    }
+}
+
+fn mcp_target_descriptor_from_config(configured: &StandaloneTargetProfile) -> McpTargetDescriptor {
+    McpTargetDescriptor {
+        target_id: configured.id.clone(),
+        enabled: configured.enabled,
+        display_name: configured.display_name.clone(),
+        kind: configured.kind.clone(),
+        aliases: configured.aliases.clone(),
+        notes: configured.notes.clone(),
+        connection_summary: target_connection_summary(configured),
+    }
+}
+
+fn build_target_runtime_indexes(
+    settings: &CoreSettings,
+) -> Result<
+    (
+        HashMap<String, TargetProfile>,
+        HashMap<String, String>,
+        HashMap<String, McpTargetDescriptor>,
+    ),
+    CoreRuntimeError,
+> {
+    let mut profiles = HashMap::new();
+    let mut target_refs = HashMap::new();
+    let mut target_descriptors = HashMap::new();
+    for configured in &settings.targets {
+        let profile = to_target_profile(configured)?;
+        let target_id = profile.id.clone();
+        let descriptor = mcp_target_descriptor_from_config(configured);
+        if descriptor.enabled {
+            register_target_ref(&mut target_refs, &target_id, &target_id)?;
+            register_target_ref(&mut target_refs, &descriptor.display_name, &target_id)?;
+            for alias in &descriptor.aliases {
+                register_target_ref(&mut target_refs, alias, &target_id)?;
+            }
+        }
+        profiles.insert(target_id.clone(), profile);
+        target_descriptors.insert(target_id, descriptor);
+    }
+    Ok((profiles, target_refs, target_descriptors))
 }
 
 fn target_kind_label(kind: &TargetKind) -> String {
@@ -2671,10 +3312,9 @@ fn aggregate_health_state(statuses: &[CapabilityStatus]) -> &'static str {
         .any(|status| *status == CapabilityStatus::Unsupported)
     {
         "unsupported"
-    } else if statuses
-        .iter()
-        .any(|status| *status == CapabilityStatus::Degraded || *status == CapabilityStatus::Fallback)
-    {
+    } else if statuses.iter().any(|status| {
+        *status == CapabilityStatus::Degraded || *status == CapabilityStatus::Fallback
+    }) {
         "degraded"
     } else {
         "ready"
@@ -2838,7 +3478,8 @@ fn resolve_runtime_path_defaults(
         ));
     }
 
-    let runtime_paths = runtime_paths_adapter.runtime_paths(&settings.core.instance_name, &data_dir);
+    let runtime_paths =
+        runtime_paths_adapter.runtime_paths(&settings.core.instance_name, &data_dir);
     settings.core.data_dir = data_dir.to_string_lossy().to_string();
     settings.storage.metadata_path = resolve_path_with_host_default(
         &settings.storage.metadata_path,
@@ -3387,12 +4028,15 @@ fn handle_http_connection(
     runtime: &SharedRuntime,
 ) -> Result<(), CoreRuntimeError> {
     let (method, path, body) = read_http_request(stream, Some(runtime))?;
-    trace_mcp(Some(runtime), format!(
-        "http request method={} path={} body_len={}",
-        method,
-        path,
-        body.len()
-    ));
+    trace_mcp(
+        Some(runtime),
+        format!(
+            "http request method={} path={} body_len={}",
+            method,
+            path,
+            body.len()
+        ),
+    );
     let (status, content_type, response_body) = match (method.as_str(), path.as_str()) {
         ("GET", "/health") => {
             let runtime = runtime.lock().map_err(|_| CoreRuntimeError::LockPoisoned)?;
@@ -3486,14 +4130,17 @@ fn handle_http_connection(
         }
         _ => (404, "text/plain", "not found".to_string()),
     };
-    trace_mcp(Some(runtime), format!(
-        "http response method={} path={} status={} content_type={} body_len={}",
-        method,
-        path,
-        status,
-        content_type,
-        response_body.len()
-    ));
+    trace_mcp(
+        Some(runtime),
+        format!(
+            "http response method={} path={} status={} content_type={} body_len={}",
+            method,
+            path,
+            status,
+            content_type,
+            response_body.len()
+        ),
+    );
     write_http_response(stream, status, content_type, &response_body)
 }
 
@@ -3544,12 +4191,18 @@ fn handle_mcp_http_request(
             .and_then(|map| map.get("name"))
             .and_then(Value::as_str)
             .unwrap_or("<missing>");
-        trace_mcp(Some(runtime), format!(
-            "mcp request id={} method={} tool={}",
-            id_brief, method, tool_name
-        ));
+        trace_mcp(
+            Some(runtime),
+            format!(
+                "mcp request id={} method={} tool={}",
+                id_brief, method, tool_name
+            ),
+        );
     } else {
-        trace_mcp(Some(runtime), format!("mcp request id={} method={}", id_brief, method));
+        trace_mcp(
+            Some(runtime),
+            format!("mcp request id={} method={}", id_brief, method),
+        );
     }
     let params = request_value.get("params").cloned().unwrap_or(Value::Null);
 
@@ -3596,12 +4249,15 @@ fn handle_mcp_http_request(
         Ok(payload) => jsonrpc_success(id.clone(), payload),
         Err(error_body) => normalize_jsonrpc_error_id(error_body, &id),
     };
-    trace_mcp(Some(runtime), format!(
-        "mcp response id={} method={} body_len={}",
-        id_brief,
-        method,
-        response_body.len()
-    ));
+    trace_mcp(
+        Some(runtime),
+        format!(
+            "mcp response id={} method={} body_len={}",
+            id_brief,
+            method,
+            response_body.len()
+        ),
+    );
     Ok((200, "application/json", response_body))
 }
 
@@ -4162,38 +4818,87 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
                 .map_err(|message| jsonrpc_error(Value::Null, -32602, &message))?;
             let command = required_json_string(&arguments, "command")
                 .map_err(|message| jsonrpc_error(Value::Null, -32602, &message))?;
-            let outcome = runtime
-                .execute_target_command(target, context, command, None)
-                .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
-            let structured = json!({
-                "requested_target_ref": outcome.requested_target_ref,
-                "resolved_target_id": outcome.resolved_target_id,
-                "target_kind": outcome.target_kind,
-                "artifact_id": outcome.artifact_id,
-                "logical_session_id": outcome.logical_session_id,
-                "channel_id": outcome.channel_id,
-                "command": outcome.command,
-                "executed_command": outcome.executed_command,
-                "invocation": invocation_json(outcome.invocation.as_ref()),
-                "output": outcome.output
-            });
-            Ok(json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": format!(
-                            "executed on target={} (resolved={}) artifact={} logical_session={} channel={}",
-                            structured["requested_target_ref"].as_str().unwrap_or("unknown"),
-                            structured["resolved_target_id"].as_str().unwrap_or("unknown"),
-                            structured["artifact_id"].as_str().unwrap_or("unknown"),
-                            structured["logical_session_id"].as_str().unwrap_or("unknown"),
-                            structured["channel_id"].as_str().unwrap_or("unknown")
+            match runtime.resolve_target_for_mcp(target) {
+                TargetResolutionResult::Resolved(resolved) => {
+                    let profile = runtime
+                        .profiles
+                        .get(&resolved.resolved_target_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            jsonrpc_error(
+                                Value::Null,
+                                -32603,
+                                &format!(
+                                    "resolved target profile missing: {}",
+                                    resolved.resolved_target_id
+                                ),
+                            )
+                        })?;
+                    let outcome = runtime
+                        .execute_target_command_on_profile(
+                            resolved.requested_target_ref,
+                            profile,
+                            context,
+                            command,
+                            None,
                         )
-                    }
-                ],
-                "structuredContent": structured,
-                "isError": false
-            }))
+                        .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
+                    let structured = json!({
+                        "resolution_state": "resolved",
+                        "resolution_policy": runtime.target_resolution_policy.as_str(),
+                        "resolution_matched_via": resolved.matched_via,
+                        "requested_target_ref": outcome.requested_target_ref,
+                        "resolved_target_id": outcome.resolved_target_id,
+                        "target_kind": outcome.target_kind,
+                        "artifact_id": outcome.artifact_id,
+                        "logical_session_id": outcome.logical_session_id,
+                        "channel_id": outcome.channel_id,
+                        "command": outcome.command,
+                        "executed_command": outcome.executed_command,
+                        "invocation": invocation_json(outcome.invocation.as_ref()),
+                        "output": outcome.output
+                    });
+                    Ok(json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "executed on target={} (resolved={}) artifact={} logical_session={} channel={}",
+                                    structured["requested_target_ref"].as_str().unwrap_or("unknown"),
+                                    structured["resolved_target_id"].as_str().unwrap_or("unknown"),
+                                    structured["artifact_id"].as_str().unwrap_or("unknown"),
+                                    structured["logical_session_id"].as_str().unwrap_or("unknown"),
+                                    structured["channel_id"].as_str().unwrap_or("unknown")
+                                )
+                            }
+                        ],
+                        "structuredContent": structured,
+                        "isError": false
+                    }))
+                }
+                TargetResolutionResult::ConfirmationRequired(confirmation) => {
+                    let structured = runtime
+                        .confirmation_payload_json(&confirmation, "bridgingio.terminal.exec");
+                    Ok(json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "target confirmation required for input={}",
+                                    structured["requested_target_ref"].as_str().unwrap_or("unknown")
+                                )
+                            }
+                        ],
+                        "structuredContent": structured,
+                        "isError": false
+                    }))
+                }
+                TargetResolutionResult::NotFound(not_found) => Err(jsonrpc_error(
+                    Value::Null,
+                    -32603,
+                    &format!("target not found: {}", not_found.requested_target_ref),
+                )),
+            }
         }
         "bridgingio.artifacts.read" => {
             let artifact_id = required_json_string(&arguments, "artifact_id")
@@ -4376,40 +5081,87 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
         "bridgingio.terminal.shell.open" => {
             let target = required_json_string(&arguments, "target")
                 .map_err(|message| jsonrpc_error(Value::Null, -32602, &message))?;
-            let handle = runtime
-                .open_interactive_shell(target, context)
-                .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
-            let structured = json!({
-                "mode": "interactive_shell",
-                "shell_id": handle.shell_id,
-                "requested_target_ref": handle.requested_target_ref,
-                "resolved_target_id": handle.resolved_target_id,
-                "target_kind": handle.target_kind,
-                "logical_session_id": handle.logical_session_id,
-                "channel_id": handle.channel_id,
-                "prompt": handle.prompt,
-                "cwd": handle.cwd,
-                "launch_strategy": handle.launch_strategy,
-                "launch_fallback_applied": handle.launch_fallback_applied,
-                "launch_diagnostics": handle.launch_diagnostics,
-                "invocation": invocation_json(handle.invocation.as_ref())
-            });
-            Ok(json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": format!(
-                            "interactive shell opened shell_id={} target={} logical_session={} channel={}",
-                            structured["shell_id"].as_str().unwrap_or("unknown"),
-                            structured["resolved_target_id"].as_str().unwrap_or("unknown"),
-                            structured["logical_session_id"].as_str().unwrap_or("unknown"),
-                            structured["channel_id"].as_str().unwrap_or("unknown")
+            match runtime.resolve_target_for_mcp(target) {
+                TargetResolutionResult::Resolved(resolved) => {
+                    let profile = runtime
+                        .profiles
+                        .get(&resolved.resolved_target_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            jsonrpc_error(
+                                Value::Null,
+                                -32603,
+                                &format!(
+                                    "resolved target profile missing: {}",
+                                    resolved.resolved_target_id
+                                ),
+                            )
+                        })?;
+                    let handle = runtime
+                        .open_interactive_shell_with_profile(
+                            resolved.requested_target_ref,
+                            profile,
+                            context,
                         )
-                    }
-                ],
-                "structuredContent": structured,
-                "isError": false
-            }))
+                        .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
+                    let structured = json!({
+                        "resolution_state": "resolved",
+                        "resolution_policy": runtime.target_resolution_policy.as_str(),
+                        "resolution_matched_via": resolved.matched_via,
+                        "mode": "interactive_shell",
+                        "shell_id": handle.shell_id,
+                        "requested_target_ref": handle.requested_target_ref,
+                        "resolved_target_id": handle.resolved_target_id,
+                        "target_kind": handle.target_kind,
+                        "logical_session_id": handle.logical_session_id,
+                        "channel_id": handle.channel_id,
+                        "prompt": handle.prompt,
+                        "cwd": handle.cwd,
+                        "launch_strategy": handle.launch_strategy,
+                        "launch_fallback_applied": handle.launch_fallback_applied,
+                        "launch_diagnostics": handle.launch_diagnostics,
+                        "invocation": invocation_json(handle.invocation.as_ref())
+                    });
+                    Ok(json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "interactive shell opened shell_id={} target={} logical_session={} channel={}",
+                                    structured["shell_id"].as_str().unwrap_or("unknown"),
+                                    structured["resolved_target_id"].as_str().unwrap_or("unknown"),
+                                    structured["logical_session_id"].as_str().unwrap_or("unknown"),
+                                    structured["channel_id"].as_str().unwrap_or("unknown")
+                                )
+                            }
+                        ],
+                        "structuredContent": structured,
+                        "isError": false
+                    }))
+                }
+                TargetResolutionResult::ConfirmationRequired(confirmation) => {
+                    let structured = runtime
+                        .confirmation_payload_json(&confirmation, "bridgingio.terminal.shell.open");
+                    Ok(json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "target confirmation required for input={}",
+                                    structured["requested_target_ref"].as_str().unwrap_or("unknown")
+                                )
+                            }
+                        ],
+                        "structuredContent": structured,
+                        "isError": false
+                    }))
+                }
+                TargetResolutionResult::NotFound(not_found) => Err(jsonrpc_error(
+                    Value::Null,
+                    -32603,
+                    &format!("target not found: {}", not_found.requested_target_ref),
+                )),
+            }
         }
         "bridgingio.terminal.shell.write" => {
             let shell_id = required_json_string(&arguments, "shell_id")
@@ -4547,34 +5299,83 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
         "bridgingio.target.inspect_basic" => {
             let target = required_json_string(&arguments, "target")
                 .map_err(|message| jsonrpc_error(Value::Null, -32602, &message))?;
-            let result = runtime
-                .inspect_target_basic(target, context)
-                .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
-            let structured = json!({
-                "requested_target_ref": result.requested_target_ref,
-                "resolved_target_id": result.resolved_target_id,
-                "target_kind": result.target_kind,
-                "kernel_version": result.kernel_version,
-                "username": result.username,
-                "logical_session_id": result.logical_session_id,
-                "artifacts": result.artifacts,
-                "invocation": invocation_json(result.invocation.as_ref())
-            });
-            Ok(json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": format!(
-                            "target={} kernel_version={} username={}",
-                            structured["resolved_target_id"].as_str().unwrap_or("unknown"),
-                            structured["kernel_version"].as_str().unwrap_or("unknown"),
-                            structured["username"].as_str().unwrap_or("unknown")
+            match runtime.resolve_target_for_mcp(target) {
+                TargetResolutionResult::Resolved(resolved) => {
+                    let profile = runtime
+                        .profiles
+                        .get(&resolved.resolved_target_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            jsonrpc_error(
+                                Value::Null,
+                                -32603,
+                                &format!(
+                                    "resolved target profile missing: {}",
+                                    resolved.resolved_target_id
+                                ),
+                            )
+                        })?;
+                    let result = runtime
+                        .inspect_target_basic_with_profile(
+                            resolved.requested_target_ref,
+                            profile,
+                            context,
                         )
-                    }
-                ],
-                "structuredContent": structured,
-                "isError": false
-            }))
+                        .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
+                    let structured = json!({
+                        "resolution_state": "resolved",
+                        "resolution_policy": runtime.target_resolution_policy.as_str(),
+                        "resolution_matched_via": resolved.matched_via,
+                        "requested_target_ref": result.requested_target_ref,
+                        "resolved_target_id": result.resolved_target_id,
+                        "target_kind": result.target_kind,
+                        "kernel_version": result.kernel_version,
+                        "username": result.username,
+                        "logical_session_id": result.logical_session_id,
+                        "artifacts": result.artifacts,
+                        "invocation": invocation_json(result.invocation.as_ref())
+                    });
+                    Ok(json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "target={} kernel_version={} username={}",
+                                    structured["resolved_target_id"].as_str().unwrap_or("unknown"),
+                                    structured["kernel_version"].as_str().unwrap_or("unknown"),
+                                    structured["username"].as_str().unwrap_or("unknown")
+                                )
+                            }
+                        ],
+                        "structuredContent": structured,
+                        "isError": false
+                    }))
+                }
+                TargetResolutionResult::ConfirmationRequired(confirmation) => {
+                    let structured = runtime.confirmation_payload_json(
+                        &confirmation,
+                        "bridgingio.target.inspect_basic",
+                    );
+                    Ok(json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "target confirmation required for input={}",
+                                    structured["requested_target_ref"].as_str().unwrap_or("unknown")
+                                )
+                            }
+                        ],
+                        "structuredContent": structured,
+                        "isError": false
+                    }))
+                }
+                TargetResolutionResult::NotFound(not_found) => Err(jsonrpc_error(
+                    Value::Null,
+                    -32603,
+                    &format!("target not found: {}", not_found.requested_target_ref),
+                )),
+            }
         }
         _ => Err(jsonrpc_error(
             Value::Null,
@@ -4704,9 +5505,11 @@ fn trace_mcp(runtime: Option<&SharedRuntime>, message: impl AsRef<str>) {
             return;
         }
     }
-    detect_host_platform_adapter("trace")
-        .runtime_logger()
-        .log(RuntimeLogLevel::Trace, RuntimeLogCategory::Mcp, message.as_ref());
+    detect_host_platform_adapter("trace").runtime_logger().log(
+        RuntimeLogLevel::Trace,
+        RuntimeLogCategory::Mcp,
+        message.as_ref(),
+    );
 }
 
 fn mcp_trace_enabled() -> bool {
@@ -4802,7 +5605,8 @@ fn decode_network_text(runtime: Option<&SharedRuntime>, bytes: &[u8], surface: &
     if let Some(runtime) = runtime {
         if let Ok(locked) = runtime.lock() {
             let decoded = locked.host_platform_adapter.output_decoder().decode(bytes);
-            if decoded.used_fallback || decoded.had_replacement_char || decoded.normalized_newlines {
+            if decoded.used_fallback || decoded.had_replacement_char || decoded.normalized_newlines
+            {
                 locked.host_platform_adapter.runtime_logger().log(
                     RuntimeLogLevel::Warn,
                     RuntimeLogCategory::Decode,
@@ -4948,6 +5752,19 @@ mod tests {
         }
     }
 
+    fn settings_with_extra_targets(
+        policy: &str,
+        extra_targets: &str,
+    ) -> bridgingio_engine::CoreSettings {
+        let base = bridgingio_engine::CoreSettings::minimal_example().replace(
+            "mcp_target_resolution_policy = \"confirm_if_family\"",
+            &format!("mcp_target_resolution_policy = \"{policy}\""),
+        );
+        let merged = format!("{base}\n{extra_targets}");
+        bridgingio_engine::CoreSettings::from_toml_str(&merged)
+            .expect("parse settings with extra targets")
+    }
+
     #[test]
     fn returns_structured_capabilities_for_ssh_target() {
         let target = bridgingio_domain::TargetProfile {
@@ -5084,6 +5901,199 @@ mod tests {
         assert_eq!(runtime.settings_store.settings.schema_version, 1);
     }
 
+    #[test]
+    fn resolver_supports_multi_alias_relaxed_normalization_and_disabled_filtering() {
+        let root = temp_dir("resolver-multi-alias");
+        let settings = settings_with_extra_targets(
+            "confirm_if_family",
+            r#"
+[[targets]]
+id = "test-device"
+display_name = "Test Device"
+kind = "ssh"
+enabled = true
+aliases = ["test_alias", "device-a"]
+
+[targets.connection]
+host = "127.0.0.1"
+port = 22
+username = "dev"
+
+[targets.providers.terminal]
+enabled = true
+
+[[targets]]
+id = "legacy-device"
+display_name = "Legacy Device"
+kind = "ssh"
+enabled = false
+aliases = ["legacy"]
+
+[targets.connection]
+host = "127.0.0.1"
+port = 22
+username = "dev"
+
+[targets.providers.terminal]
+enabled = true
+"#,
+        );
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+
+        let alias_hit = runtime.resolve_target_for_mcp("test_alias");
+        assert!(matches!(
+            alias_hit,
+            super::TargetResolutionResult::Resolved(super::TargetResolutionResolved { ref resolved_target_id, .. })
+                if resolved_target_id == "test-device"
+        ));
+
+        let relaxed_hit = runtime.resolve_target_for_mcp("TEST DEVICE");
+        assert!(matches!(
+            relaxed_hit,
+            super::TargetResolutionResult::Resolved(super::TargetResolutionResolved { ref resolved_target_id, .. })
+                if resolved_target_id == "test-device"
+        ));
+
+        let disabled_hit = runtime.resolve_target_for_mcp("legacy");
+        assert!(matches!(
+            disabled_hit,
+            super::TargetResolutionResult::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn resolver_family_boundary_and_policy_branches_are_respected() {
+        let root = temp_dir("resolver-family-policy");
+        let settings = settings_with_extra_targets(
+            "confirm_if_family",
+            r#"
+[[targets]]
+id = "test"
+display_name = "Test"
+kind = "ssh"
+enabled = true
+aliases = []
+
+[targets.connection]
+host = "127.0.0.1"
+port = 22
+username = "dev"
+
+[targets.providers.terminal]
+enabled = true
+
+[[targets]]
+id = "test-1"
+display_name = "Test 1"
+kind = "ssh"
+enabled = true
+aliases = []
+
+[targets.connection]
+host = "127.0.0.1"
+port = 22
+username = "dev"
+
+[targets.providers.terminal]
+enabled = true
+
+[[targets]]
+id = "testlab"
+display_name = "Test Lab"
+kind = "ssh"
+enabled = true
+aliases = []
+
+[targets.connection]
+host = "127.0.0.1"
+port = 22
+username = "dev"
+
+[targets.providers.terminal]
+enabled = true
+"#,
+        );
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let confirmation = runtime.resolve_target_for_mcp("test");
+        match confirmation {
+            super::TargetResolutionResult::ConfirmationRequired(value) => {
+                assert_eq!(value.policy.as_str(), "confirm_if_family");
+                assert_eq!(
+                    value
+                        .exact_match
+                        .as_ref()
+                        .map(|item| item.target_id.as_str()),
+                    Some("test")
+                );
+                let candidate_ids = value
+                    .related_candidates
+                    .iter()
+                    .map(|item| item.target_id.as_str())
+                    .collect::<Vec<_>>();
+                assert!(candidate_ids.contains(&"test-1"));
+                assert!(!candidate_ids.contains(&"testlab"));
+            }
+            other => panic!("expected confirmation, got {other:?}"),
+        }
+
+        let settings = settings_with_extra_targets(
+            "auto_execute",
+            r#"
+[[targets]]
+id = "test"
+display_name = "Test"
+kind = "ssh"
+enabled = true
+aliases = []
+
+[targets.connection]
+host = "127.0.0.1"
+port = 22
+username = "dev"
+
+[targets.providers.terminal]
+enabled = true
+
+[[targets]]
+id = "test-1"
+display_name = "Test 1"
+kind = "ssh"
+enabled = true
+aliases = []
+
+[targets.connection]
+host = "127.0.0.1"
+port = 22
+username = "dev"
+
+[targets.providers.terminal]
+enabled = true
+"#,
+        );
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let resolved = runtime.resolve_target_for_mcp("test");
+        assert!(matches!(
+            resolved,
+            super::TargetResolutionResult::Resolved(super::TargetResolutionResolved { ref resolved_target_id, .. })
+                if resolved_target_id == "test"
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn ipc_and_http_can_bind_from_same_runtime() {
@@ -5195,9 +6205,10 @@ mod tests {
     #[test]
     fn structured_exec_invocation_uses_unified_pipeline() {
         let root = temp_dir("structured-exec-invocation");
-        let settings =
-            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
-                .expect("parse settings");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
         let resolver = super::ToolchainResolver::new(
             ExecutableResolver::with_search_paths(Vec::new()),
             &root,
@@ -5227,9 +6238,10 @@ mod tests {
     #[test]
     fn invocation_json_separates_host_runtime_and_target_terminal_dimensions() {
         let root = temp_dir("invocation-dimension-separation");
-        let settings =
-            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
-                .expect("parse settings");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
         let resolver = super::ToolchainResolver::new(
             ExecutableResolver::with_search_paths(Vec::new()),
             &root,
@@ -5263,9 +6275,10 @@ mod tests {
     #[test]
     fn target_terminal_shell_config_selects_future_dialect_with_deferred_semantics() {
         let root = temp_dir("target-shell-override");
-        let mut settings =
-            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
-                .expect("parse settings");
+        let mut settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
         let target = settings
             .targets
             .iter_mut()
@@ -5333,15 +6346,17 @@ exec /bin/sh -s
             perms.set_mode(0o755);
             fs::set_permissions(&ssh_mock, perms).expect("chmod ssh");
         }
-        let settings =
-            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
-                .expect("parse settings");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
         let resolver = super::ToolchainResolver::new(
             ExecutableResolver::with_search_paths(vec![root.clone()]),
             &root,
             Vec::new(),
         );
-        let mut runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
         let handle = runtime
             .open_interactive_shell(
                 "local",
@@ -5353,10 +6368,7 @@ exec /bin/sh -s
                 ),
             )
             .expect("open interactive shell");
-        assert_eq!(
-            handle.launch_strategy,
-            "structured_interactive_invocation"
-        );
+        assert_eq!(handle.launch_strategy, "structured_interactive_invocation");
         assert!(!handle.launch_fallback_applied);
         assert!(handle.launch_diagnostics.is_empty());
         let invocation = handle.invocation.expect("invocation");
@@ -5391,19 +6403,23 @@ exit 1
         .expect("write failing ssh");
         #[cfg(unix)]
         {
-            let mut perms = fs::metadata(&failing_ssh).expect("ssh metadata").permissions();
+            let mut perms = fs::metadata(&failing_ssh)
+                .expect("ssh metadata")
+                .permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&failing_ssh, perms).expect("chmod ssh");
         }
-        let settings =
-            bridgingio_engine::CoreSettings::from_toml_str(&bridgingio_engine::CoreSettings::minimal_example())
-                .expect("parse settings");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
         let resolver = super::ToolchainResolver::new(
             ExecutableResolver::with_search_paths(vec![root.clone()]),
             &root,
             Vec::new(),
         );
-        let mut runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
         let open_context = context(
             "agent-fb",
             "run-fb",
@@ -5495,10 +6511,7 @@ exit 1
 
         let mut text = bridgingio_engine::CoreSettings::complete_example().to_string();
         text = text.replace("__GLOBAL_ADB_OVERRIDE__", &global_adb.to_string_lossy());
-        text = text.replace(
-            "__TARGET_ADB_OVERRIDE__",
-            &target_adb.to_string_lossy(),
-        );
+        text = text.replace("__TARGET_ADB_OVERRIDE__", &target_adb.to_string_lossy());
         let config_path = root.join("managed-core.toml");
         fs::write(&config_path, text).expect("write config");
         let resolver = super::ToolchainResolver::new(
@@ -5639,10 +6652,7 @@ exit 1
 
         let mut text = bridgingio_engine::CoreSettings::complete_example().to_string();
         text = text.replace("__GLOBAL_ADB_OVERRIDE__", "");
-        text = text.replace(
-            "__TARGET_ADB_OVERRIDE__",
-            "",
-        );
+        text = text.replace("__TARGET_ADB_OVERRIDE__", "");
         let config_path = root.join("managed-core.toml");
         fs::write(&config_path, text).expect("write config");
         let resolver = super::ToolchainResolver::new(

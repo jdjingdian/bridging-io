@@ -152,7 +152,10 @@ pub trait LocalShellRuntime: Send + Sync {
     fn status(&self) -> CapabilityStatus;
     fn default_shell_label(&self) -> &'static str;
     fn launch_spec(&self, mode: ShellLaunchMode, command: Option<&str>) -> ShellLaunchSpec;
-    fn run_one_shot(&self, command: &str) -> Result<LocalShellOneShotOutput, LocalShellRuntimeError>;
+    fn run_one_shot(
+        &self,
+        command: &str,
+    ) -> Result<LocalShellOneShotOutput, LocalShellRuntimeError>;
     fn open_interactive_shell(
         &self,
         shell_id: &str,
@@ -479,7 +482,10 @@ impl LocalShellRuntime for UnixLocalShellRuntime {
         self.inner.launch_spec(mode, command)
     }
 
-    fn run_one_shot(&self, command: &str) -> Result<LocalShellOneShotOutput, LocalShellRuntimeError> {
+    fn run_one_shot(
+        &self,
+        command: &str,
+    ) -> Result<LocalShellOneShotOutput, LocalShellRuntimeError> {
         self.inner.run_one_shot(command)
     }
 
@@ -514,7 +520,8 @@ impl LocalShellRuntime for UnixLocalShellRuntime {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<String>, LocalShellRuntimeError> {
-        self.inner.read_interactive_transcript(shell_id, offset, limit)
+        self.inner
+            .read_interactive_transcript(shell_id, offset, limit)
     }
 
     fn interactive_shell_state(
@@ -581,7 +588,10 @@ impl LocalShellRuntime for WindowsLocalShellRuntime {
         self.inner.launch_spec(mode, command)
     }
 
-    fn run_one_shot(&self, command: &str) -> Result<LocalShellOneShotOutput, LocalShellRuntimeError> {
+    fn run_one_shot(
+        &self,
+        command: &str,
+    ) -> Result<LocalShellOneShotOutput, LocalShellRuntimeError> {
         self.inner.run_one_shot(command)
     }
 
@@ -616,7 +626,8 @@ impl LocalShellRuntime for WindowsLocalShellRuntime {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<String>, LocalShellRuntimeError> {
-        self.inner.read_interactive_transcript(shell_id, offset, limit)
+        self.inner
+            .read_interactive_transcript(shell_id, offset, limit)
     }
 
     fn interactive_shell_state(
@@ -683,7 +694,10 @@ impl LocalShellRuntime for UnsupportedLocalShellRuntime {
         self.inner.launch_spec(mode, command)
     }
 
-    fn run_one_shot(&self, command: &str) -> Result<LocalShellOneShotOutput, LocalShellRuntimeError> {
+    fn run_one_shot(
+        &self,
+        command: &str,
+    ) -> Result<LocalShellOneShotOutput, LocalShellRuntimeError> {
         self.inner.run_one_shot(command)
     }
 
@@ -718,7 +732,8 @@ impl LocalShellRuntime for UnsupportedLocalShellRuntime {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<String>, LocalShellRuntimeError> {
-        self.inner.read_interactive_transcript(shell_id, offset, limit)
+        self.inner
+            .read_interactive_transcript(shell_id, offset, limit)
     }
 
     fn interactive_shell_state(
@@ -760,7 +775,9 @@ impl LocalShellRuntime for UnsupportedLocalShellRuntime {
     }
 }
 
-fn runtime_snapshot_to_public(snapshot: InteractiveShellRuntimeSnapshot) -> LocalShellRuntimeSnapshot {
+fn runtime_snapshot_to_public(
+    snapshot: InteractiveShellRuntimeSnapshot,
+) -> LocalShellRuntimeSnapshot {
     LocalShellRuntimeSnapshot {
         shell_id: snapshot.shell_id,
         target_kind: snapshot.target_kind,
@@ -867,8 +884,10 @@ impl ControlPlaneTransport for WindowsControlPlaneTransport {
     fn lifecycle_semantics(&self) -> ControlPlaneLifecycleSemantics {
         ControlPlaneLifecycleSemantics {
             attach: "ui/host attach is expected to open a local named pipe handle",
-            request_response: "request/response over named pipe is deferred until windows server wiring lands",
-            lifecycle: "pipe endpoint naming is stable; full server lifecycle is deferred in this baseline",
+            request_response:
+                "request/response over named pipe is deferred until windows server wiring lands",
+            lifecycle:
+                "pipe endpoint naming is stable; full server lifecycle is deferred in this baseline",
         }
     }
 
@@ -948,8 +967,9 @@ impl ControlPlaneTransport for UnsupportedControlPlaneTransport {
             code: "transport.unsupported_host",
             status: CapabilityStatus::Unsupported,
             message: "control-plane transport is unsupported on unknown host platform".to_string(),
-            recovery_hint: "run on unix or windows host, or disable control-plane in standalone mode"
-                .to_string(),
+            recovery_hint:
+                "run on unix or windows host, or disable control-plane in standalone mode"
+                    .to_string(),
         }]
     }
 }
@@ -1330,9 +1350,9 @@ fn unknown_baseline_adapter(log_level: &str) -> BaselineHostPlatformAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_host_platform_adapter, named_pipe_endpoint, normalize_newlines, unix_baseline_adapter,
-        windows_baseline_adapter, CapabilityStatus, HostPlatform, HostPlatformAdapter, RuntimeLogCategory,
-        RuntimeLogLevel,
+        detect_host_platform_adapter, named_pipe_endpoint, normalize_newlines,
+        unix_baseline_adapter, windows_baseline_adapter, CapabilityStatus, HostPlatform,
+        HostPlatformAdapter, RuntimeLogCategory, RuntimeLogLevel,
     };
     use std::path::Path;
 
@@ -1370,16 +1390,18 @@ mod tests {
         let snapshot = adapter.snapshot();
         assert_eq!(snapshot.host_platform, HostPlatform::Unix);
         assert_eq!(snapshot.local_shell_runtime_status, CapabilityStatus::Ready);
-        assert_eq!(snapshot.control_plane_transport_status, CapabilityStatus::Ready);
         assert_eq!(
-            adapter.local_shell_runtime().default_shell_label(),
-            "sh"
+            snapshot.control_plane_transport_status,
+            CapabilityStatus::Ready
         );
+        assert_eq!(adapter.local_shell_runtime().default_shell_label(), "sh");
         let runtime_paths = adapter
             .runtime_paths()
             .runtime_paths("test-instance", Path::new("/tmp/bridgingio-platform-test"));
         assert!(
-            runtime_paths.control_plane_endpoint.ends_with("control-plane.sock"),
+            runtime_paths
+                .control_plane_endpoint
+                .ends_with("control-plane.sock"),
             "unexpected endpoint: {}",
             runtime_paths.control_plane_endpoint
         );
@@ -1391,11 +1413,11 @@ mod tests {
         let snapshot = adapter.snapshot();
         assert_eq!(snapshot.host_platform, HostPlatform::Windows);
         assert_eq!(snapshot.local_shell_runtime_status, CapabilityStatus::Ready);
-        assert_eq!(snapshot.control_plane_transport_status, CapabilityStatus::Degraded);
         assert_eq!(
-            adapter.local_shell_runtime().default_shell_label(),
-            "cmd"
+            snapshot.control_plane_transport_status,
+            CapabilityStatus::Degraded
         );
+        assert_eq!(adapter.local_shell_runtime().default_shell_label(), "cmd");
         assert_eq!(snapshot.native_vault_status, CapabilityStatus::Degraded);
         assert_eq!(
             adapter.control_plane_transport().transport_kind(),

@@ -409,6 +409,7 @@ pub struct PolicyDefaultsSection {
     pub reuse_policy: SessionReusePolicy,
     pub approval_mode: String,
     pub capture_env_fingerprint: bool,
+    pub mcp_target_resolution_policy: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -581,6 +582,7 @@ impl CoreSettings {
             reuse_policy: SessionReusePolicy::ResumeOrCreate,
             approval_mode: "on-risk".into(),
             capture_env_fingerprint: true,
+            mcp_target_resolution_policy: "confirm_if_family".into(),
         };
         let mut targets = Vec::<StandaloneTargetProfile>::new();
 
@@ -757,6 +759,10 @@ impl CoreSettings {
                     "approval_mode" => policies.approval_mode = parse_string(key, value)?,
                     "capture_env_fingerprint" => {
                         policies.capture_env_fingerprint = parse_bool(key, value)?
+                    }
+                    "mcp_target_resolution_policy" => {
+                        policies.mcp_target_resolution_policy =
+                            parse_mcp_target_resolution_policy(value)?;
                     }
                     _ => return Err(invalid_field(key, "policies.defaults")),
                 },
@@ -996,6 +1002,19 @@ impl CoreSettings {
             }
         }
 
+        if !matches!(
+            self.policies.mcp_target_resolution_policy.as_str(),
+            "auto_execute" | "confirm_if_family" | "confirm_if_related" | "confirm_always"
+        ) {
+            return Err(ConfigError::InvalidValue {
+                field: "policies.defaults.mcp_target_resolution_policy".into(),
+                reason: format!(
+                    "unsupported mcp target resolution policy: {}",
+                    self.policies.mcp_target_resolution_policy
+                ),
+            });
+        }
+
         Ok(())
     }
 
@@ -1068,6 +1087,11 @@ impl CoreSettings {
             ConfigFieldDescription {
                 path: "policies.defaults.reuse_policy",
                 description: "逻辑会话复用策略。",
+            },
+            ConfigFieldDescription {
+                path: "policies.defaults.mcp_target_resolution_policy",
+                description:
+                    "MCP target 解析策略，支持 auto_execute/confirm_if_family/confirm_if_related/confirm_always。",
             },
             ConfigFieldDescription {
                 path: "targets[].credential_ref",
@@ -1157,6 +1181,10 @@ impl CoreSettings {
             format!(
                 "capture_env_fingerprint = {}",
                 self.policies.capture_env_fingerprint
+            ),
+            format!(
+                "mcp_target_resolution_policy = {}",
+                toml_quote(&self.policies.mcp_target_resolution_policy)
             ),
             String::new(),
         ];
@@ -1420,6 +1448,17 @@ fn parse_reuse_policy(value: &str) -> Result<SessionReusePolicy, ConfigError> {
     }
 }
 
+fn parse_mcp_target_resolution_policy(value: &str) -> Result<String, ConfigError> {
+    let raw = parse_string("policies.defaults.mcp_target_resolution_policy", value)?;
+    match raw.as_str() {
+        "auto_execute" | "confirm_if_family" | "confirm_if_related" | "confirm_always" => Ok(raw),
+        _ => Err(ConfigError::InvalidValue {
+            field: "policies.defaults.mcp_target_resolution_policy".into(),
+            reason: format!("unsupported mcp target resolution policy: {raw}"),
+        }),
+    }
+}
+
 fn is_sensitive_key(key: &str) -> bool {
     let lowered = key.to_ascii_lowercase();
     lowered.contains("password")
@@ -1563,15 +1602,16 @@ mod tests {
             SessionReusePolicy::ReuseIfAlive,
             now,
         );
-        let transport = store.open_transport_session(
-            &logical.logical_session_id,
-            "target-1",
-            TargetKind::Ssh,
-            Some("/usr/bin/ssh".into()),
-            Some("system_path".into()),
-            now,
-        )
-        .expect("open transport session");
+        let transport = store
+            .open_transport_session(
+                &logical.logical_session_id,
+                "target-1",
+                TargetKind::Ssh,
+                Some("/usr/bin/ssh".into()),
+                Some("system_path".into()),
+                now,
+            )
+            .expect("open transport session");
 
         let command_channel = store.open_channel(
             &logical.logical_session_id,
@@ -1747,6 +1787,10 @@ mod config_tests {
         assert_eq!(config.model_plane.http.port, 19718);
         assert_eq!(config.storage.artifacts.backend, "memory");
         assert_eq!(config.targets.len(), 1);
+        assert_eq!(
+            config.policies.mcp_target_resolution_policy,
+            "confirm_if_family"
+        );
     }
 
     #[test]
@@ -1769,6 +1813,10 @@ mod config_tests {
         );
         assert_eq!(config.model_plane.http.host, "127.0.0.1");
         assert_eq!(config.storage.artifacts.backend, "filesystem");
+        assert_eq!(
+            config.policies.mcp_target_resolution_policy,
+            "confirm_if_family"
+        );
     }
 
     #[test]
@@ -1855,5 +1903,15 @@ mod config_tests {
         invalid = invalid.replace("allow_non_loopback = false", "allow_non_loopback = true");
         let err = CoreSettings::from_toml_str(&invalid).expect_err("must require auth");
         assert!(matches!(err, ConfigError::NonLoopbackAuthRequired(_)));
+    }
+
+    #[test]
+    fn rejects_unknown_mcp_target_resolution_policy() {
+        let invalid = CoreSettings::minimal_example().replace(
+            "mcp_target_resolution_policy = \"confirm_if_family\"",
+            "mcp_target_resolution_policy = \"unknown\"",
+        );
+        let err = CoreSettings::from_toml_str(&invalid).expect_err("must reject unknown policy");
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
 }

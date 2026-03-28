@@ -229,7 +229,8 @@ impl TerminalProvider {
             launch_diagnostics,
         };
 
-        self.interactive_contexts.insert(shell_id.clone(), context.clone());
+        self.interactive_contexts
+            .insert(shell_id.clone(), context.clone());
         Ok(runtime_state_to_provider_state(context, snapshot))
     }
 
@@ -340,7 +341,10 @@ impl TerminalProvider {
             .map_err(runtime_error_to_provider_error)
     }
 
-    fn ensure_shell_context(&self, shell_id: &str) -> Result<&InteractiveShellContext, ProviderError> {
+    fn ensure_shell_context(
+        &self,
+        shell_id: &str,
+    ) -> Result<&InteractiveShellContext, ProviderError> {
         self.interactive_contexts
             .get(shell_id)
             .ok_or_else(|| ProviderError {
@@ -426,7 +430,9 @@ fn open_runtime_snapshot_with_launch_fallback(
     }
 }
 
-fn runtime_error_to_provider_error(err: bridgingio_platform::LocalShellRuntimeError) -> ProviderError {
+fn runtime_error_to_provider_error(
+    err: bridgingio_platform::LocalShellRuntimeError,
+) -> ProviderError {
     ProviderError {
         message: err.message,
     }
@@ -672,10 +678,19 @@ mod tests {
         assert_eq!(diagnostics.api_layering.startup, "open_interactive_shell");
         assert_eq!(diagnostics.api_layering.write, "write_interactive_shell");
         assert_eq!(diagnostics.api_layering.read, "read_interactive_transcript");
-        assert_eq!(diagnostics.api_layering.state_query, "interactive_shell_state");
-        assert_eq!(diagnostics.api_layering.interrupt, "interrupt_interactive_shell");
+        assert_eq!(
+            diagnostics.api_layering.state_query,
+            "interactive_shell_state"
+        );
+        assert_eq!(
+            diagnostics.api_layering.interrupt,
+            "interrupt_interactive_shell"
+        );
         assert_eq!(diagnostics.api_layering.close, "close_interactive_shell");
-        assert_eq!(diagnostics.api_layering.diagnostics, "interactive_shell_diagnostics");
+        assert_eq!(
+            diagnostics.api_layering.diagnostics,
+            "interactive_shell_diagnostics"
+        );
     }
 
     #[cfg(unix)]

@@ -144,7 +144,9 @@ impl TerminalConcurrencyPolicy {
 
 pub fn default_terminal_target_family_for_kind(kind: &TargetKind) -> Option<TerminalTargetFamily> {
     match kind {
-        TargetKind::Ssh | TargetKind::Adb | TargetKind::Serial => Some(TerminalTargetFamily::Terminal),
+        TargetKind::Ssh | TargetKind::Adb | TargetKind::Serial => {
+            Some(TerminalTargetFamily::Terminal)
+        }
         _ => None,
     }
 }
@@ -170,7 +172,9 @@ pub fn default_terminal_concurrency_policy_for_kind(
     }
 }
 
-pub fn terminal_concurrency_policy_for(target: &TargetProfile) -> Option<TerminalConcurrencyPolicy> {
+pub fn terminal_concurrency_policy_for(
+    target: &TargetProfile,
+) -> Option<TerminalConcurrencyPolicy> {
     if let Some(policy) = target
         .metadata
         .get(TARGET_TERMINAL_CONCURRENCY_METADATA_KEY)
@@ -505,17 +509,18 @@ mod tests {
 
     #[test]
     fn terminal_family_and_concurrency_defaults_follow_target_kind() {
-        let make_target = |id: &str, kind: TargetKind, connection: ConnectionConfig| TargetProfile {
-            id: id.into(),
-            name: id.into(),
-            kind,
-            connection,
-            credential_ref: None,
-            default_policy: PolicyProfile::default(),
-            notes: None,
-            metadata: MetadataMap::new(),
-            toolchains: MetadataMap::new(),
-        };
+        let make_target =
+            |id: &str, kind: TargetKind, connection: ConnectionConfig| TargetProfile {
+                id: id.into(),
+                name: id.into(),
+                kind,
+                connection,
+                credential_ref: None,
+                default_policy: PolicyProfile::default(),
+                notes: None,
+                metadata: MetadataMap::new(),
+                toolchains: MetadataMap::new(),
+            };
 
         let ssh = make_target(
             "t-ssh",

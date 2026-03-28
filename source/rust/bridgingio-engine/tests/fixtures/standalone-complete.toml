@@ -46,6 +46,7 @@ prefer_builtin_fallback = true
 reuse_policy = "resume_or_create"
 approval_mode = "on-risk"
 capture_env_fingerprint = true
+mcp_target_resolution_policy = "confirm_if_family"
 
 [[targets]]
 id = "lab-ssh-01"

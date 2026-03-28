@@ -710,7 +710,8 @@ fn run_core(
 
     #[cfg(not(unix))]
     if settings.control_plane.enabled {
-        let endpoint_semantics = transport.endpoint_semantics(&settings.core.instance_name, &runtime_paths);
+        let endpoint_semantics =
+            transport.endpoint_semantics(&settings.core.instance_name, &runtime_paths);
         let message = format!(
             "control-plane transport is not wired on this build (kind={}, endpoint={}, naming_rule={})",
             transport.transport_kind(),

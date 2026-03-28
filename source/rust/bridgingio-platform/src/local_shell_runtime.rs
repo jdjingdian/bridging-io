@@ -83,7 +83,11 @@ impl BaselineLocalShellRuntime {
         self.shell_label
     }
 
-    pub(crate) fn launch_spec(&self, mode: ShellLaunchMode, command: Option<&str>) -> ShellLaunchSpec {
+    pub(crate) fn launch_spec(
+        &self,
+        mode: ShellLaunchMode,
+        command: Option<&str>,
+    ) -> ShellLaunchSpec {
         match self.host_platform {
             HostPlatform::Windows => windows_launch_spec(mode, command),
             _ => unix_launch_spec(mode, command),
@@ -405,7 +409,11 @@ impl BaselineLocalShellRuntime {
         shell_id: &str,
     ) -> Result<InteractiveShellDiagnostics, LocalShellRuntimeError> {
         let snapshot = self.interactive_shell_state(shell_id)?;
-        Ok(build_diagnostics(self.host_platform, self.shell_label, &snapshot))
+        Ok(build_diagnostics(
+            self.host_platform,
+            self.shell_label,
+            &snapshot,
+        ))
     }
 
     pub(crate) fn semantics(&self) -> InteractiveShellSemantics {
@@ -484,7 +492,8 @@ fn spawn_interactive_pipe_process(
     runtime: &BaselineLocalShellRuntime,
     launch_command: Option<&str>,
 ) -> Result<InteractiveShellProcess, LocalShellRuntimeError> {
-    let mut command = command_from_spec(runtime.launch_spec(ShellLaunchMode::Interactive, launch_command));
+    let mut command =
+        command_from_spec(runtime.launch_spec(ShellLaunchMode::Interactive, launch_command));
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -739,7 +748,9 @@ fn refresh_runtime_shell_state(
     Ok(passthrough)
 }
 
-fn snapshot_to_public(snapshot: InteractiveShellRuntimeSnapshot) -> crate::LocalShellRuntimeSnapshot {
+fn snapshot_to_public(
+    snapshot: InteractiveShellRuntimeSnapshot,
+) -> crate::LocalShellRuntimeSnapshot {
     crate::LocalShellRuntimeSnapshot {
         shell_id: snapshot.shell_id,
         target_kind: snapshot.target_kind,
@@ -783,9 +794,7 @@ fn build_probe(shell_label: &str) -> RuntimeStateProbe {
     let done_marker = "__BRIDGINGIO_STATE_DONE__".to_string();
 
     let command = if shell_label.eq_ignore_ascii_case("cmd") {
-        format!(
-            "echo {cwd_start} & cd & echo {cwd_end} & echo {env_start} & set & echo {env_end}"
-        )
+        format!("echo {cwd_start} & cd & echo {cwd_end} & echo {env_start} & set & echo {env_end}")
     } else {
         format!(
             "printf '%s\\n' {} ; pwd ; printf '%s\\n' {} ; printf '%s\\n' {} ; env ; printf '%s\\n' {}",
@@ -858,17 +867,21 @@ fn write_bytes_to_interactive_process(
     bytes: &[u8],
 ) -> Result<(), LocalShellRuntimeError> {
     match &mut process.writer {
-        InteractiveShellWriter::Pipe(stdin) => stdin.write_all(bytes).map_err(|err| {
-            LocalShellRuntimeError {
-                message: format!("failed to write command to interactive shell: {err}"),
-            }
-        }),
+        InteractiveShellWriter::Pipe(stdin) => {
+            stdin
+                .write_all(bytes)
+                .map_err(|err| LocalShellRuntimeError {
+                    message: format!("failed to write command to interactive shell: {err}"),
+                })
+        }
         #[cfg(unix)]
-        InteractiveShellWriter::Pty(master) => master.write_all(bytes).map_err(|err| {
-            LocalShellRuntimeError {
-                message: format!("failed to write command to PTY interactive shell: {err}"),
-            }
-        }),
+        InteractiveShellWriter::Pty(master) => {
+            master
+                .write_all(bytes)
+                .map_err(|err| LocalShellRuntimeError {
+                    message: format!("failed to write command to PTY interactive shell: {err}"),
+                })
+        }
     }
 }
 
@@ -876,15 +889,17 @@ fn flush_interactive_process_writer(
     process: &mut InteractiveShellProcess,
 ) -> Result<(), LocalShellRuntimeError> {
     match &mut process.writer {
-        InteractiveShellWriter::Pipe(stdin) => stdin.flush().map_err(|err| LocalShellRuntimeError {
-            message: format!("failed to flush interactive shell stdin: {err}"),
-        }),
+        InteractiveShellWriter::Pipe(stdin) => {
+            stdin.flush().map_err(|err| LocalShellRuntimeError {
+                message: format!("failed to flush interactive shell stdin: {err}"),
+            })
+        }
         #[cfg(unix)]
-        InteractiveShellWriter::Pty(master) => master.flush().map_err(|err| {
-            LocalShellRuntimeError {
+        InteractiveShellWriter::Pty(master) => {
+            master.flush().map_err(|err| LocalShellRuntimeError {
                 message: format!("failed to flush PTY interactive shell writer: {err}"),
-            }
-        }),
+            })
+        }
     }
 }
 
@@ -944,7 +959,9 @@ fn push_output_line(output_lines: &Arc<Mutex<Vec<String>>>, prefix: &str, line: 
 }
 
 #[cfg(unix)]
-fn initialize_pty_session(process: &mut InteractiveShellProcess) -> Result<(), LocalShellRuntimeError> {
+fn initialize_pty_session(
+    process: &mut InteractiveShellProcess,
+) -> Result<(), LocalShellRuntimeError> {
     write_bytes_to_interactive_process(process, b"stty -echo 2>/dev/null || true\n")?;
     flush_interactive_process_writer(process)?;
     write_bytes_to_interactive_process(process, b"export PS1=''\n")?;
@@ -993,7 +1010,9 @@ extern "C" {
 }
 
 #[cfg(unix)]
-fn send_interrupt_signal(process: &mut InteractiveShellProcess) -> Result<(), LocalShellRuntimeError> {
+fn send_interrupt_signal(
+    process: &mut InteractiveShellProcess,
+) -> Result<(), LocalShellRuntimeError> {
     if process.backend == InteractiveShellBackendKind::Pty {
         write_bytes_to_interactive_process(process, &[0x03])?;
         flush_interactive_process_writer(process)?;
@@ -1017,7 +1036,9 @@ fn send_interrupt_signal(process: &mut InteractiveShellProcess) -> Result<(), Lo
 }
 
 #[cfg(not(unix))]
-fn send_interrupt_signal(process: &mut InteractiveShellProcess) -> Result<(), LocalShellRuntimeError> {
+fn send_interrupt_signal(
+    process: &mut InteractiveShellProcess,
+) -> Result<(), LocalShellRuntimeError> {
     process.child.kill().map_err(|err| LocalShellRuntimeError {
         message: format!("failed to send interrupt signal: {err}"),
     })

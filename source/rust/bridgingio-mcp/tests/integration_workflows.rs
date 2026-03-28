@@ -12,12 +12,12 @@ use bridgingio_connectors::{
     BuiltInBinarySpec, BuiltInDistributionKind, ExecutableResolver, ToolchainResolver,
 };
 use bridgingio_domain::{SessionReusePolicy, TargetKind};
+#[cfg(unix)]
+use bridgingio_mcp::{ControlPlaneIpcClient, ControlPlaneIpcServer};
 use bridgingio_mcp::{
     CoreHostMode, CoreRuntimeError, McpToolHandler, ModelPlaneHttpServer, StandaloneCoreRuntime,
     ToolRequest, ToolRequestContext, ToolResult,
 };
-#[cfg(unix)]
-use bridgingio_mcp::{ControlPlaneIpcClient, ControlPlaneIpcServer};
 use bridgingio_platform::{detect_host_platform_adapter, HostPlatform};
 use bridgingio_policy::OperationKind;
 use serde_json::{json, Value};
@@ -1148,14 +1148,12 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
         payload["result"]["structuredContent"]["closed"].as_bool(),
         Some(false)
     );
-    assert!(lines
-        .iter()
-        .any(|line| {
-            line.as_str()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .contains(&cwd_hint)
-        }));
+    assert!(lines.iter().any(|line| {
+        line.as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains(&cwd_hint)
+    }));
 
     let addr = http_server.local_addr().expect("http addr");
     let cross_scope_read = json!({
@@ -1388,6 +1386,209 @@ fn validates_interactive_shell_long_running_interrupt_flow() {
 }
 
 #[test]
+fn validates_target_confirmation_is_side_effect_free_across_tools() {
+    let root = temp_dir("mcp-target-confirmation");
+    let config_text = format!(
+        "{}\n\n[[targets]]\nid = \"test\"\ndisplay_name = \"Test\"\nkind = \"ssh\"\nenabled = true\naliases = []\n\n[targets.connection]\nhost = \"127.0.0.1\"\nport = 22\nusername = \"dev\"\n\n[targets.providers.terminal]\nenabled = true\n\n[[targets]]\nid = \"test-1\"\ndisplay_name = \"Test 1\"\nkind = \"ssh\"\nenabled = true\naliases = []\n\n[targets.connection]\nhost = \"127.0.0.1\"\nport = 22\nusername = \"dev\"\n\n[targets.providers.terminal]\nenabled = true\n\n[[targets]]\nid = \"testlab\"\ndisplay_name = \"Test Lab\"\nkind = \"ssh\"\nenabled = true\naliases = []\n\n[targets.connection]\nhost = \"127.0.0.1\"\nport = 22\nusername = \"dev\"\n\n[targets.providers.terminal]\nenabled = true\n\n[[targets]]\nid = \"test-device\"\ndisplay_name = \"Test Device\"\nkind = \"ssh\"\nenabled = true\naliases = []\n\n[targets.connection]\nhost = \"127.0.0.1\"\nport = 22\nusername = \"dev\"\n\n[targets.providers.terminal]\nenabled = true\n",
+        bridgingio_engine::CoreSettings::minimal_example().replace("port = 19718", "port = 0")
+    );
+    let settings =
+        bridgingio_engine::CoreSettings::from_toml_str(&config_text).expect("parse config");
+    let runtime = StandaloneCoreRuntime::from_settings(settings.clone(), toolchain_resolver(&root))
+        .expect("runtime")
+        .shared();
+    let http_server = ModelPlaneHttpServer::bind(runtime.clone(), &settings).expect("bind http");
+
+    let addr = http_server.local_addr().expect("http addr");
+    let confirm_exec = json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "tools/call",
+        "params": {
+            "name": "bridgingio.terminal.exec",
+            "arguments": {
+                "target": "test",
+                "command": command_ok(),
+                "agent_id": "agent-c",
+                "run_id": "run-c",
+                "client_session_id": "client-c",
+                "reuse_policy": "reuse_if_alive"
+            }
+        }
+    });
+    let confirm_exec_client = thread::spawn(move || post_json(addr, "/mcp", &confirm_exec));
+    http_server.serve_once().expect("serve confirm exec");
+    let (_, body) = parse_http_response(&confirm_exec_client.join().expect("join confirm exec"));
+    let payload: Value = serde_json::from_str(&body).expect("confirm exec json");
+    assert_eq!(
+        payload["result"]["structuredContent"]["resolution_state"].as_str(),
+        Some("confirmation_required")
+    );
+    assert_eq!(
+        payload["result"]["structuredContent"]["exact_match"]["canonical_target_id"].as_str(),
+        Some("test")
+    );
+    let related_ids = payload["result"]["structuredContent"]["related_candidates"]
+        .as_array()
+        .expect("related candidates")
+        .iter()
+        .filter_map(|item| item["canonical_target_id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(related_ids.contains(&"test-1"));
+    assert!(!related_ids.contains(&"testlab"));
+
+    let addr = http_server.local_addr().expect("http addr");
+    let confirm_shell_open = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "tools/call",
+        "params": {
+            "name": "bridgingio.terminal.shell.open",
+            "arguments": {
+                "target": "test",
+                "agent_id": "agent-c",
+                "run_id": "run-c",
+                "client_session_id": "client-c",
+                "reuse_policy": "reuse_if_alive"
+            }
+        }
+    });
+    let confirm_shell_client = thread::spawn(move || post_json(addr, "/mcp", &confirm_shell_open));
+    http_server.serve_once().expect("serve confirm shell");
+    let (_, body) = parse_http_response(&confirm_shell_client.join().expect("join confirm shell"));
+    let payload: Value = serde_json::from_str(&body).expect("confirm shell json");
+    assert_eq!(
+        payload["result"]["structuredContent"]["resolution_state"].as_str(),
+        Some("confirmation_required")
+    );
+    assert!(payload["result"]["structuredContent"]["shell_id"].is_null());
+
+    let addr = http_server.local_addr().expect("http addr");
+    let confirm_inspect = json!({
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "tools/call",
+        "params": {
+            "name": "bridgingio.target.inspect_basic",
+            "arguments": {
+                "target": "test",
+                "agent_id": "agent-c",
+                "run_id": "run-c",
+                "client_session_id": "client-c",
+                "reuse_policy": "reuse_if_alive"
+            }
+        }
+    });
+    let confirm_inspect_client = thread::spawn(move || post_json(addr, "/mcp", &confirm_inspect));
+    http_server.serve_once().expect("serve confirm inspect");
+    let (_, body) =
+        parse_http_response(&confirm_inspect_client.join().expect("join confirm inspect"));
+    let payload: Value = serde_json::from_str(&body).expect("confirm inspect json");
+    assert_eq!(
+        payload["result"]["structuredContent"]["resolution_state"].as_str(),
+        Some("confirmation_required")
+    );
+
+    let addr = http_server.local_addr().expect("http addr");
+    let confirm_typo = json!({
+        "jsonrpc": "2.0",
+        "id": 44,
+        "method": "tools/call",
+        "params": {
+            "name": "bridgingio.terminal.exec",
+            "arguments": {
+                "target": "test-devics",
+                "command": command_ok(),
+                "agent_id": "agent-c",
+                "run_id": "run-c",
+                "client_session_id": "client-c",
+                "reuse_policy": "reuse_if_alive"
+            }
+        }
+    });
+    let confirm_typo_client = thread::spawn(move || post_json(addr, "/mcp", &confirm_typo));
+    http_server.serve_once().expect("serve confirm typo");
+    let (_, body) = parse_http_response(&confirm_typo_client.join().expect("join confirm typo"));
+    let payload: Value = serde_json::from_str(&body).expect("confirm typo json");
+    assert_eq!(
+        payload["result"]["structuredContent"]["resolution_state"].as_str(),
+        Some("confirmation_required")
+    );
+    let related_ids = payload["result"]["structuredContent"]["related_candidates"]
+        .as_array()
+        .expect("related candidates")
+        .iter()
+        .filter_map(|item| item["canonical_target_id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(related_ids.contains(&"test-device"));
+
+    let runtime = runtime.lock().expect("runtime lock");
+    assert_eq!(runtime.logical_session_count(), 0);
+    assert!(runtime.tool_handler.metadata().logical_sessions.is_empty());
+    assert!(runtime
+        .tool_handler
+        .metadata()
+        .transport_sessions
+        .is_empty());
+    assert!(runtime.tool_handler.metadata().channels.is_empty());
+    assert!(runtime.tool_handler.metadata().artifacts.is_empty());
+}
+
+#[test]
+fn validates_auto_execute_policy_allows_exact_execution_with_family_candidates() {
+    let root = temp_dir("mcp-target-auto-execute");
+    let config_text = format!(
+        "{}\n\n[[targets]]\nid = \"test\"\ndisplay_name = \"Test\"\nkind = \"ssh\"\nenabled = true\naliases = []\n\n[targets.connection]\nhost = \"127.0.0.1\"\nport = 22\nusername = \"dev\"\n\n[targets.providers.terminal]\nenabled = true\n\n[[targets]]\nid = \"test-1\"\ndisplay_name = \"Test 1\"\nkind = \"ssh\"\nenabled = true\naliases = []\n\n[targets.connection]\nhost = \"127.0.0.1\"\nport = 22\nusername = \"dev\"\n\n[targets.providers.terminal]\nenabled = true\n",
+        bridgingio_engine::CoreSettings::minimal_example()
+            .replace("port = 19718", "port = 0")
+            .replace(
+                "mcp_target_resolution_policy = \"confirm_if_family\"",
+                "mcp_target_resolution_policy = \"auto_execute\"",
+            )
+    );
+    let settings =
+        bridgingio_engine::CoreSettings::from_toml_str(&config_text).expect("parse config");
+    let runtime = StandaloneCoreRuntime::from_settings(settings.clone(), toolchain_resolver(&root))
+        .expect("runtime")
+        .shared();
+    let http_server = ModelPlaneHttpServer::bind(runtime, &settings).expect("bind http");
+
+    let addr = http_server.local_addr().expect("http addr");
+    let call_exec = json!({
+        "jsonrpc": "2.0",
+        "id": 45,
+        "method": "tools/call",
+        "params": {
+            "name": "bridgingio.terminal.exec",
+            "arguments": {
+                "target": "test",
+                "command": command_ok(),
+                "agent_id": "agent-auto",
+                "run_id": "run-auto",
+                "client_session_id": "client-auto",
+                "reuse_policy": "reuse_if_alive"
+            }
+        }
+    });
+    let call_client = thread::spawn(move || post_json(addr, "/mcp", &call_exec));
+    http_server.serve_once().expect("serve auto execute");
+    let (_, body) = parse_http_response(&call_client.join().expect("join auto execute"));
+    let payload: Value = serde_json::from_str(&body).expect("auto execute json");
+    assert_eq!(
+        payload["result"]["structuredContent"]["resolution_state"].as_str(),
+        Some("resolved")
+    );
+    assert_eq!(
+        payload["result"]["structuredContent"]["resolved_target_id"].as_str(),
+        Some("test")
+    );
+    assert!(payload["result"]["structuredContent"]["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("ok"));
+}
+
+#[test]
 fn validates_platform_matrix_contract_for_transport_paths_and_toolchain_fallback() {
     let root = temp_dir("platform-matrix-contract");
     let bundled_root = root.join("bundled");
@@ -1440,8 +1641,14 @@ fn validates_platform_matrix_contract_for_transport_paths_and_toolchain_fallback
             .expect("adb diagnostics for android-emulator"),
         other => panic!("unexpected diagnostics response: {other:?}"),
     };
-    assert_eq!(adb_diag.effective_scope.as_deref(), Some("builtin_fallback"));
-    assert_eq!(adb_diag.effective_source.as_deref(), Some("builtin_fallback"));
+    assert_eq!(
+        adb_diag.effective_scope.as_deref(),
+        Some("builtin_fallback")
+    );
+    assert_eq!(
+        adb_diag.effective_source.as_deref(),
+        Some("builtin_fallback")
+    );
 
     let adapter = detect_host_platform_adapter("info");
     let runtime_root = root.join("runtime-root");
@@ -1453,7 +1660,10 @@ fn validates_platform_matrix_contract_for_transport_paths_and_toolchain_fallback
         .control_plane_transport()
         .endpoint_semantics("bridgingio-matrix", &runtime_paths)
         .endpoint;
-    assert!(!endpoint.is_empty(), "transport endpoint should not be empty");
+    assert!(
+        !endpoint.is_empty(),
+        "transport endpoint should not be empty"
+    );
     match adapter.host_platform() {
         HostPlatform::Windows => assert!(
             endpoint.starts_with(r"\\.\pipe\bridgingio-"),

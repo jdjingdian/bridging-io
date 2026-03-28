@@ -437,10 +437,7 @@ impl AppApiLineCodec {
                     .metadata
                     .get(TARGET_TERMINAL_CONCURRENCY_METADATA_KEY)
                 {
-                    base.push_str(&format!(
-                        "|target_terminal_concurrency={}",
-                        escape(policy)
-                    ));
+                    base.push_str(&format!("|target_terminal_concurrency={}", escape(policy)));
                 }
                 if let Some(notes) = profile.notes.as_ref() {
                     base.push_str(&format!("|notes={}", escape(notes)));

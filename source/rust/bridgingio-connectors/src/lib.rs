@@ -151,7 +151,10 @@ impl ToolchainResolver {
         let builtin_candidates = self.builtin_candidate_paths(command);
         let mut result = self.executable.resolve(command, user_override, None);
         if matches!(result, Err(ResolveError::NotFound { .. })) {
-            if let Some(path) = builtin_candidates.iter().find(|candidate| candidate.is_file()) {
+            if let Some(path) = builtin_candidates
+                .iter()
+                .find(|candidate| candidate.is_file())
+            {
                 result = Ok(ExecutableSelection {
                     source: ExecutableSource::BuiltInFallback,
                     path: path.clone(),
@@ -162,7 +165,11 @@ impl ToolchainResolver {
             .executable
             .search_paths
             .iter()
-            .flat_map(|path| command_variants(command).into_iter().map(|candidate| path.join(candidate)))
+            .flat_map(|path| {
+                command_variants(command)
+                    .into_iter()
+                    .map(|candidate| path.join(candidate))
+            })
             .collect::<Vec<_>>();
 
         let mut diagnostics = ToolchainResolutionDiagnostics {
@@ -333,8 +340,8 @@ impl Default for InvocationQuotingBoundary {
     fn default() -> Self {
         Self {
             host_shell_runtime: "quotes local program/args for host shell tokenization".to_string(),
-            target_shell_dialect:
-                "defines remote shell semantics and payload argument shape".to_string(),
+            target_shell_dialect: "defines remote shell semantics and payload argument shape"
+                .to_string(),
         }
     }
 }
@@ -477,7 +484,11 @@ pub struct EnvironmentProbePlan {
 pub trait TerminalConnector {
     fn connector_name(&self) -> &'static str;
     fn toolchain_command(&self) -> &'static str;
-    fn connect(&self, target: &TargetProfile, now: SystemTime) -> Result<SessionRecord, ResolveError>;
+    fn connect(
+        &self,
+        target: &TargetProfile,
+        now: SystemTime,
+    ) -> Result<SessionRecord, ResolveError>;
     fn build_exec_invocation(
         &self,
         target: &TargetProfile,
@@ -729,7 +740,11 @@ impl TerminalConnector for SshConnector {
         "ssh"
     }
 
-    fn connect(&self, target: &TargetProfile, now: SystemTime) -> Result<SessionRecord, ResolveError> {
+    fn connect(
+        &self,
+        target: &TargetProfile,
+        now: SystemTime,
+    ) -> Result<SessionRecord, ResolveError> {
         SshConnector::connect(self, target, now)
     }
 
@@ -905,7 +920,11 @@ impl TerminalConnector for AdbConnector {
         "adb"
     }
 
-    fn connect(&self, target: &TargetProfile, now: SystemTime) -> Result<SessionRecord, ResolveError> {
+    fn connect(
+        &self,
+        target: &TargetProfile,
+        now: SystemTime,
+    ) -> Result<SessionRecord, ResolveError> {
         AdbConnector::connect(self, target, now)
     }
 
@@ -941,8 +960,8 @@ mod tests {
 
     use super::{
         target_shell_dialect_for, AdbConnector, BuiltInBinarySpec, BuiltInDistributionKind,
-        ExecutableResolver, ExecutableSource, InvocationKind, InvocationResolution,
-        TargetShellDialect, SshConnector, ToolchainResolver, TARGET_TERMINAL_SHELL_METADATA_KEY,
+        ExecutableResolver, ExecutableSource, InvocationKind, InvocationResolution, SshConnector,
+        TargetShellDialect, ToolchainResolver, TARGET_TERMINAL_SHELL_METADATA_KEY,
     };
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -1031,16 +1050,11 @@ mod tests {
         let (selected, diagnostics) = toolchain.resolve_with_diagnostics("adb", None);
         let selected = selected.expect("must resolve");
         assert_eq!(selected.source, ExecutableSource::BuiltInFallback);
-        assert_eq!(
-            selected.path.to_string_lossy(),
-            bundled.to_string_lossy(),
-        );
-        assert!(
-            diagnostics
-                .builtin_candidates
-                .iter()
-                .any(|candidate| candidate == &bundled)
-        );
+        assert_eq!(selected.path.to_string_lossy(), bundled.to_string_lossy(),);
+        assert!(diagnostics
+            .builtin_candidates
+            .iter()
+            .any(|candidate| candidate == &bundled));
     }
 
     #[test]
@@ -1290,7 +1304,10 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(command, "/opt/tools/ssh -p 22 root@10.1.1.8 uname -r");
         #[cfg(not(windows))]
-        assert_eq!(command, "'/opt/tools/ssh' '-p' '22' 'root@10.1.1.8' 'uname -r'");
+        assert_eq!(
+            command,
+            "'/opt/tools/ssh' '-p' '22' 'root@10.1.1.8' 'uname -r'"
+        );
     }
 
     #[test]
