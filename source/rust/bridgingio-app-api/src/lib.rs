@@ -76,6 +76,41 @@ pub struct ToolchainDiagnosticView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTokenScopeView {
+    pub scope_profile: Option<String>,
+    pub target_ids: Vec<String>,
+    pub tool_ids: Vec<String>,
+    pub max_risk_envelope: Option<String>,
+    pub allow_open_shell: Option<bool>,
+    pub allow_write_shell_input: Option<bool>,
+    pub allow_artifact_cross_principal: Option<bool>,
+    pub allow_delegation: Option<bool>,
+    pub allow_admin_actions: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTokenSummaryView {
+    pub token_id: String,
+    pub label: String,
+    pub principal_summary: String,
+    pub status: String,
+    pub scope_profile: String,
+    pub target_scope_summary: String,
+    pub active_scope_version: u32,
+    pub created_at: SystemTime,
+    pub last_used_at: Option<SystemTime>,
+    pub expires_at: Option<SystemTime>,
+    pub revoked_at: Option<SystemTime>,
+    pub revoke_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateAgentTokenResult {
+    pub plaintext_token: String,
+    pub summary: AgentTokenSummaryView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppCommand {
     AttachUi {
         host_id: String,
@@ -124,6 +159,23 @@ pub enum AppCommand {
     ListSessions,
     ListApprovals,
     GetToolchainDiagnostics,
+    CreateAgentToken {
+        label: String,
+        expires_in_seconds: Option<u64>,
+        scope: AgentTokenScopeView,
+        attestation_id: Option<String>,
+    },
+    ListAgentTokens,
+    RevokeAgentToken {
+        token_id: String,
+        reason: Option<String>,
+    },
+    UpdateAgentTokenScope {
+        token_id: String,
+        scope: AgentTokenScopeView,
+        reason: Option<String>,
+        attestation_id: Option<String>,
+    },
     OpenSession {
         target_id: String,
     },
@@ -268,6 +320,18 @@ pub enum ApiResponse {
         request_id: String,
         items: Vec<ToolchainDiagnosticView>,
     },
+    AgentTokenCreated {
+        request_id: String,
+        result: CreateAgentTokenResult,
+    },
+    AgentTokens {
+        request_id: String,
+        items: Vec<AgentTokenSummaryView>,
+    },
+    AgentTokenRevoked {
+        request_id: String,
+        summary: AgentTokenSummaryView,
+    },
     Session {
         request_id: String,
         session: SessionRecord,
@@ -404,6 +468,46 @@ impl AppApiLineCodec {
             AppCommand::ListSessions => base.push_str("|command=list_sessions"),
             AppCommand::ListApprovals => base.push_str("|command=list_approvals"),
             AppCommand::GetToolchainDiagnostics => base.push_str("|command=get_diagnostics"),
+            AppCommand::CreateAgentToken {
+                label,
+                expires_in_seconds,
+                scope,
+                attestation_id,
+            } => {
+                base.push_str("|command=create_agent_token");
+                base.push_str(&format!("|label={}", escape(label)));
+                if let Some(value) = expires_in_seconds {
+                    base.push_str(&format!("|expires_in_seconds={value}"));
+                }
+                append_scope_fields(&mut base, scope);
+                if let Some(value) = attestation_id {
+                    base.push_str(&format!("|attestation_id={}", escape(value)));
+                }
+            }
+            AppCommand::ListAgentTokens => base.push_str("|command=list_agent_tokens"),
+            AppCommand::RevokeAgentToken { token_id, reason } => {
+                base.push_str("|command=revoke_agent_token");
+                base.push_str(&format!("|token_id={}", escape(token_id)));
+                if let Some(value) = reason {
+                    base.push_str(&format!("|reason={}", escape(value)));
+                }
+            }
+            AppCommand::UpdateAgentTokenScope {
+                token_id,
+                scope,
+                reason,
+                attestation_id,
+            } => {
+                base.push_str("|command=update_agent_token_scope");
+                base.push_str(&format!("|token_id={}", escape(token_id)));
+                append_scope_fields(&mut base, scope);
+                if let Some(value) = reason {
+                    base.push_str(&format!("|reason={}", escape(value)));
+                }
+                if let Some(value) = attestation_id {
+                    base.push_str(&format!("|attestation_id={}", escape(value)));
+                }
+            }
             AppCommand::OpenSession { target_id } => {
                 base.push_str("|command=open_session");
                 base.push_str(&format!("|target_id={target_id}"));
@@ -601,6 +705,23 @@ impl AppApiLineCodec {
             "list_sessions" => AppCommand::ListSessions,
             "list_approvals" => AppCommand::ListApprovals,
             "get_diagnostics" => AppCommand::GetToolchainDiagnostics,
+            "create_agent_token" => AppCommand::CreateAgentToken {
+                label: unescape(required(&map, "label")?),
+                expires_in_seconds: parse_optional_u64(optional(&map, "expires_in_seconds"))?,
+                scope: parse_scope_from_fields(&map)?,
+                attestation_id: optional(&map, "attestation_id").map(unescape),
+            },
+            "list_agent_tokens" => AppCommand::ListAgentTokens,
+            "revoke_agent_token" => AppCommand::RevokeAgentToken {
+                token_id: unescape(required(&map, "token_id")?),
+                reason: optional(&map, "reason").map(unescape),
+            },
+            "update_agent_token_scope" => AppCommand::UpdateAgentTokenScope {
+                token_id: unescape(required(&map, "token_id")?),
+                scope: parse_scope_from_fields(&map)?,
+                reason: optional(&map, "reason").map(unescape),
+                attestation_id: optional(&map, "attestation_id").map(unescape),
+            },
             "open_session" => AppCommand::OpenSession {
                 target_id: required(&map, "target_id")?.to_string(),
             },
@@ -775,6 +896,36 @@ impl AppApiLineCodec {
             ApiResponse::Diagnostics { request_id, items } => {
                 format!("kind=diagnostics|request_id={request_id}|count={}", items.len())
             }
+            ApiResponse::AgentTokenCreated { request_id, result } => {
+                let mut line = format!(
+                    "kind=agent_token_created|request_id={request_id}|plaintext_token={}",
+                    escape(&result.plaintext_token)
+                );
+                append_agent_token_summary_fields(&mut line, &result.summary, "");
+                line
+            }
+            ApiResponse::AgentTokens { request_id, items } => {
+                let mut line = format!(
+                    "kind=agent_tokens|request_id={request_id}|count={}",
+                    items.len()
+                );
+                for (index, item) in items.iter().enumerate() {
+                    append_agent_token_summary_fields(
+                        &mut line,
+                        item,
+                        &format!("token_{index}_"),
+                    );
+                }
+                line
+            }
+            ApiResponse::AgentTokenRevoked {
+                request_id,
+                summary,
+            } => {
+                let mut line = format!("kind=agent_token_revoked|request_id={request_id}");
+                append_agent_token_summary_fields(&mut line, summary, "");
+                line
+            }
             ApiResponse::Session {
                 request_id,
                 session,
@@ -891,6 +1042,34 @@ impl AppApiLineCodec {
             "diagnostics" => Ok(ApiResponse::Diagnostics {
                 request_id,
                 items: Vec::new(),
+            }),
+            "agent_token_created" => Ok(ApiResponse::AgentTokenCreated {
+                request_id,
+                result: CreateAgentTokenResult {
+                    plaintext_token: unescape(required(&map, "plaintext_token")?),
+                    summary: parse_agent_token_summary_from_fields(&map, "")?,
+                },
+            }),
+            "agent_tokens" => {
+                let count = optional(&map, "count")
+                    .map(|raw| {
+                        raw.parse::<usize>()
+                            .map_err(|_| invalid_request("count must be usize"))
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                let mut items = Vec::with_capacity(count);
+                for index in 0..count {
+                    items.push(parse_agent_token_summary_from_fields(
+                        &map,
+                        &format!("token_{index}_"),
+                    )?);
+                }
+                Ok(ApiResponse::AgentTokens { request_id, items })
+            }
+            "agent_token_revoked" => Ok(ApiResponse::AgentTokenRevoked {
+                request_id,
+                summary: parse_agent_token_summary_from_fields(&map, "")?,
             }),
             "settings" => Ok(ApiResponse::Settings {
                 request_id,
@@ -1045,6 +1224,186 @@ fn parse_optional_u64(value: Option<&str>) -> Result<Option<u64>, ApiError> {
             .map_err(|_| invalid_request("field must be u64")),
         None => Ok(None),
     }
+}
+
+fn parse_optional_u32(value: Option<&str>) -> Result<Option<u32>, ApiError> {
+    match value {
+        Some(raw) => raw
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| invalid_request("field must be u32")),
+        None => Ok(None),
+    }
+}
+
+fn parse_optional_bool(value: Option<&str>) -> Result<Option<bool>, ApiError> {
+    match value {
+        Some(raw) => raw
+            .parse::<bool>()
+            .map(Some)
+            .map_err(|_| invalid_request("field must be bool")),
+        None => Ok(None),
+    }
+}
+
+fn parse_optional_system_time_ms(value: Option<&str>) -> Result<Option<SystemTime>, ApiError> {
+    match value {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(|millis| Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)))
+            .map_err(|_| invalid_request("field must be unix milliseconds")),
+        None => Ok(None),
+    }
+}
+
+fn to_unix_millis(value: SystemTime) -> u64 {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn encode_string_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|item| escape(item))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_string_list(value: Option<&str>) -> Vec<String> {
+    value
+        .map(|raw| {
+            raw.split(',')
+                .map(unescape)
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn append_scope_fields(line: &mut String, scope: &AgentTokenScopeView) {
+    if let Some(value) = scope.scope_profile.as_ref() {
+        line.push_str(&format!("|scope_profile={}", escape(value)));
+    }
+    if !scope.target_ids.is_empty() {
+        line.push_str(&format!(
+            "|target_ids={}",
+            escape(&encode_string_list(&scope.target_ids))
+        ));
+    }
+    if !scope.tool_ids.is_empty() {
+        line.push_str(&format!(
+            "|tool_ids={}",
+            escape(&encode_string_list(&scope.tool_ids))
+        ));
+    }
+    if let Some(value) = scope.max_risk_envelope.as_ref() {
+        line.push_str(&format!("|max_risk_envelope={}", escape(value)));
+    }
+    if let Some(value) = scope.allow_open_shell {
+        line.push_str(&format!("|allow_open_shell={value}"));
+    }
+    if let Some(value) = scope.allow_write_shell_input {
+        line.push_str(&format!("|allow_write_shell_input={value}"));
+    }
+    if let Some(value) = scope.allow_artifact_cross_principal {
+        line.push_str(&format!("|allow_artifact_cross_principal={value}"));
+    }
+    if let Some(value) = scope.allow_delegation {
+        line.push_str(&format!("|allow_delegation={value}"));
+    }
+    if let Some(value) = scope.allow_admin_actions {
+        line.push_str(&format!("|allow_admin_actions={value}"));
+    }
+}
+
+fn parse_scope_from_fields(
+    map: &std::collections::HashMap<String, String>,
+) -> Result<AgentTokenScopeView, ApiError> {
+    Ok(AgentTokenScopeView {
+        scope_profile: optional(map, "scope_profile").map(unescape),
+        target_ids: parse_string_list(optional(map, "target_ids").map(unescape).as_deref()),
+        tool_ids: parse_string_list(optional(map, "tool_ids").map(unescape).as_deref()),
+        max_risk_envelope: optional(map, "max_risk_envelope").map(unescape),
+        allow_open_shell: parse_optional_bool(optional(map, "allow_open_shell"))?,
+        allow_write_shell_input: parse_optional_bool(optional(map, "allow_write_shell_input"))?,
+        allow_artifact_cross_principal: parse_optional_bool(optional(
+            map,
+            "allow_artifact_cross_principal",
+        ))?,
+        allow_delegation: parse_optional_bool(optional(map, "allow_delegation"))?,
+        allow_admin_actions: parse_optional_bool(optional(map, "allow_admin_actions"))?,
+    })
+}
+
+fn append_agent_token_summary_fields(
+    line: &mut String,
+    summary: &AgentTokenSummaryView,
+    prefix: &str,
+) {
+    line.push_str(&format!("|{prefix}token_id={}", escape(&summary.token_id)));
+    line.push_str(&format!("|{prefix}label={}", escape(&summary.label)));
+    line.push_str(&format!(
+        "|{prefix}principal_summary={}",
+        escape(&summary.principal_summary)
+    ));
+    line.push_str(&format!("|{prefix}status={}", escape(&summary.status)));
+    line.push_str(&format!(
+        "|{prefix}scope_profile={}",
+        escape(&summary.scope_profile)
+    ));
+    line.push_str(&format!(
+        "|{prefix}target_scope_summary={}",
+        escape(&summary.target_scope_summary)
+    ));
+    line.push_str(&format!(
+        "|{prefix}active_scope_version={}",
+        summary.active_scope_version
+    ));
+    line.push_str(&format!(
+        "|{prefix}created_at_ms={}",
+        to_unix_millis(summary.created_at)
+    ));
+    if let Some(value) = summary.last_used_at {
+        line.push_str(&format!(
+            "|{prefix}last_used_at_ms={}",
+            to_unix_millis(value)
+        ));
+    }
+    if let Some(value) = summary.expires_at {
+        line.push_str(&format!("|{prefix}expires_at_ms={}", to_unix_millis(value)));
+    }
+    if let Some(value) = summary.revoked_at {
+        line.push_str(&format!("|{prefix}revoked_at_ms={}", to_unix_millis(value)));
+    }
+    if let Some(value) = summary.revoke_reason.as_ref() {
+        line.push_str(&format!("|{prefix}revoke_reason={}", escape(value)));
+    }
+}
+
+fn parse_agent_token_summary_from_fields(
+    map: &std::collections::HashMap<String, String>,
+    prefix: &str,
+) -> Result<AgentTokenSummaryView, ApiError> {
+    let key = |suffix: &str| -> String { format!("{prefix}{suffix}") };
+    Ok(AgentTokenSummaryView {
+        token_id: unescape(required(map, &key("token_id"))?),
+        label: unescape(required(map, &key("label"))?),
+        principal_summary: unescape(required(map, &key("principal_summary"))?),
+        status: unescape(required(map, &key("status"))?),
+        scope_profile: unescape(required(map, &key("scope_profile"))?),
+        target_scope_summary: unescape(required(map, &key("target_scope_summary"))?),
+        active_scope_version: parse_optional_u32(optional(map, &key("active_scope_version")))?
+            .ok_or_else(|| invalid_request("missing field: active_scope_version"))?,
+        created_at: parse_optional_system_time_ms(optional(map, &key("created_at_ms")))?
+            .ok_or_else(|| invalid_request("missing field: created_at_ms"))?,
+        last_used_at: parse_optional_system_time_ms(optional(map, &key("last_used_at_ms")))?,
+        expires_at: parse_optional_system_time_ms(optional(map, &key("expires_at_ms")))?,
+        revoked_at: parse_optional_system_time_ms(optional(map, &key("revoked_at_ms")))?,
+        revoke_reason: optional(map, &key("revoke_reason")).map(unescape),
+    })
 }
 
 fn parse_reuse_policy(raw: &str) -> Result<SessionReusePolicy, ApiError> {
@@ -1209,12 +1568,14 @@ fn unescape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::SystemTime;
 
     use bridgingio_domain::{ConnectionConfig, SessionReusePolicy, TargetKind, TargetProfile};
 
     use super::{
-        ApiRequest, ApiRequestContext, ApiResponse, AppApiLineCodec, AppCommand,
-        ArtifactCacheSettingsView, ControlPlaneView, CoreSettingsView, ModelPlaneHttpView,
+        AgentTokenScopeView, AgentTokenSummaryView, ApiRequest, ApiRequestContext, ApiResponse,
+        AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ControlPlaneView, CoreSettingsView,
+        CreateAgentTokenResult, ModelPlaneHttpView,
     };
 
     #[test]
@@ -1447,6 +1808,101 @@ mod tests {
                 );
             }
             other => panic!("expected settings response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_create_agent_token_request() {
+        let request = ApiRequest {
+            request_id: "req-token-create".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::CreateAgentToken {
+                label: "nightly-runner".into(),
+                expires_in_seconds: Some(1800),
+                scope: AgentTokenScopeView {
+                    scope_profile: Some("strict-default".into()),
+                    target_ids: vec!["target-a".into(), "target-b".into()],
+                    tool_ids: Vec::new(),
+                    max_risk_envelope: Some("deny-all".into()),
+                    allow_open_shell: Some(false),
+                    allow_write_shell_input: Some(false),
+                    allow_artifact_cross_principal: Some(false),
+                    allow_delegation: Some(false),
+                    allow_admin_actions: Some(false),
+                },
+                attestation_id: Some("attest-001".into()),
+            },
+        };
+
+        let line = AppApiLineCodec::encode_request_line(&request);
+        let parsed = AppApiLineCodec::decode_request_line(&line).expect("decode");
+        match parsed.command {
+            AppCommand::CreateAgentToken {
+                label,
+                expires_in_seconds,
+                scope,
+                attestation_id,
+            } => {
+                assert_eq!(label, "nightly-runner");
+                assert_eq!(expires_in_seconds, Some(1800));
+                assert_eq!(scope.scope_profile.as_deref(), Some("strict-default"));
+                assert_eq!(scope.target_ids, vec!["target-a", "target-b"]);
+                assert_eq!(attestation_id.as_deref(), Some("attest-001"));
+            }
+            other => panic!("expected create token command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_agent_token_responses() {
+        let summary = AgentTokenSummaryView {
+            token_id: "token-000001".into(),
+            label: "nightly-runner".into(),
+            principal_summary: "principal-000001".into(),
+            status: "active".into(),
+            scope_profile: "strict-default".into(),
+            target_scope_summary: "targets:2".into(),
+            active_scope_version: 1,
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(10),
+            last_used_at: None,
+            expires_at: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(3600)),
+            revoked_at: None,
+            revoke_reason: None,
+        };
+        let response = ApiResponse::AgentTokenCreated {
+            request_id: "req-token-create".into(),
+            result: CreateAgentTokenResult {
+                plaintext_token: "agt_opaque_token".into(),
+                summary: summary.clone(),
+            },
+        };
+        let line = AppApiLineCodec::encode_response_line(&response);
+        let parsed = AppApiLineCodec::decode_response_line(&line).expect("decode");
+        match parsed {
+            ApiResponse::AgentTokenCreated { result, .. } => {
+                assert_eq!(result.plaintext_token, "agt_opaque_token");
+                assert_eq!(result.summary.token_id, "token-000001");
+                assert_eq!(result.summary.scope_profile, "strict-default");
+            }
+            other => panic!("expected token created response, got {other:?}"),
+        }
+
+        let list_line = AppApiLineCodec::encode_response_line(&ApiResponse::AgentTokens {
+            request_id: "req-token-list".into(),
+            items: vec![summary],
+        });
+        let list_parsed = AppApiLineCodec::decode_response_line(&list_line).expect("decode list");
+        match list_parsed {
+            ApiResponse::AgentTokens { items, .. } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].token_id, "token-000001");
+            }
+            other => panic!("expected token list response, got {other:?}"),
         }
     }
 }

@@ -29,6 +29,7 @@ fn context(
     reuse_policy: SessionReusePolicy,
 ) -> ToolRequestContext {
     ToolRequestContext {
+        principal_id: None,
         agent_id: agent.into(),
         run_id: run.into(),
         client_session_id: client.into(),

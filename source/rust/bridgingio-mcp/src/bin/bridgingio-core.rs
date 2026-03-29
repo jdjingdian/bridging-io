@@ -1224,6 +1224,17 @@ fn parse_args_from<I>(args: I) -> Result<CliArgs, String>
 where
     I: IntoIterator<Item = String>,
 {
+    let args = args.into_iter().collect::<Vec<_>>();
+    reject_plaintext_secret_argv(&args)?;
+    if matches!(
+        args.first().map(String::as_str),
+        Some("auth") | Some("token")
+    ) {
+        return Err(
+            "future standalone route is reserved for `bridgingio-core auth token create/list/revoke/update-scope` and must reuse the same control-plane token service; plaintext token argv is forbidden".to_string(),
+        );
+    }
+
     let mut mode = LaunchMode::StandaloneRun;
     let mut config_path = None::<PathBuf>;
     let mut runtime_root = None::<PathBuf>;
@@ -1308,6 +1319,20 @@ where
     })
 }
 
+fn reject_plaintext_secret_argv(args: &[String]) -> Result<(), String> {
+    const FORBIDDEN_FLAGS: [&str; 3] = ["--token", "--secret", "--access-token"];
+    if let Some(flag) = args
+        .iter()
+        .map(String::as_str)
+        .find(|arg| FORBIDDEN_FLAGS.contains(arg))
+    {
+        return Err(format!(
+            "{flag} is forbidden: do not pass plaintext token or secret via argv"
+        ));
+    }
+    Ok(())
+}
+
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  bridgingio-core --self-test");
@@ -1315,6 +1340,8 @@ fn print_usage() {
     eprintln!("  bridgingio-core -d --config <path-to-standalone.toml>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --runtime-root <runtime-root-dir>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-managed-core.toml>");
+    eprintln!("  future route (not yet implemented): bridgingio-core auth token create|list|revoke|update-scope");
+    eprintln!("    route must reuse control-plane token service/records; plaintext token argv is forbidden");
     eprintln!("  debug/testing escape hatch: --control-plane-socket-override <path-or-endpoint>");
 }
 
@@ -1528,6 +1555,38 @@ mod tests {
             .collect::<Vec<_>>();
         let err = parse_args_from(args).expect_err("must reject mixed self-test arguments");
         assert!(err.contains("--self-test does not accept"));
+    }
+
+    #[test]
+    fn rejects_plaintext_token_argv_flags() {
+        let args = [
+            "run",
+            "--config",
+            "/tmp/standalone.toml",
+            "--token",
+            "raw-value",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>();
+        let err = parse_args_from(args).expect_err("must reject plaintext token argv");
+        assert!(err.contains("forbidden"));
+    }
+
+    #[test]
+    fn reserves_future_standalone_auth_token_route() {
+        let args = [
+            "auth",
+            "token",
+            "create",
+            "--config",
+            "/tmp/standalone.toml",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>();
+        let err = parse_args_from(args).expect_err("must reserve future auth token route");
+        assert!(err.contains("future standalone route"));
     }
 
     #[test]

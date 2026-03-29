@@ -257,6 +257,140 @@ pub struct SecretRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentTokenStatus {
+    Active,
+    Revoked,
+    Expired,
+}
+
+impl AgentTokenStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenScopeStatus {
+    Active,
+    Superseded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTokenRecord {
+    pub token_id: String,
+    pub principal_id: String,
+    pub label: String,
+    pub status: AgentTokenStatus,
+    pub token_hash: String,
+    pub hash_scheme: String,
+    pub scope_profile: String,
+    pub active_scope_version: u32,
+    pub created_by: String,
+    pub created_at: SystemTime,
+    pub last_used_at: Option<SystemTime>,
+    pub expires_at: Option<SystemTime>,
+    pub idle_timeout_sec: Option<u64>,
+    pub revoked_at: Option<SystemTime>,
+    pub revoke_reason: Option<String>,
+    pub parent_token_id: Option<String>,
+    pub issued_via_attestation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenScopeRecord {
+    pub token_id: String,
+    pub version: u32,
+    pub status: TokenScopeStatus,
+    pub scope_profile: String,
+    pub target_ids: Vec<String>,
+    pub tool_ids: Vec<String>,
+    pub max_risk_envelope: String,
+    pub allow_open_shell: bool,
+    pub allow_write_shell_input: bool,
+    pub allow_artifact_cross_principal: bool,
+    pub allow_delegation: bool,
+    pub allow_admin_actions: bool,
+    pub created_by: String,
+    pub created_at: SystemTime,
+    pub superseded_at: Option<SystemTime>,
+    pub change_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTokenSummary {
+    pub token_id: String,
+    pub label: String,
+    pub principal_summary: String,
+    pub status: AgentTokenStatus,
+    pub scope_profile: String,
+    pub target_scope_summary: String,
+    pub active_scope_version: u32,
+    pub created_at: SystemTime,
+    pub last_used_at: Option<SystemTime>,
+    pub expires_at: Option<SystemTime>,
+    pub revoked_at: Option<SystemTime>,
+    pub revoke_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenScopeInput {
+    pub scope_profile: Option<String>,
+    pub target_ids: Vec<String>,
+    pub tool_ids: Vec<String>,
+    pub max_risk_envelope: Option<String>,
+    pub allow_open_shell: Option<bool>,
+    pub allow_write_shell_input: Option<bool>,
+    pub allow_artifact_cross_principal: Option<bool>,
+    pub allow_delegation: Option<bool>,
+    pub allow_admin_actions: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateAgentTokenRequest {
+    pub label: String,
+    pub created_by: String,
+    pub expires_in: Option<Duration>,
+    pub idle_timeout_sec: Option<u64>,
+    pub scope: TokenScopeInput,
+    pub attestation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateAgentTokenScopeRequest {
+    pub token_id: String,
+    pub changed_by: String,
+    pub scope: TokenScopeInput,
+    pub reason: Option<String>,
+    pub attestation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateAgentTokenResult {
+    pub plaintext_token: String,
+    pub summary: AgentTokenSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedAgentToken {
+    pub token_id: String,
+    pub principal_id: String,
+    pub active_scope_version: u32,
+    pub scope_profile: String,
+    pub target_ids: Vec<String>,
+    pub tool_ids: Vec<String>,
+    pub max_risk_envelope: String,
+    pub allow_open_shell: bool,
+    pub allow_write_shell_input: bool,
+    pub allow_artifact_cross_principal: bool,
+    pub allow_delegation: bool,
+    pub allow_admin_actions: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VaultSecretMetadataView {
     pub record: VaultSecretRecord,
     pub versions: Vec<VaultSecretVersionRecord>,
@@ -601,6 +735,8 @@ pub enum VaultError {
     SshBrokerSessionNotFound(String),
     SshBrokerUnsupported(String),
     SshRuntimePassphraseForbidden(String),
+    AgentTokenNotFound(String),
+    AgentTokenRejected(String),
 }
 
 struct StoredSecretVersionMaterial {
@@ -627,11 +763,15 @@ pub struct SecretVaultRouter {
     active_backend: String,
     backends: HashMap<String, Box<dyn SecretVaultBackend>>,
     secrets: HashMap<String, StoredSecretState>,
+    agent_tokens: HashMap<String, AgentTokenRecord>,
+    token_scopes: HashMap<String, Vec<TokenScopeRecord>>,
+    token_hash_index: HashMap<String, String>,
     redaction_registry: RuntimeRedactionRegistry,
     root_key: SecretBytes,
     allow_degraded_mode: bool,
     next_version_seq: u64,
     next_audit_seq: u64,
+    next_agent_token_seq: u64,
     next_intent_seq: u64,
     next_attestation_seq: u64,
     next_ssh_broker_seq: u64,
@@ -648,11 +788,15 @@ impl Default for SecretVaultRouter {
             active_backend: "os-native".into(),
             backends: HashMap::new(),
             secrets: HashMap::new(),
+            agent_tokens: HashMap::new(),
+            token_scopes: HashMap::new(),
+            token_hash_index: HashMap::new(),
             redaction_registry: RuntimeRedactionRegistry::default(),
             root_key: SecretBytes::from_bytes(pseudo_random_bytes(32, "vault-root-key")),
             allow_degraded_mode: false,
             next_version_seq: 0,
             next_audit_seq: 0,
+            next_agent_token_seq: 0,
             next_intent_seq: 0,
             next_attestation_seq: 0,
             next_ssh_broker_seq: 0,
@@ -879,6 +1023,266 @@ impl SecretVaultRouter {
                 signing_scope: signing_scope.into(),
             },
         )
+    }
+
+    pub fn create_agent_token(
+        &mut self,
+        request: CreateAgentTokenRequest,
+    ) -> Result<CreateAgentTokenResult, VaultError> {
+        let label = request.label.trim();
+        if label.is_empty() {
+            return Err(VaultError::AgentTokenRejected(
+                "token label must be non-empty".into(),
+            ));
+        }
+        let created_by = request.created_by.trim();
+        if created_by.is_empty() {
+            return Err(VaultError::AgentTokenRejected(
+                "created_by principal must be non-empty".into(),
+            ));
+        }
+
+        self.next_agent_token_seq += 1;
+        let seq = self.next_agent_token_seq;
+        let token_id = format!("token-{seq:06}");
+        let principal_id = format!("principal-{seq:06}");
+        let now = SystemTime::now();
+        let expires_at = request.expires_in.map(|ttl| now + ttl);
+        let scope_profile =
+            normalized_scope_profile(request.scope.scope_profile.as_deref(), Some("default-deny"));
+        let scope_record = build_scope_record(
+            &token_id,
+            1,
+            &scope_profile,
+            TokenScopeStatus::Active,
+            &request.scope,
+            created_by,
+            now,
+            None,
+        );
+
+        let mut attempt = 0u32;
+        let (plaintext_token, token_hash) = loop {
+            let plaintext = format!(
+                "agt_{}",
+                hex_encode(&pseudo_random_bytes(
+                    24,
+                    &format!("agent-token:{token_id}:{attempt}")
+                ))
+            );
+            let digest = short_digest(plaintext.as_bytes());
+            if !self.token_hash_index.contains_key(&digest) {
+                break (plaintext, digest);
+            }
+            attempt = attempt.saturating_add(1);
+        };
+
+        self.redaction_registry.register(&plaintext_token);
+        self.token_hash_index
+            .insert(token_hash.clone(), token_id.clone());
+        self.agent_tokens.insert(
+            token_id.clone(),
+            AgentTokenRecord {
+                token_id: token_id.clone(),
+                principal_id,
+                label: label.to_string(),
+                status: AgentTokenStatus::Active,
+                token_hash,
+                hash_scheme: "siphash-64".into(),
+                scope_profile: scope_profile.clone(),
+                active_scope_version: 1,
+                created_by: created_by.to_string(),
+                created_at: now,
+                last_used_at: None,
+                expires_at,
+                idle_timeout_sec: request.idle_timeout_sec,
+                revoked_at: None,
+                revoke_reason: None,
+                parent_token_id: None,
+                issued_via_attestation_id: request.attestation_id,
+            },
+        );
+        self.token_scopes
+            .insert(token_id.clone(), vec![scope_record]);
+
+        let summary = self
+            .agent_token_summary(&token_id)?
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.clone()))?;
+        Ok(CreateAgentTokenResult {
+            plaintext_token,
+            summary,
+        })
+    }
+
+    pub fn list_agent_tokens(&mut self) -> Vec<AgentTokenSummary> {
+        let mut token_ids = self.agent_tokens.keys().cloned().collect::<Vec<_>>();
+        token_ids.sort();
+        token_ids
+            .iter()
+            .filter_map(|token_id| self.agent_token_summary(token_id).ok().flatten())
+            .collect()
+    }
+
+    pub fn revoke_agent_token(
+        &mut self,
+        token_id: &str,
+        reason: Option<String>,
+    ) -> Result<AgentTokenSummary, VaultError> {
+        let now = SystemTime::now();
+        let record = self
+            .agent_tokens
+            .get_mut(token_id)
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))?;
+        refresh_agent_token_status(record, now);
+        if !matches!(record.status, AgentTokenStatus::Revoked) {
+            record.status = AgentTokenStatus::Revoked;
+            record.revoked_at = Some(now);
+            record.revoke_reason = reason;
+        }
+        self.agent_token_summary(token_id)?
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))
+    }
+
+    pub fn update_agent_token_scope(
+        &mut self,
+        request: UpdateAgentTokenScopeRequest,
+    ) -> Result<AgentTokenSummary, VaultError> {
+        let now = SystemTime::now();
+        let token_id = request.token_id.clone();
+        let token = self
+            .agent_tokens
+            .get_mut(&token_id)
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.clone()))?;
+        refresh_agent_token_status(token, now);
+        if !matches!(token.status, AgentTokenStatus::Active) {
+            return Err(VaultError::AgentTokenRejected(format!(
+                "token {} is not active",
+                token.token_id
+            )));
+        }
+
+        let active_scope_version = token.active_scope_version;
+        let next_scope_version = token.active_scope_version.saturating_add(1);
+        let scope_profile = normalized_scope_profile(
+            request.scope.scope_profile.as_deref(),
+            Some(&token.scope_profile),
+        );
+        token.active_scope_version = next_scope_version;
+        token.scope_profile = scope_profile.clone();
+        if request.attestation_id.is_some() {
+            token.issued_via_attestation_id = request.attestation_id.clone();
+        }
+
+        let scopes = self
+            .token_scopes
+            .get_mut(&token_id)
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.clone()))?;
+        for scope in scopes.iter_mut() {
+            if scope.version == active_scope_version
+                && matches!(scope.status, TokenScopeStatus::Active)
+            {
+                scope.status = TokenScopeStatus::Superseded;
+                scope.superseded_at = Some(now);
+                scope.change_reason = request.reason.clone();
+            }
+        }
+        scopes.push(build_scope_record(
+            &token_id,
+            next_scope_version,
+            &scope_profile,
+            TokenScopeStatus::Active,
+            &request.scope,
+            &request.changed_by,
+            now,
+            request.reason,
+        ));
+
+        self.agent_token_summary(&token_id)?
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id))
+    }
+
+    pub fn authenticate_agent_token(&mut self, token: &str) -> Option<AuthenticatedAgentToken> {
+        let token_hash = short_digest(token.as_bytes());
+        let token_id = self.token_hash_index.get(&token_hash)?.clone();
+        let now = SystemTime::now();
+        let (principal_id, active_scope_version, scope_profile) = {
+            let record = self.agent_tokens.get_mut(&token_id)?;
+            refresh_agent_token_status(record, now);
+            if !matches!(record.status, AgentTokenStatus::Active) {
+                return None;
+            }
+            record.last_used_at = Some(now);
+            (
+                record.principal_id.clone(),
+                record.active_scope_version,
+                record.scope_profile.clone(),
+            )
+        };
+        let scope = self
+            .scope_for_version(&token_id, active_scope_version)?
+            .clone();
+        Some(AuthenticatedAgentToken {
+            token_id,
+            principal_id,
+            active_scope_version,
+            scope_profile,
+            target_ids: scope.target_ids,
+            tool_ids: scope.tool_ids,
+            max_risk_envelope: scope.max_risk_envelope,
+            allow_open_shell: scope.allow_open_shell,
+            allow_write_shell_input: scope.allow_write_shell_input,
+            allow_artifact_cross_principal: scope.allow_artifact_cross_principal,
+            allow_delegation: scope.allow_delegation,
+            allow_admin_actions: scope.allow_admin_actions,
+        })
+    }
+
+    pub fn active_scope_record(&self, token_id: &str) -> Option<TokenScopeRecord> {
+        let record = self.agent_tokens.get(token_id)?;
+        self.scope_for_version(token_id, record.active_scope_version)
+            .cloned()
+    }
+
+    pub fn token_scope_history(&self, token_id: &str) -> Vec<TokenScopeRecord> {
+        self.token_scopes.get(token_id).cloned().unwrap_or_default()
+    }
+
+    fn agent_token_summary(
+        &mut self,
+        token_id: &str,
+    ) -> Result<Option<AgentTokenSummary>, VaultError> {
+        let now = SystemTime::now();
+        let record = match self.agent_tokens.get_mut(token_id) {
+            Some(record) => {
+                refresh_agent_token_status(record, now);
+                record.clone()
+            }
+            None => return Ok(None),
+        };
+        let scope = self
+            .scope_for_version(token_id, record.active_scope_version)
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))?;
+        Ok(Some(AgentTokenSummary {
+            token_id: record.token_id,
+            label: record.label,
+            principal_summary: record.principal_id,
+            status: record.status,
+            scope_profile: record.scope_profile,
+            target_scope_summary: format!("targets:{}", scope.target_ids.len()),
+            active_scope_version: record.active_scope_version,
+            created_at: record.created_at,
+            last_used_at: record.last_used_at,
+            expires_at: record.expires_at,
+            revoked_at: record.revoked_at,
+            revoke_reason: record.revoke_reason,
+        }))
+    }
+
+    fn scope_for_version(&self, token_id: &str, version: u32) -> Option<&TokenScopeRecord> {
+        self.token_scopes
+            .get(token_id)?
+            .iter()
+            .find(|scope| scope.version == version)
     }
 
     pub fn create_local_admin_intent(
@@ -1420,6 +1824,77 @@ impl SecretVaultRouter {
     }
 }
 
+fn refresh_agent_token_status(record: &mut AgentTokenRecord, now: SystemTime) {
+    if matches!(record.status, AgentTokenStatus::Active)
+        && record
+            .expires_at
+            .map(|expires_at| now >= expires_at)
+            .unwrap_or(false)
+    {
+        record.status = AgentTokenStatus::Expired;
+    }
+}
+
+fn normalized_scope_profile(value: Option<&str>, fallback: Option<&str>) -> String {
+    value
+        .map(|raw| raw.trim())
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| raw.to_ascii_lowercase())
+        .or_else(|| {
+            fallback
+                .map(|raw| raw.trim())
+                .filter(|raw| !raw.is_empty())
+                .map(|raw| raw.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "default-deny".to_string())
+}
+
+fn canonicalize_ids(values: &[String]) -> Vec<String> {
+    let mut canonical = values
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    canonical.sort();
+    canonical.dedup();
+    canonical
+}
+
+fn build_scope_record(
+    token_id: &str,
+    version: u32,
+    scope_profile: &str,
+    status: TokenScopeStatus,
+    input: &TokenScopeInput,
+    actor: &str,
+    now: SystemTime,
+    reason: Option<String>,
+) -> TokenScopeRecord {
+    TokenScopeRecord {
+        token_id: token_id.to_string(),
+        version,
+        status,
+        scope_profile: scope_profile.to_string(),
+        target_ids: canonicalize_ids(&input.target_ids),
+        tool_ids: canonicalize_ids(&input.tool_ids),
+        max_risk_envelope: input
+            .max_risk_envelope
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "deny-all".to_string()),
+        allow_open_shell: input.allow_open_shell.unwrap_or(false),
+        allow_write_shell_input: input.allow_write_shell_input.unwrap_or(false),
+        allow_artifact_cross_principal: input.allow_artifact_cross_principal.unwrap_or(false),
+        allow_delegation: input.allow_delegation.unwrap_or(false),
+        allow_admin_actions: input.allow_admin_actions.unwrap_or(false),
+        created_by: actor.to_string(),
+        created_at: now,
+        superseded_at: None,
+        change_reason: reason,
+    }
+}
+
 fn readiness_label(status: &VaultReadinessState) -> &'static str {
     match status {
         VaultReadinessState::Ready => "ready",
@@ -1640,12 +2115,23 @@ fn short_digest(data: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn hex_encode(data: &[u8]) -> String {
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for byte in data {
+        out.push(LUT[(byte >> 4) as usize] as char);
+        out.push(LUT[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        command_audit_preview, normalize_credential_ref, LocalAdminActionKind, SecretBytes,
-        SecretVaultRouter, SshAgentBrokerPrepareRequest, SshAgentBrokerSessionState,
-        SshHostKeyPolicy, SshKeyPassphraseHandling, VaultError, VaultReadinessState,
+        command_audit_preview, normalize_credential_ref, AgentTokenStatus, CreateAgentTokenRequest,
+        LocalAdminActionKind, SecretBytes, SecretVaultRouter, SshAgentBrokerPrepareRequest,
+        SshAgentBrokerSessionState, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
+        UpdateAgentTokenScopeRequest, VaultError, VaultReadinessState,
     };
     use std::time::Duration;
 
@@ -1955,6 +2441,162 @@ mod tests {
         let openharmony = router.ssh_agent_compatibility("openharmony");
         assert_eq!(openharmony.len(), 1);
         assert_eq!(openharmony[0].status, VaultReadinessState::Degraded);
+    }
+
+    #[test]
+    fn agent_token_create_list_revoke_contract() {
+        let mut router = SecretVaultRouter::default();
+        let created = router
+            .create_agent_token(CreateAgentTokenRequest {
+                label: "nightly-runner".into(),
+                created_by: "local-operator".into(),
+                expires_in: None,
+                idle_timeout_sec: None,
+                scope: TokenScopeInput {
+                    scope_profile: Some("strict-default".into()),
+                    target_ids: vec!["TARGET-A".into(), "target-a".into(), "target-b".into()],
+                    tool_ids: Vec::new(),
+                    max_risk_envelope: None,
+                    allow_open_shell: None,
+                    allow_write_shell_input: None,
+                    allow_artifact_cross_principal: None,
+                    allow_delegation: None,
+                    allow_admin_actions: None,
+                },
+                attestation_id: None,
+            })
+            .expect("create token");
+        assert!(created.plaintext_token.starts_with("agt_"));
+        assert_eq!(created.summary.status, AgentTokenStatus::Active);
+
+        let listed = router.list_agent_tokens();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].token_id, created.summary.token_id);
+        assert_eq!(listed[0].target_scope_summary, "targets:2");
+
+        let revoked = router
+            .revoke_agent_token(&created.summary.token_id, Some("user delete".into()))
+            .expect("revoke");
+        assert_eq!(revoked.status, AgentTokenStatus::Revoked);
+        assert_eq!(revoked.revoke_reason.as_deref(), Some("user delete"));
+    }
+
+    #[test]
+    fn agent_token_plaintext_only_on_create_and_not_returned_by_listing() {
+        let mut router = SecretVaultRouter::default();
+        let created = router
+            .create_agent_token(CreateAgentTokenRequest {
+                label: "ci-runner".into(),
+                created_by: "local-operator".into(),
+                expires_in: None,
+                idle_timeout_sec: None,
+                scope: TokenScopeInput {
+                    scope_profile: None,
+                    target_ids: vec!["local-ssh".into()],
+                    tool_ids: Vec::new(),
+                    max_risk_envelope: None,
+                    allow_open_shell: Some(false),
+                    allow_write_shell_input: Some(false),
+                    allow_artifact_cross_principal: Some(false),
+                    allow_delegation: Some(false),
+                    allow_admin_actions: Some(false),
+                },
+                attestation_id: None,
+            })
+            .expect("create token");
+
+        let listed = router.list_agent_tokens();
+        assert_eq!(listed.len(), 1);
+        assert_ne!(listed[0].token_id, created.plaintext_token);
+        assert!(router
+            .authenticate_agent_token(&created.plaintext_token)
+            .is_some());
+    }
+
+    #[test]
+    fn agent_token_scope_update_creates_new_version_and_preserves_superseded_history() {
+        let mut router = SecretVaultRouter::default();
+        let created = router
+            .create_agent_token(CreateAgentTokenRequest {
+                label: "scope-updater".into(),
+                created_by: "local-operator".into(),
+                expires_in: None,
+                idle_timeout_sec: None,
+                scope: TokenScopeInput {
+                    scope_profile: Some("strict-default".into()),
+                    target_ids: vec!["target-a".into()],
+                    tool_ids: Vec::new(),
+                    max_risk_envelope: None,
+                    allow_open_shell: None,
+                    allow_write_shell_input: None,
+                    allow_artifact_cross_principal: None,
+                    allow_delegation: None,
+                    allow_admin_actions: None,
+                },
+                attestation_id: None,
+            })
+            .expect("create token");
+
+        let updated = router
+            .update_agent_token_scope(UpdateAgentTokenScopeRequest {
+                token_id: created.summary.token_id.clone(),
+                changed_by: "local-operator".into(),
+                scope: TokenScopeInput {
+                    scope_profile: Some("strict-default".into()),
+                    target_ids: vec!["target-a".into(), "target-b".into()],
+                    tool_ids: Vec::new(),
+                    max_risk_envelope: Some("deny-all".into()),
+                    allow_open_shell: Some(false),
+                    allow_write_shell_input: Some(false),
+                    allow_artifact_cross_principal: Some(false),
+                    allow_delegation: Some(false),
+                    allow_admin_actions: Some(false),
+                },
+                reason: Some("expand targets".into()),
+                attestation_id: Some("attest-001".into()),
+            })
+            .expect("update scope");
+        assert_eq!(updated.active_scope_version, 2);
+
+        let scopes = router.token_scope_history(&created.summary.token_id);
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.iter().any(|scope| scope.version == 1
+            && matches!(scope.status, super::TokenScopeStatus::Superseded)));
+        assert!(scopes
+            .iter()
+            .any(|scope| scope.version == 2
+                && matches!(scope.status, super::TokenScopeStatus::Active)));
+    }
+
+    #[test]
+    fn agent_token_lifetime_expiration_blocks_authentication() {
+        let mut router = SecretVaultRouter::default();
+        let created = router
+            .create_agent_token(CreateAgentTokenRequest {
+                label: "expiring-token".into(),
+                created_by: "local-operator".into(),
+                expires_in: Some(Duration::from_millis(1)),
+                idle_timeout_sec: None,
+                scope: TokenScopeInput {
+                    scope_profile: None,
+                    target_ids: vec!["local-ssh".into()],
+                    tool_ids: Vec::new(),
+                    max_risk_envelope: None,
+                    allow_open_shell: None,
+                    allow_write_shell_input: None,
+                    allow_artifact_cross_principal: None,
+                    allow_delegation: None,
+                    allow_admin_actions: None,
+                },
+                attestation_id: None,
+            })
+            .expect("create token");
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(router
+            .authenticate_agent_token(&created.plaintext_token)
+            .is_none());
+        let listed = router.list_agent_tokens();
+        assert_eq!(listed[0].status, AgentTokenStatus::Expired);
     }
 
     #[test]
