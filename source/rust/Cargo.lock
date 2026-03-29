@@ -46,6 +46,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridgingio-desktop-host"
+version = "0.1.0"
+dependencies = [
+ "bridgingio-app-api",
+ "bridgingio-domain",
+]
+
+[[package]]
 name = "bridgingio-domain"
 version = "0.1.0"
 dependencies = [

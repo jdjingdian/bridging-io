@@ -13,12 +13,19 @@ This document defines testing conventions for Rust core and platform UI tests.
 ## UI Test Baseline
 
 - macOS UI tests live in `source/ui/swiftui-macos/Tests/UITests/`.
+- bundled desktop console UI contract tests live in
+  `source/rust/bridgingio-desktop-host/src/bundle.rs`.
 - Required user flows:
   - target selection or creation
   - session state view
   - command timeline view
   - artifact detail or refine view
   - approval request handling
+  - runtime-root onboarding gate
+  - workspace primary navigation (`Targets`/`Timeline`/`Settings`)
+  - timeline source grouping (`token_label` + `http_fingerprint`)
+  - token revoke in trusted settings
+  - vault unlock trusted verification entrypoint
 
 Future platform UI test suites should mirror the same required flows.
 
@@ -29,6 +36,13 @@ The default run plan is:
 ```bash
 cd source/rust
 cargo test
+```
+
+Bundled desktop console contract suite:
+
+```bash
+cd source/rust
+cargo test -p bridgingio-desktop-host
 ```
 
 ## Core Platform Contract

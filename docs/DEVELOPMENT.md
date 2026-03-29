@@ -48,6 +48,7 @@ Cross-platform architecture references:
 - core platform contract: `docs/testing/CORE_PLATFORM_CONTRACT.md`
 - runtime root layout contract: `docs/runtime/RUNTIME_ROOT_LAYOUT.md`
 - platform handoff and workflow boundaries: `docs/runtime/PLATFORM_RUNTIME_HANDOFF.md`
+- tauri shell host/webview handoff: `docs/runtime/TAURI_SHELL_HANDOFF.md`
 
 Cross-platform implementation rules:
 
@@ -95,6 +96,8 @@ Out of current MVP:
   `source/rust/bridgingio-mcp/tests/`).
 - Platform UI work must include UI tests; future platforms must follow the same
   user-flow contract in `docs/testing/UI_PLATFORM_CONTRACT.md`.
+- Bundled desktop console contract updates must run
+  `cargo test -p bridgingio-desktop-host`.
 
 Default test command:
 

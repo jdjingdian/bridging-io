@@ -48,6 +48,20 @@ pub struct ToolchainSettingsView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeLogSettingsView {
+    pub level: String,
+    pub root: String,
+    pub used_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultStatusView {
+    pub status: String,
+    pub configured_backend: String,
+    pub binding_backend: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreSettingsView {
     pub schema_version: u32,
     pub instance_name: String,
@@ -55,6 +69,8 @@ pub struct CoreSettingsView {
     pub model_plane_http: ModelPlaneHttpView,
     pub control_plane: ControlPlaneView,
     pub artifact_cache: ArtifactCacheSettingsView,
+    pub runtime_logs: RuntimeLogSettingsView,
+    pub vault: VaultStatusView,
     pub toolchains: Vec<ToolchainSettingsView>,
 }
 
@@ -111,6 +127,15 @@ pub struct CreateAgentTokenResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineSourceGroupSummaryView {
+    pub group_key: String,
+    pub group_kind: String,
+    pub group_label: String,
+    pub principal_summary: String,
+    pub user_agent_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppCommand {
     AttachUi {
         host_id: String,
@@ -146,6 +171,7 @@ pub enum AppCommand {
     },
     GetSettings,
     UpdateSettings {
+        core_log_level: Option<String>,
         model_plane_host: Option<String>,
         model_plane_port: Option<u16>,
         artifact_cache_backend: Option<String>,
@@ -207,6 +233,7 @@ pub struct TimelineEntry {
     pub session_id: String,
     pub command_preview: String,
     pub status: String,
+    pub source_group: TimelineSourceGroupSummaryView,
     pub artifact_id: Option<String>,
     pub created_at: SystemTime,
 }
@@ -426,6 +453,7 @@ impl AppApiLineCodec {
             }
             AppCommand::GetSettings => base.push_str("|command=get_settings"),
             AppCommand::UpdateSettings {
+                core_log_level,
                 model_plane_host,
                 model_plane_port,
                 artifact_cache_backend,
@@ -436,6 +464,9 @@ impl AppApiLineCodec {
                 tool_override_path,
             } => {
                 base.push_str("|command=update_settings");
+                if let Some(value) = core_log_level {
+                    base.push_str(&format!("|core_log_level={}", escape(value)));
+                }
                 if let Some(value) = model_plane_host {
                     base.push_str(&format!("|model_plane_host={}", escape(value)));
                 }
@@ -688,6 +719,7 @@ impl AppApiLineCodec {
             },
             "get_settings" => AppCommand::GetSettings,
             "update_settings" => AppCommand::UpdateSettings {
+                core_log_level: optional(&map, "core_log_level").map(unescape),
                 model_plane_host: optional(&map, "model_plane_host").map(unescape),
                 model_plane_port: parse_optional_u16(optional(&map, "model_plane_port"))?,
                 artifact_cache_backend: optional(&map, "artifact_cache_backend").map(unescape),
@@ -861,20 +893,29 @@ impl AppApiLineCodec {
                 settings,
             } => {
                 let mut line = format!(
-                    "kind=settings|request_id={request_id}|schema_version={}|instance_name={}|host={}|port={}|allow_non_loopback={}|auth_mode={}|control_transport={}|artifact_backend={}|artifact_root={}|artifact_max_bytes={}|artifact_eviction_policy={}|artifact_used_bytes={}|artifact_count={}|toolchain_count={}",
+                    "kind=settings|request_id={request_id}|schema_version={}|instance_name={}|data_dir={}|host={}|port={}|allow_non_loopback={}|auth_mode={}|control_enabled={}|control_transport={}|control_endpoint={}|artifact_backend={}|artifact_root={}|artifact_max_bytes={}|artifact_eviction_policy={}|artifact_used_bytes={}|artifact_count={}|log_level={}|logs_root={}|logs_used_bytes={}|vault_status={}|vault_configured_backend={}|vault_binding_backend={}|toolchain_count={}",
                     settings.schema_version,
                     escape(&settings.instance_name),
+                    escape(&settings.data_dir),
                     settings.model_plane_http.host,
                     settings.model_plane_http.port,
                     settings.model_plane_http.allow_non_loopback,
                     settings.model_plane_http.auth_mode,
+                    settings.control_plane.enabled,
                     settings.control_plane.transport,
+                    escape(&settings.control_plane.endpoint),
                     settings.artifact_cache.backend,
                     escape(&settings.artifact_cache.root),
                     settings.artifact_cache.max_bytes,
                     settings.artifact_cache.eviction_policy,
                     settings.artifact_cache.used_bytes,
                     settings.artifact_cache.artifact_count,
+                    escape(&settings.runtime_logs.level),
+                    escape(&settings.runtime_logs.root),
+                    settings.runtime_logs.used_bytes,
+                    escape(&settings.vault.status),
+                    escape(&settings.vault.configured_backend),
+                    escape(&settings.vault.binding_backend),
                     settings.toolchains.len(),
                 );
                 for (index, toolchain) in settings.toolchains.iter().enumerate() {
@@ -1078,7 +1119,7 @@ impl AppApiLineCodec {
                         .parse()
                         .map_err(|_| invalid_request("schema_version must be u32"))?,
                     instance_name: unescape(required(&map, "instance_name")?),
-                    data_dir: String::new(),
+                    data_dir: optional(&map, "data_dir").map(unescape).unwrap_or_default(),
                     model_plane_http: ModelPlaneHttpView {
                         host: required(&map, "host")?.to_string(),
                         port: required(&map, "port")?
@@ -1090,9 +1131,15 @@ impl AppApiLineCodec {
                         auth_mode: required(&map, "auth_mode")?.to_string(),
                     },
                     control_plane: ControlPlaneView {
-                        enabled: true,
+                        enabled: optional(&map, "control_enabled")
+                            .map(|raw| raw.parse::<bool>())
+                            .transpose()
+                            .map_err(|_| invalid_request("control_enabled must be bool"))?
+                            .unwrap_or(true),
                         transport: required(&map, "control_transport")?.to_string(),
-                        endpoint: String::new(),
+                        endpoint: optional(&map, "control_endpoint")
+                            .map(unescape)
+                            .unwrap_or_default(),
                     },
                     artifact_cache: ArtifactCacheSettingsView {
                         backend: required(&map, "artifact_backend")?.to_string(),
@@ -1107,6 +1154,27 @@ impl AppApiLineCodec {
                         artifact_count: required(&map, "artifact_count")?
                             .parse()
                             .map_err(|_| invalid_request("artifact_count must be usize"))?,
+                    },
+                    runtime_logs: RuntimeLogSettingsView {
+                        level: optional(&map, "log_level")
+                            .map(unescape)
+                            .unwrap_or_else(|| "info".to_string()),
+                        root: optional(&map, "logs_root")
+                            .map(unescape)
+                            .unwrap_or_default(),
+                        used_bytes: parse_optional_u64(optional(&map, "logs_used_bytes"))?
+                            .unwrap_or(0),
+                    },
+                    vault: VaultStatusView {
+                        status: optional(&map, "vault_status")
+                            .map(unescape)
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        configured_backend: optional(&map, "vault_configured_backend")
+                            .map(unescape)
+                            .unwrap_or_default(),
+                        binding_backend: optional(&map, "vault_binding_backend")
+                            .map(unescape)
+                            .unwrap_or_default(),
                     },
                     toolchains: {
                         let toolchain_count = optional(&map, "toolchain_count")
@@ -1575,7 +1643,7 @@ mod tests {
     use super::{
         AgentTokenScopeView, AgentTokenSummaryView, ApiRequest, ApiRequestContext, ApiResponse,
         AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ControlPlaneView, CoreSettingsView,
-        CreateAgentTokenResult, ModelPlaneHttpView,
+        CreateAgentTokenResult, ModelPlaneHttpView, RuntimeLogSettingsView, VaultStatusView,
     };
 
     #[test]
@@ -1676,6 +1744,16 @@ mod tests {
                     eviction_policy: "lru".into(),
                     used_bytes: 128,
                     artifact_count: 2,
+                },
+                runtime_logs: RuntimeLogSettingsView {
+                    level: "info".into(),
+                    root: "~/.bridgingio/logs".into(),
+                    used_bytes: 512,
+                },
+                vault: VaultStatusView {
+                    status: "ready".into(),
+                    configured_backend: "builtin-encrypted".into(),
+                    binding_backend: "native-memory-shim".into(),
                 },
                 toolchains: Vec::new(),
             },
@@ -1788,6 +1866,16 @@ mod tests {
                     eviction_policy: "lru".into(),
                     used_bytes: 128,
                     artifact_count: 2,
+                },
+                runtime_logs: RuntimeLogSettingsView {
+                    level: "info".into(),
+                    root: "~/.bridgingio/logs".into(),
+                    used_bytes: 512,
+                },
+                vault: VaultStatusView {
+                    status: "ready".into(),
+                    configured_backend: "builtin-encrypted".into(),
+                    binding_backend: "native-memory-shim".into(),
                 },
                 toolchains: vec![super::ToolchainSettingsView {
                     command: "adb".into(),

@@ -34,6 +34,7 @@ fn context(
         run_id: run.into(),
         client_session_id: client.into(),
         reuse_policy,
+        timeline_source: None,
     }
 }
 

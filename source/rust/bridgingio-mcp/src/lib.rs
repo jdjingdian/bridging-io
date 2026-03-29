@@ -10,7 +10,8 @@ use bridgingio_app_api::{
     AgentTokenScopeView, AgentTokenSummaryView, ApiError, ApiErrorCode, ApiRequest, ApiResponse,
     AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ArtifactReadView, ControlPlaneView,
     CoreSettingsView, CreateAgentTokenResult as ApiCreateAgentTokenResult, ModelPlaneHttpView,
-    TimelineEntry, ToolchainDiagnosticView,
+    RuntimeLogSettingsView, TimelineEntry, TimelineSourceGroupSummaryView, ToolchainDiagnosticView,
+    VaultStatusView,
 };
 use bridgingio_artifacts::{
     ArtifactCacheBackend, ArtifactEvictionPolicy, ArtifactReadResult, ArtifactRefineMode,
@@ -170,6 +171,7 @@ pub struct ToolRequestContext {
     pub run_id: String,
     pub client_session_id: String,
     pub reuse_policy: SessionReusePolicy,
+    pub timeline_source: Option<TimelineSourceGroupSummaryView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -701,6 +703,7 @@ struct UiAttachment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SettingsUpdateRequest {
+    core_log_level: Option<String>,
     model_plane_host: Option<String>,
     model_plane_port: Option<u16>,
     artifact_cache_backend: Option<String>,
@@ -1211,6 +1214,7 @@ impl StandaloneCoreRuntime {
         session_id: String,
         command_preview: String,
         status: &str,
+        source_group: TimelineSourceGroupSummaryView,
         artifact_id: Option<String>,
     ) {
         self.next_timeline_seq += 1;
@@ -1219,10 +1223,45 @@ impl StandaloneCoreRuntime {
             session_id,
             command_preview,
             status: status.to_string(),
+            source_group,
             artifact_id,
             created_at: SystemTime::now(),
         };
         self.timeline.push(entry);
+    }
+
+    fn local_ui_timeline_source(
+        context: &bridgingio_app_api::ApiRequestContext,
+    ) -> TimelineSourceGroupSummaryView {
+        let group_key = format!(
+            "trusted-ui:{}:{}",
+            context.agent_id, context.client_session_id
+        );
+        TimelineSourceGroupSummaryView {
+            group_key,
+            group_kind: "trusted_ui".to_string(),
+            group_label: "Trusted Desktop UI".to_string(),
+            principal_summary: "local-operator".to_string(),
+            user_agent_summary: None,
+        }
+    }
+
+    fn timeline_source_from_tool_context(
+        context: &ToolRequestContext,
+    ) -> TimelineSourceGroupSummaryView {
+        context
+            .timeline_source
+            .clone()
+            .unwrap_or_else(|| TimelineSourceGroupSummaryView {
+                group_key: format!("mcp:{}:{}", context.agent_id, context.client_session_id),
+                group_kind: "mcp_actor".to_string(),
+                group_label: "MCP actor".to_string(),
+                principal_summary: context
+                    .principal_id
+                    .clone()
+                    .unwrap_or_else(|| "local-operator".to_string()),
+                user_agent_summary: None,
+            })
     }
 
     fn resolve_target_profile_by_ref(&self, target_ref: &str) -> Option<TargetProfile> {
@@ -1593,6 +1632,7 @@ impl StandaloneCoreRuntime {
             .tool_handler
             .terminal_provider
             .command_preview(&executed_command);
+        let source_group = Self::timeline_source_from_tool_context(&context);
         self.host_platform_adapter.runtime_logger().log(
             RuntimeLogLevel::Debug,
             RuntimeLogCategory::Terminal,
@@ -1665,6 +1705,7 @@ impl StandaloneCoreRuntime {
             logical_session_id.clone(),
             command_preview.clone(),
             "success",
+            source_group,
             Some(artifact_id.clone()),
         );
 
@@ -2334,6 +2375,13 @@ impl StandaloneCoreRuntime {
 
     pub fn settings_view(&self) -> CoreSettingsView {
         let artifact_usage = self.tool_handler.artifact_service.usage();
+        let platform_snapshot = self.host_platform_adapter.snapshot();
+        let runtime_paths = self.host_platform_adapter.runtime_paths().runtime_paths(
+            &self.settings_store.settings.core.instance_name,
+            Path::new(&self.settings_store.settings.core.data_dir),
+        );
+        let logs_root = runtime_paths.logs_dir.to_string_lossy().to_string();
+        let logs_used_bytes = directory_size_bytes(&runtime_paths.logs_dir);
         let mut toolchain_entries = self
             .settings_store
             .settings
@@ -2394,6 +2442,20 @@ impl StandaloneCoreRuntime {
                     .clone(),
                 used_bytes: artifact_usage.used_bytes,
                 artifact_count: artifact_usage.artifact_count,
+            },
+            runtime_logs: RuntimeLogSettingsView {
+                level: self.settings_store.settings.core.log_level.clone(),
+                root: logs_root,
+                used_bytes: logs_used_bytes,
+            },
+            vault: VaultStatusView {
+                status: platform_snapshot.native_vault_status.as_str().to_string(),
+                configured_backend: self.settings_store.settings.vault.backend.clone(),
+                binding_backend: self
+                    .host_platform_adapter
+                    .native_vault_binding()
+                    .backend_label()
+                    .to_string(),
             },
             toolchains: toolchain_entries,
         }
@@ -2474,6 +2536,10 @@ impl StandaloneCoreRuntime {
         let mut settings = self.settings_store.settings.clone();
         let mut restart_required = false;
 
+        if let Some(log_level) = update.core_log_level {
+            settings.core.log_level = log_level;
+            restart_required = true;
+        }
         if let Some(host) = update.model_plane_host {
             settings.model_plane.http.host = host;
             restart_required = true;
@@ -2791,6 +2857,11 @@ impl StandaloneCoreRuntime {
             "host_mode": self.host_mode.as_label(),
             "readiness_state": self.readiness_state_label(),
             "model_plane_ready": self.model_plane_ready(),
+            "management_plane": {
+                "bridge": "trusted_local_control_plane",
+                "requires_management_address_handoff": false,
+                "managed_restart_states": ["saving", "restart_required", "restarting", "connected", "failed"],
+            },
             "capability_health": capability_health,
             "host_platform_adapter": {
                 "host_platform": platform_snapshot.host_platform.as_str(),
@@ -2872,6 +2943,13 @@ impl StandaloneCoreRuntime {
                     "target_id": target_id,
                     "command_preview": entry.command_preview,
                     "status": entry.status,
+                    "source_group": {
+                        "group_key": entry.source_group.group_key,
+                        "group_kind": entry.source_group.group_kind,
+                        "group_label": entry.source_group.group_label,
+                        "principal_summary": entry.source_group.principal_summary,
+                        "user_agent_summary": entry.source_group.user_agent_summary,
+                    },
                     "artifact_id": entry.artifact_id,
                     "created_at_ms": system_time_to_unix_millis(entry.created_at),
                 })
@@ -2986,6 +3064,7 @@ impl StandaloneCoreRuntime {
                     run_id: request.context.run_id,
                     client_session_id: request.context.client_session_id,
                     reuse_policy: request.context.reuse_policy,
+                    timeline_source: None,
                 };
                 let owner = match self.ensure_interactive_shell_access(&shell_id, &context) {
                     Ok(owner) => owner,
@@ -3097,6 +3176,7 @@ impl StandaloneCoreRuntime {
                 settings: self.settings_view(),
             },
             AppCommand::UpdateSettings {
+                core_log_level,
                 model_plane_host,
                 model_plane_port,
                 artifact_cache_backend,
@@ -3107,6 +3187,7 @@ impl StandaloneCoreRuntime {
                 tool_override_path,
             } => {
                 let update = SettingsUpdateRequest {
+                    core_log_level,
                     model_plane_host,
                     model_plane_port,
                     artifact_cache_backend,
@@ -3294,6 +3375,7 @@ impl StandaloneCoreRuntime {
                     .tool_handler
                     .terminal_provider
                     .command_preview(&command);
+                let source_group = Self::local_ui_timeline_source(&request.context);
                 let result = self.tool_handler.handle(ToolRequest::TerminalExec {
                     target_id: target.id.clone(),
                     target_kind: target.kind.clone(),
@@ -3303,6 +3385,7 @@ impl StandaloneCoreRuntime {
                         run_id: request.context.run_id,
                         client_session_id: request.context.client_session_id,
                         reuse_policy: request.context.reuse_policy,
+                        timeline_source: Some(source_group.clone()),
                     },
                     command,
                     artifact_id,
@@ -3318,6 +3401,7 @@ impl StandaloneCoreRuntime {
                             logical_session_id,
                             command_preview.clone(),
                             "success",
+                            source_group.clone(),
                             Some(artifact_id.clone()),
                         );
                         match self.tool_handler.metadata().artifacts.get(&artifact_id) {
@@ -3337,12 +3421,19 @@ impl StandaloneCoreRuntime {
                             session_id,
                             command_preview.clone(),
                             "waiting_approval",
+                            source_group.clone(),
                             None,
                         );
                         error_response(request.request_id, ApiErrorCode::PermissionDenied, &reason)
                     }
                     ToolResult::Error { message } => {
-                        self.push_timeline_entry(session_id, command_preview, "failed", None);
+                        self.push_timeline_entry(
+                            session_id,
+                            command_preview,
+                            "failed",
+                            source_group,
+                            None,
+                        );
                         error_response(request.request_id, ApiErrorCode::Internal, &message)
                     }
                     _ => error_response(
@@ -3402,6 +3493,30 @@ fn control_plane_request_actor(context: &bridgingio_app_api::ApiRequestContext) 
         "control-plane:{}:{}:{}",
         context.agent_id, context.run_id, context.client_session_id
     )
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    let read_dir = match std::fs::read_dir(path) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let mut total = 0u64;
+    for entry in read_dir.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if file_type.is_file() {
+            if let Ok(metadata) = entry.metadata() {
+                total = total.saturating_add(metadata.len());
+            }
+            continue;
+        }
+        if file_type.is_dir() {
+            total = total.saturating_add(directory_size_bytes(&entry.path()));
+        }
+    }
+    total
 }
 
 fn token_scope_input_from_view(view: AgentTokenScopeView) -> TokenScopeInput {
@@ -4494,17 +4609,18 @@ impl ModelPlaneHttpServer {
     }
 
     pub fn serve_once(&self) -> Result<(), CoreRuntimeError> {
-        let (mut stream, _) = self
+        let (mut stream, remote_addr) = self
             .listener
             .accept()
             .map_err(|err| CoreRuntimeError::Io(format!("accept http: {err}")))?;
-        handle_http_connection(&mut stream, &self.runtime)
+        handle_http_connection(&mut stream, &self.runtime, Some(remote_addr))
     }
 }
 
 fn handle_http_connection(
     stream: &mut TcpStream,
     runtime: &SharedRuntime,
+    remote_addr: Option<SocketAddr>,
 ) -> Result<(), CoreRuntimeError> {
     let (method, path, body, headers) = read_http_request(stream, Some(runtime))?;
     trace_mcp(
@@ -4564,12 +4680,17 @@ fn handle_http_connection(
                     .or_else(|| optional_param(&params, "target"))
                     .or_else(|| optional_param(&params, "target_id"))
                     .ok_or_else(|| CoreRuntimeError::Config("missing param target_id".into()))?;
+                let user_agent_summary = summarize_user_agent_header(&headers);
                 let mut context = ToolRequestContext {
                     principal_id: None,
                     agent_id: required_param(&params, "agent_id")?.to_string(),
                     run_id: required_param(&params, "run_id")?.to_string(),
                     client_session_id: required_param(&params, "client_session_id")?.to_string(),
                     reuse_policy: parse_reuse_policy(required_param(&params, "reuse_policy")?)?,
+                    timeline_source: Some(timeline_source_from_http_fingerprint(
+                        remote_addr,
+                        user_agent_summary.clone(),
+                    )),
                 };
 
                 let mut auth_error = None::<&str>;
@@ -4601,6 +4722,11 @@ fn handle_http_connection(
                             auth_error = Some("token_scope_denied_by_risk_envelope");
                         } else {
                             context.principal_id = Some(authenticated.principal_id);
+                            context.timeline_source = Some(timeline_source_from_token_label(
+                                &authenticated.label,
+                                context.principal_id.as_deref().unwrap_or("local-operator"),
+                                user_agent_summary.clone(),
+                            ));
                         }
                     } else {
                         auth_error = Some("invalid_or_expired_token");
@@ -5974,6 +6100,7 @@ fn tool_context_from_args(
         client_session_id: optional_json_string(args, "client_session_id")
             .unwrap_or_else(|| "client-mcp".to_string()),
         reuse_policy,
+        timeline_source: None,
     })
 }
 
@@ -6144,6 +6271,64 @@ fn bearer_token_from_headers(headers: &HashMap<String, String>) -> Option<String
     Some(token.to_string())
 }
 
+fn summarize_user_agent_header(headers: &HashMap<String, String>) -> Option<String> {
+    let raw = headers.get("user-agent")?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let summary = raw.split_whitespace().next().unwrap_or(raw);
+    Some(summary.chars().take(64).collect::<String>())
+}
+
+fn timeline_source_from_token_label(
+    token_label: &str,
+    principal_summary: &str,
+    user_agent_summary: Option<String>,
+) -> TimelineSourceGroupSummaryView {
+    let normalized_label = token_label.trim();
+    TimelineSourceGroupSummaryView {
+        group_key: format!("token-label:{}", normalized_label.to_ascii_lowercase()),
+        group_kind: "token_label".to_string(),
+        group_label: if normalized_label.is_empty() {
+            "token:<unlabeled>".to_string()
+        } else {
+            normalized_label.to_string()
+        },
+        principal_summary: principal_summary.to_string(),
+        user_agent_summary,
+    }
+}
+
+fn timeline_source_from_http_fingerprint(
+    remote_addr: Option<SocketAddr>,
+    user_agent_summary: Option<String>,
+) -> TimelineSourceGroupSummaryView {
+    let addr_seed = remote_addr
+        .map(|value| value.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let ua_seed = user_agent_summary
+        .as_deref()
+        .unwrap_or("unknown-agent")
+        .to_ascii_lowercase();
+    let fingerprint = stable_fingerprint_id(&format!("{addr_seed}|{ua_seed}"));
+    TimelineSourceGroupSummaryView {
+        group_key: format!("http-fingerprint:{fingerprint}"),
+        group_kind: "http_fingerprint".to_string(),
+        group_label: format!("HTTP {fingerprint}"),
+        principal_summary: format!("http:{fingerprint}"),
+        user_agent_summary,
+    }
+}
+
+fn stable_fingerprint_id(seed: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn decode_network_text(runtime: Option<&SharedRuntime>, bytes: &[u8], surface: &str) -> String {
     if let Some(runtime) = runtime {
         if let Ok(locked) = runtime.lock() {
@@ -6279,6 +6464,7 @@ mod tests {
             run_id: run.into(),
             client_session_id: client.into(),
             reuse_policy,
+            timeline_source: None,
         }
     }
 
@@ -6713,6 +6899,7 @@ enabled = true
                 reuse_policy: bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
             },
             command: AppCommand::UpdateSettings {
+                core_log_level: Some("debug".into()),
                 model_plane_host: Some("127.0.0.1".into()),
                 model_plane_port: Some(19719),
                 artifact_cache_backend: None,
@@ -6736,9 +6923,202 @@ enabled = true
             persisted.contains("port = 19719"),
             "persisted config: {persisted}"
         );
+        assert!(
+            persisted.contains("log_level = \"debug\""),
+            "persisted config: {persisted}"
+        );
         let reloaded =
             bridgingio_engine::CoreSettings::load_from_file(&config_path).expect("reload");
         assert_eq!(reloaded.model_plane.http.port, 19719);
+        assert_eq!(reloaded.core.log_level, "debug");
+
+        let bootstrap = runtime.handle_app_request(ApiRequest {
+            request_id: "req-bootstrap".into(),
+            context: request_context(),
+            command: AppCommand::GetBootstrapState {
+                timeline_limit: 10,
+                artifact_limit: 10,
+                transcript_limit: 10,
+            },
+        });
+        let bootstrap_payload = match bootstrap {
+            ApiResponse::Bootstrap { payload_json, .. } => payload_json,
+            other => panic!("expected bootstrap response, got {other:?}"),
+        };
+        let bootstrap_json: serde_json::Value =
+            serde_json::from_str(&bootstrap_payload).expect("bootstrap json");
+        assert_eq!(
+            bootstrap_json["management_plane"]["requires_management_address_handoff"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn settings_view_exposes_runtime_logs_and_vault_status() {
+        let root = temp_dir("settings-view-runtime-vault");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+
+        let view = runtime.settings_view();
+        assert!(view.runtime_logs.root.ends_with("/logs"));
+        assert_eq!(
+            view.runtime_logs.level,
+            runtime.settings_store.settings.core.log_level
+        );
+        assert!(!view.vault.status.is_empty());
+        assert_eq!(
+            view.vault.configured_backend,
+            runtime.settings_store.settings.vault.backend
+        );
+    }
+
+    #[test]
+    fn control_plane_get_settings_includes_vault_status_projection() {
+        let root = temp_dir("control-plane-settings-vault-status");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "settings".into(),
+            context: request_context(),
+            command: AppCommand::GetSettings,
+        });
+        match response {
+            ApiResponse::Settings { settings, .. } => {
+                assert!(!settings.vault.status.is_empty());
+                assert!(!settings.vault.binding_backend.is_empty());
+                assert_eq!(
+                    settings.vault.configured_backend,
+                    runtime.settings_store.settings.vault.backend
+                );
+            }
+            other => panic!("expected settings response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeline_payload_and_bootstrap_include_source_group_summary() {
+        let root = temp_dir("timeline-source-group-summary");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        runtime.push_timeline_entry(
+            "logical-session-1".into(),
+            "echo hello".into(),
+            "success",
+            super::timeline_source_from_token_label(
+                "nightly-runner",
+                "principal-000001",
+                Some("curl/8.0".into()),
+            ),
+            Some("artifact-1".into()),
+        );
+        runtime.push_timeline_entry(
+            "logical-session-2".into(),
+            "uname -a".into(),
+            "success",
+            super::timeline_source_from_http_fingerprint(
+                Some("127.0.0.1:9022".parse().expect("socket")),
+                Some("curl/8.0".into()),
+            ),
+            Some("artifact-2".into()),
+        );
+
+        let timeline = runtime.handle_app_request(ApiRequest {
+            request_id: "timeline".into(),
+            context: request_context(),
+            command: AppCommand::GetTimeline { limit: 10 },
+        });
+        let timeline_payload = match timeline {
+            ApiResponse::Timeline { payload_json, .. } => payload_json,
+            other => panic!("unexpected timeline response: {other:?}"),
+        };
+        let timeline_json: serde_json::Value =
+            serde_json::from_str(&timeline_payload).expect("timeline json");
+        let timeline_items = timeline_json["items"]
+            .as_array()
+            .expect("timeline items array");
+        let timeline_group_kinds: Vec<&str> = timeline_items
+            .iter()
+            .filter_map(|item| item["source_group"]["group_kind"].as_str())
+            .collect();
+        assert!(timeline_group_kinds.contains(&"token_label"));
+        assert!(timeline_group_kinds.contains(&"http_fingerprint"));
+        let has_token_label = timeline_items.iter().any(|item| {
+            item["source_group"]["group_kind"].as_str() == Some("token_label")
+                && item["source_group"]["group_label"].as_str() == Some("nightly-runner")
+        });
+        assert!(has_token_label);
+
+        let bootstrap = runtime.handle_app_request(ApiRequest {
+            request_id: "bootstrap".into(),
+            context: request_context(),
+            command: AppCommand::GetBootstrapState {
+                timeline_limit: 10,
+                artifact_limit: 10,
+                transcript_limit: 10,
+            },
+        });
+        let bootstrap_payload = match bootstrap {
+            ApiResponse::Bootstrap { payload_json, .. } => payload_json,
+            other => panic!("unexpected bootstrap response: {other:?}"),
+        };
+        let bootstrap_json: serde_json::Value =
+            serde_json::from_str(&bootstrap_payload).expect("bootstrap json");
+        let bootstrap_timeline = bootstrap_json["timeline"]
+            .as_array()
+            .expect("bootstrap timeline array");
+        let bootstrap_group_kinds: Vec<&str> = bootstrap_timeline
+            .iter()
+            .filter_map(|item| item["source_group"]["group_kind"].as_str())
+            .collect();
+        assert!(bootstrap_group_kinds.contains(&"token_label"));
+        assert!(bootstrap_group_kinds.contains(&"http_fingerprint"));
+    }
+
+    #[test]
+    fn request_attribution_projection_prefers_token_label_then_fingerprint() {
+        let token_source = super::timeline_source_from_token_label(
+            "release-bot",
+            "principal-000007",
+            Some("curl/8.0".into()),
+        );
+        assert_eq!(token_source.group_kind, "token_label");
+        assert_eq!(token_source.group_label, "release-bot");
+        assert_eq!(token_source.principal_summary, "principal-000007");
+
+        let fallback_source = super::timeline_source_from_http_fingerprint(
+            Some("127.0.0.1:9022".parse().expect("socket")),
+            Some("curl/8.0".into()),
+        );
+        assert_eq!(fallback_source.group_kind, "http_fingerprint");
+        assert!(fallback_source.group_key.starts_with("http-fingerprint:"));
+        assert_ne!(token_source.group_key, fallback_source.group_key);
     }
 
     #[test]
@@ -6814,6 +7194,20 @@ enabled = true
                 assert_eq!(summary.revoke_reason.as_deref(), Some("user delete"));
             }
             other => panic!("expected token revoke response, got {other:?}"),
+        }
+
+        let list_after_revoke = runtime.handle_app_request(ApiRequest {
+            request_id: "token-list-after-revoke".into(),
+            context: request_context(),
+            command: AppCommand::ListAgentTokens,
+        });
+        match list_after_revoke {
+            ApiResponse::AgentTokens { items, .. } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].status, "revoked");
+                assert_eq!(items[0].revoke_reason.as_deref(), Some("user delete"));
+            }
+            other => panic!("expected token list response, got {other:?}"),
         }
     }
 
@@ -6907,6 +7301,7 @@ enabled = true
             run_id: "run-label".into(),
             client_session_id: "client-label".into(),
             reuse_policy: bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+            timeline_source: None,
         };
         let scope = super::build_scope(&context, SystemTime::now());
         assert_eq!(scope.principal_id, "principal-000001");
@@ -7606,6 +8001,7 @@ exit 1
             request_id: "update-global-clear".into(),
             context: request_context(),
             command: AppCommand::UpdateSettings {
+                core_log_level: None,
                 model_plane_host: None,
                 model_plane_port: None,
                 artifact_cache_backend: None,

@@ -377,6 +377,7 @@ pub struct CreateAgentTokenResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthenticatedAgentToken {
     pub token_id: String,
+    pub label: String,
     pub principal_id: String,
     pub active_scope_version: u32,
     pub scope_profile: String,
@@ -1205,7 +1206,7 @@ impl SecretVaultRouter {
         let token_hash = short_digest(token.as_bytes());
         let token_id = self.token_hash_index.get(&token_hash)?.clone();
         let now = SystemTime::now();
-        let (principal_id, active_scope_version, scope_profile) = {
+        let (label, principal_id, active_scope_version, scope_profile) = {
             let record = self.agent_tokens.get_mut(&token_id)?;
             refresh_agent_token_status(record, now);
             if !matches!(record.status, AgentTokenStatus::Active) {
@@ -1213,6 +1214,7 @@ impl SecretVaultRouter {
             }
             record.last_used_at = Some(now);
             (
+                record.label.clone(),
                 record.principal_id.clone(),
                 record.active_scope_version,
                 record.scope_profile.clone(),
@@ -1223,6 +1225,7 @@ impl SecretVaultRouter {
             .clone();
         Some(AuthenticatedAgentToken {
             token_id,
+            label,
             principal_id,
             active_scope_version,
             scope_profile,

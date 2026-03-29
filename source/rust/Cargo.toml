@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "bridgingio-desktop-host",
     "bridgingio-domain",
     "bridgingio-engine",
     "bridgingio-artifacts",
