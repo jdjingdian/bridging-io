@@ -29,19 +29,15 @@ BridgingIO 的每个平台 UI 实现都必须提供平台原生或等价能力�
 - **那么** 该平台实现必须附带覆盖相同关键用户流的 UI Test，而不能只依赖 macOS UI Test 或手工验证
 
 ### 需求:core 必须具备跨平台契约测试基线
-BridgingIO 的 Rust core 必须建立独立于 UI 的 cross-platform contract test 基线，用于验证宿主平台相关的关键能力。该契约至少必须覆盖 one-shot exec、interactive shell 生命周期、cwd/env 语义、local control-plane transport、runtime paths、toolchain fallback、vault backend、output decoding 与 self-test。`bridgingio-core --self-test` 作为 contract-critical smoke 入口时，必须额外覆盖默认 MCP model-plane 监听地址 `127.0.0.1:19718` 的绑定诊断，并在失败时输出可用于排障的原始错误信息。
+BridgingIO 的 Rust core 必须建立独立于 UI 的 cross-platform contract test 基线，用于验证宿主平台相关的关键能力。对于 `design-vault-and-agent-auth` 已经产品化且属于 contract-critical 的安全边界，`bridgingio-core --self-test` 必须额外覆盖 canonical `CredentialRef` 归一化、degraded vault fail-closed、broker-only secret use、本地管理员 `intent + attestation` 单次消费、secret-backed SSH delivery lifecycle，以及 non-loopback model-plane 安全默认值。
 
-#### 场景:验证 Windows 宿主平台契约
-- **当** 团队在 Windows 宿主上运行 core 平台契约测试
-- **那么** 测试必须能够验证 terminal provider、local transport、runtime path 与 artifact 文本采集等核心行为；若 `--self-test` 中默认 MCP 监听地址绑定失败，还必须输出具体绑定错误，而不是只给出笼统失败摘要
-
-#### 场景:验证 Unix 宿主平台契约
-- **当** 团队在 macOS 或 Linux 宿主上运行 core 平台契约测试
-- **那么** 测试必须确认新的平台抽象没有破坏既有 Unix 行为，并记录该平台实际运行的 contract suite 与结果
-
-#### 场景:执行 self-test smoke 入口
+#### 场景:执行包含 vault / auth smoke 的 self-test
 - **当** 团队执行 `bridgingio-core --self-test` 作为 core contract smoke
-- **那么** 自检必须显式报告默认 MCP 监听地址 `127.0.0.1:19718` 的绑定检查结果，并在失败输出中保留底层错误文本
+- **那么** 自检必须验证 canonical `vault://...` 归一化、degraded backend fail-closed、本地管理员验证单次消费，以及 secret-backed SSH delivery 的 broker / fallback 语义，而不能只验证 shell 与 platform contract
+
+#### 场景:验证 model-plane 安全默认值
+- **当** 团队执行 `bridgingio-core --self-test`
+- **那么** 自检必须验证 non-loopback model-plane 暴露仍要求显式 enable 与认证保护，而不能把 `auth_mode=none` + 非 loopback 暴露当作可接受默认值
 
 ### 需求:跨平台自动化测试不得默认依赖 Unix 专有假设
 Rust 核心的集成测试与 fixture 在未显式声明仅限 Unix 的情况下，不得默认依赖 `/tmp`、`/bin/sh`、`pwd`、`printf`、Unix socket 路径或其他 Unix 专有假设。平台差异必须通过 adapter、fixture 或显式平台分层表达，而不是隐式埋在测试脚本中。
@@ -60,3 +56,4 @@ Rust 核心的集成测试与 fixture 在未显式声明仅限 Unix 的情况下
 #### 场景:structured launch fallback 路径的状态一致性验证
 - **当** 测试触发 `terminal.shell.open` 的 structured interactive launch 失败并进入 fallback 路径
 - **那么** 测试必须断言 read/interrupt/close 的 `running`、`interrupted`、`closed` 状态语义保持确定性，并验证 fallback 诊断可见
+

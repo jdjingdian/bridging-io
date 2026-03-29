@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use bridgingio_app_api::{
     ApiError, ApiErrorCode, ApiRequest, ApiResponse, AppApiLineCodec, AppCommand,
@@ -17,8 +17,8 @@ use bridgingio_artifacts::{
 };
 use bridgingio_connectors::{
     target_shell_dialect_for, terminal_concurrency_policy_for, terminal_target_family_for,
-    AdbConnector, CommandInvocation, ExecutableSource, InvocationResolution, SshConnector,
-    TerminalConnector, ToolchainResolver, TARGET_TERMINAL_CONCURRENCY_METADATA_KEY,
+    AdbConnector, CommandInvocation, ExecutableSource, InvocationKind, InvocationResolution,
+    SshConnector, TerminalConnector, ToolchainResolver, TARGET_TERMINAL_CONCURRENCY_METADATA_KEY,
     TARGET_TERMINAL_FAMILY_METADATA_KEY, TARGET_TERMINAL_SHELL_METADATA_KEY,
 };
 use bridgingio_domain::{
@@ -35,11 +35,19 @@ use bridgingio_platform::{
 };
 use bridgingio_policy::{evaluate, OperationKind, PolicyDecision};
 use bridgingio_providers::{GitProvider, TerminalProvider};
-use bridgingio_secrets::{SecretVaultRouter, VaultError};
+use bridgingio_secrets::{
+    normalize_credential_ref, SecretVaultRouter, SshAgentBrokerPrepareRequest, SshHostKeyPolicy,
+    SshKeyPassphraseHandling, VaultError,
+};
 use serde_json::{json, Value};
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+
+const TARGET_SSH_HOST_KEY_POLICY_METADATA_KEY: &str = "ssh.host_key_policy";
+const TARGET_SSH_ALLOW_IDENTITY_FALLBACK_METADATA_KEY: &str = "ssh.allow_identity_fallback";
+const TARGET_SSH_RUNTIME_PASSPHRASE_PROMPT_METADATA_KEY: &str = "ssh.runtime_passphrase_prompt";
+const TARGET_SSH_DELIVERY_MODE_METADATA_KEY: &str = "ssh.delivery_mode";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityEnvelope {
@@ -173,6 +181,7 @@ pub enum ToolRequest {
         context: ToolRequestContext,
         command: String,
         artifact_id: String,
+        invocation: Option<CommandInvocation>,
     },
     ArtifactsRead {
         artifact_id: String,
@@ -388,7 +397,15 @@ impl McpToolHandler {
                 context,
                 command,
                 artifact_id,
-            } => self.run_terminal(target_id, target_kind, context, command, artifact_id),
+                invocation,
+            } => self.run_terminal(
+                target_id,
+                target_kind,
+                context,
+                command,
+                artifact_id,
+                invocation,
+            ),
             ToolRequest::ArtifactsRead {
                 artifact_id,
                 offset,
@@ -482,7 +499,7 @@ impl McpToolHandler {
                         reason: "policy requires explicit approval".into(),
                     };
                 }
-                self.run_terminal(target_id, target_kind, context, command, artifact_id)
+                self.run_terminal(target_id, target_kind, context, command, artifact_id, None)
             }
         }
     }
@@ -494,6 +511,7 @@ impl McpToolHandler {
         context: ToolRequestContext,
         command: String,
         artifact_id: String,
+        invocation: Option<CommandInvocation>,
     ) -> ToolResult {
         let now = SystemTime::now();
         let scope = build_scope(&context, now);
@@ -503,12 +521,21 @@ impl McpToolHandler {
             context.reuse_policy.clone(),
             now,
         );
+        let (resolved_path, resolved_source) = invocation
+            .as_ref()
+            .map(|resolved| {
+                (
+                    resolved.resolution.effective_path.clone(),
+                    resolved.resolution.effective_source.clone(),
+                )
+            })
+            .unwrap_or((None, None));
         let transport = match self.metadata.open_transport_session(
             &logical.logical_session_id,
             &target_id,
             target_kind,
-            None,
-            None,
+            resolved_path,
+            resolved_source,
             now,
         ) {
             Ok(record) => record,
@@ -528,14 +555,26 @@ impl McpToolHandler {
         );
 
         let policy = bridgingio_domain::PolicyProfile::default();
-        let execution_result = self.terminal_provider.exec_local(
-            &logical.logical_session_id,
-            Some(&channel.channel_id),
-            Some(&transport.transport_session_id),
-            &command,
-            &artifact_id,
-            &policy,
-        );
+        let execution_result = if let Some(invocation) = invocation.as_ref() {
+            self.terminal_provider.exec_structured_invocation(
+                &logical.logical_session_id,
+                Some(&channel.channel_id),
+                Some(&transport.transport_session_id),
+                invocation,
+                &command,
+                &artifact_id,
+                &policy,
+            )
+        } else {
+            self.terminal_provider.exec_local(
+                &logical.logical_session_id,
+                Some(&channel.channel_id),
+                Some(&transport.transport_session_id),
+                &command,
+                &artifact_id,
+                &policy,
+            )
+        };
         let completed_at = SystemTime::now();
         let _ = self.metadata.update_channel_status(
             &channel.channel_id,
@@ -740,6 +779,7 @@ struct InteractiveShellOwner {
     channel_id: String,
     transport_session_id: String,
     target_id: String,
+    ssh_broker_session_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -863,7 +903,7 @@ pub struct StandaloneCoreRuntime {
     toolchain_diagnostics: Vec<ToolchainDiagnosticView>,
     toolchain_diagnostics_by_target: HashMap<String, ToolchainDiagnosticView>,
     toolchain_resolver: ToolchainResolver,
-    _vault_router: SecretVaultRouter,
+    vault_router: SecretVaultRouter,
 }
 
 impl StandaloneCoreRuntime {
@@ -954,7 +994,7 @@ impl StandaloneCoreRuntime {
             toolchain_diagnostics: Vec::new(),
             toolchain_diagnostics_by_target: HashMap::new(),
             toolchain_resolver,
-            _vault_router: vault_router,
+            vault_router,
         };
         runtime.refresh_toolchain_diagnostics();
         Ok(runtime)
@@ -1521,29 +1561,63 @@ impl StandaloneCoreRuntime {
         command: &str,
         artifact_id: Option<String>,
     ) -> Result<TargetCommandExecution, CoreRuntimeError> {
-        let invocation = self.resolve_structured_exec_invocation(&target, command)?;
+        let mut invocation = self.resolve_structured_exec_invocation(&target, command)?;
+        let artifact_id = artifact_id.unwrap_or_else(|| self.next_internal_artifact_hint());
+        let one_shot_attach_scope = format!("one-shot:{artifact_id}");
+        let mut ssh_broker_session_id = None;
+        if let Some(invocation_ref) = invocation.as_mut() {
+            ssh_broker_session_id = self.prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context,
+                invocation_ref,
+                None,
+            )?;
+            if let Some(session_id) = ssh_broker_session_id.as_deref() {
+                self.vault_router
+                    .attach_ssh_agent_broker_session(session_id, &one_shot_attach_scope)
+                    .map_err(vault_error_to_runtime)?;
+            }
+        }
         let executed_command = invocation
             .as_ref()
             .map(CommandInvocation::to_host_shell_command)
             .unwrap_or_else(|| command.to_string());
+        let command_preview = self.tool_handler.terminal_provider.command_preview(command);
+        let executed_command_preview = self
+            .tool_handler
+            .terminal_provider
+            .command_preview(&executed_command);
         self.host_platform_adapter.runtime_logger().log(
             RuntimeLogLevel::Debug,
             RuntimeLogCategory::Terminal,
             &format!(
-                "executing target command target_id={} kind={} command={}",
+                "executing target command target_id={} kind={} command_preview={}",
                 target.id,
                 target_kind_label(&target.kind),
-                command
+                command_preview
             ),
         );
-        let artifact_id = artifact_id.unwrap_or_else(|| self.next_internal_artifact_hint());
         let result = self.tool_handler.handle(ToolRequest::TerminalExec {
             target_id: target.id.clone(),
             target_kind: target.kind.clone(),
             context,
-            command: executed_command.clone(),
-            artifact_id,
+            command: command.to_string(),
+            artifact_id: artifact_id.clone(),
+            invocation: invocation.clone(),
         });
+        if let Some(session_id) = ssh_broker_session_id.as_deref() {
+            let _ = self
+                .vault_router
+                .detach_ssh_agent_broker_session(session_id, &one_shot_attach_scope);
+            let cleanup_reason = if matches!(result, ToolResult::Execution { .. }) {
+                "one-shot execution completed"
+            } else {
+                "one-shot execution ended with error"
+            };
+            let _ = self
+                .vault_router
+                .close_ssh_agent_broker_session(session_id, cleanup_reason);
+        }
 
         let (artifact_id, logical_session_id, channel_id) = match result {
             ToolResult::Execution {
@@ -1583,7 +1657,7 @@ impl StandaloneCoreRuntime {
 
         self.push_timeline_entry(
             logical_session_id.clone(),
-            command.to_string(),
+            command_preview.clone(),
             "success",
             Some(artifact_id.clone()),
         );
@@ -1592,8 +1666,8 @@ impl StandaloneCoreRuntime {
             requested_target_ref,
             resolved_target_id: target.id.clone(),
             target_kind: target_kind_label(&target.kind),
-            command: command.to_string(),
-            executed_command,
+            command: command_preview,
+            executed_command: executed_command_preview,
             invocation,
             artifact_id,
             logical_session_id,
@@ -1670,9 +1744,6 @@ impl StandaloneCoreRuntime {
         } else {
             self.resolve_transport_executable_for_target(&target)
         };
-        let launch_command = invocation
-            .as_ref()
-            .map(CommandInvocation::to_host_shell_command);
         let transport = self
             .tool_handler
             .metadata_mut()
@@ -1693,6 +1764,18 @@ impl StandaloneCoreRuntime {
             Some("terminal.interactive".into()),
             now,
         );
+        let mut ssh_broker_session_id = None;
+        if let Some(invocation_ref) = invocation.as_mut() {
+            ssh_broker_session_id = self.prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context,
+                invocation_ref,
+                Some(&channel.channel_id),
+            )?;
+        }
+        let launch_command = invocation
+            .as_ref()
+            .map(CommandInvocation::to_host_shell_command);
         let shell = match self
             .tool_handler
             .terminal_provider
@@ -1717,6 +1800,15 @@ impl StandaloneCoreRuntime {
                     "interactive shell open failed",
                     failed_at,
                 );
+                if let Some(session_id) = ssh_broker_session_id.as_deref() {
+                    let _ = self
+                        .vault_router
+                        .detach_ssh_agent_broker_session(session_id, &channel.channel_id);
+                    let _ = self.vault_router.close_ssh_agent_broker_session(
+                        session_id,
+                        "interactive shell open failed",
+                    );
+                }
                 return Err(CoreRuntimeError::Config(err.message));
             }
         };
@@ -1736,6 +1828,7 @@ impl StandaloneCoreRuntime {
                 channel_id: channel.channel_id.clone(),
                 transport_session_id: transport.transport_session_id.clone(),
                 target_id: target.id.clone(),
+                ssh_broker_session_id,
             },
         );
 
@@ -1813,6 +1906,13 @@ impl StandaloneCoreRuntime {
             .terminal_provider
             .read_interactive_transcript(shell_id, offset, limit)
             .map_err(|err| CoreRuntimeError::Config(err.message))?;
+        if state.closed {
+            self.release_interactive_ssh_broker(
+                shell_id,
+                &owner,
+                "interactive shell ended and broker cleanup was triggered",
+            );
+        }
 
         Ok(InteractiveShellReadOutcome {
             shell_id: shell_id.to_string(),
@@ -1878,6 +1978,7 @@ impl StandaloneCoreRuntime {
             "interactive shell closed",
             now,
         );
+        self.release_interactive_ssh_broker(shell_id, &owner, "interactive shell closed");
         let state = self
             .tool_handler
             .terminal_provider
@@ -1894,6 +1995,96 @@ impl StandaloneCoreRuntime {
             running: state.running,
             lines: Vec::new(),
         })
+    }
+
+    fn prepare_ssh_secret_delivery_for_invocation(
+        &mut self,
+        target: &TargetProfile,
+        context: &ToolRequestContext,
+        invocation: &mut CommandInvocation,
+        attach_channel_id: Option<&str>,
+    ) -> Result<Option<String>, CoreRuntimeError> {
+        if !matches!(target.kind, TargetKind::Ssh) {
+            return Ok(None);
+        }
+        if target
+            .metadata
+            .get(TARGET_SSH_DELIVERY_MODE_METADATA_KEY)
+            .map(|raw| !raw.trim().eq_ignore_ascii_case("ssh-agent-broker"))
+            .unwrap_or(true)
+        {
+            return Ok(None);
+        }
+        let Some(credential_ref) = target.credential_ref.as_ref() else {
+            return Ok(None);
+        };
+
+        let host_key_policy = ssh_host_key_policy_for_target(target);
+        let allow_identity_fallback = target
+            .metadata
+            .get(TARGET_SSH_ALLOW_IDENTITY_FALLBACK_METADATA_KEY)
+            .map(|raw| parse_bool_metadata(raw, true))
+            .unwrap_or(true);
+        let runtime_passphrase_requested = target
+            .metadata
+            .get(TARGET_SSH_RUNTIME_PASSPHRASE_PROMPT_METADATA_KEY)
+            .map(|raw| parse_bool_metadata(raw, false))
+            .unwrap_or(false);
+        let prepared = self
+            .vault_router
+            .prepare_ssh_agent_broker_session(SshAgentBrokerPrepareRequest {
+                target_id: target.id.clone(),
+                credential_ref: credential_ref.id.clone(),
+                principal_id: context.agent_id.clone(),
+                logical_session_id: None,
+                host_platform: runtime_host_platform_label(self.host_platform_adapter.as_ref()),
+                allow_identity_fallback,
+                host_key_policy,
+                key_passphrase_handling: SshKeyPassphraseHandling::RuntimePromptForbidden,
+                runtime_passphrase_requested,
+                session_ttl: Some(Duration::from_secs(120)),
+            })
+            .map_err(vault_error_to_runtime)?;
+
+        apply_ssh_delivery_args(invocation, &prepared.ssh_option_args);
+        invocation
+            .resolution
+            .warnings
+            .extend(prepared.diagnostics.clone());
+        invocation.resolution.warnings.push(format!(
+            "ssh broker session {} endpoint_kind={} degraded={}",
+            prepared.session.broker_session_id,
+            prepared.session.endpoint_kind.as_str(),
+            prepared.session.degraded
+        ));
+
+        if let Some(channel_id) = attach_channel_id {
+            self.vault_router
+                .attach_ssh_agent_broker_session(&prepared.session.broker_session_id, channel_id)
+                .map_err(vault_error_to_runtime)?;
+        }
+
+        Ok(Some(prepared.session.broker_session_id))
+    }
+
+    fn release_interactive_ssh_broker(
+        &mut self,
+        shell_id: &str,
+        owner: &InteractiveShellOwner,
+        reason: &str,
+    ) {
+        let Some(state) = self.interactive_shell_owners.get_mut(shell_id) else {
+            return;
+        };
+        let Some(session_id) = state.ssh_broker_session_id.take() else {
+            return;
+        };
+        let _ = self
+            .vault_router
+            .detach_ssh_agent_broker_session(&session_id, &owner.channel_id);
+        let _ = self
+            .vault_router
+            .close_ssh_agent_broker_session(&session_id, reason);
     }
 
     fn ensure_interactive_shell_access(
@@ -2240,6 +2431,7 @@ impl StandaloneCoreRuntime {
         &mut self,
         profile: TargetProfile,
     ) -> Result<String, CoreRuntimeError> {
+        let profile = normalize_profile_credential_ref(profile)?;
         if profile.id.trim().is_empty() {
             return Err(CoreRuntimeError::Config("target id is required".into()));
         }
@@ -3023,7 +3215,10 @@ impl StandaloneCoreRuntime {
                     }
                 };
                 let artifact_id = format!("ipc-artifact-{}", request.request_id);
-                let command_preview = command.clone();
+                let command_preview = self
+                    .tool_handler
+                    .terminal_provider
+                    .command_preview(&command);
                 let result = self.tool_handler.handle(ToolRequest::TerminalExec {
                     target_id: target.id.clone(),
                     target_kind: target.kind.clone(),
@@ -3035,6 +3230,7 @@ impl StandaloneCoreRuntime {
                     },
                     command,
                     artifact_id,
+                    invocation: None,
                 });
                 match result {
                     ToolResult::Execution {
@@ -3489,6 +3685,49 @@ fn invocation_resolution_from_toolchain(
     }
 }
 
+fn apply_ssh_delivery_args(invocation: &mut CommandInvocation, option_args: &[String]) {
+    if option_args.is_empty() {
+        return;
+    }
+    let insertion_index = match invocation.invocation_kind {
+        InvocationKind::OneShot if invocation.args.len() >= 2 => invocation.args.len() - 2,
+        InvocationKind::Interactive if !invocation.args.is_empty() => invocation.args.len() - 1,
+        _ => invocation.args.len(),
+    };
+    let mut index = insertion_index;
+    for value in option_args {
+        invocation.args.insert(index, value.clone());
+        index += 1;
+    }
+}
+
+fn parse_bool_metadata(raw: &str, default: bool) -> bool {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn ssh_host_key_policy_for_target(target: &TargetProfile) -> SshHostKeyPolicy {
+    let Some(raw) = target.metadata.get(TARGET_SSH_HOST_KEY_POLICY_METADATA_KEY) else {
+        return SshHostKeyPolicy::Strict;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "accept-new" | "accept_new" => SshHostKeyPolicy::AcceptNew,
+        "insecure-no-check" | "insecure_no_check" | "no-check" => SshHostKeyPolicy::InsecureNoCheck,
+        _ => SshHostKeyPolicy::Strict,
+    }
+}
+
+fn runtime_host_platform_label(adapter: &dyn HostPlatformAdapter) -> String {
+    match adapter.host_platform().as_str() {
+        "windows" => "windows".into(),
+        "unix" => std::env::consts::OS.to_string(),
+        _ => "unknown".into(),
+    }
+}
+
 fn invocation_json(invocation: Option<&CommandInvocation>) -> Value {
     let Some(invocation) = invocation else {
         return Value::Null;
@@ -3623,6 +3862,17 @@ fn looks_like_named_pipe_endpoint(endpoint: &str) -> bool {
     endpoint.trim().starts_with(r"\\.\pipe\")
 }
 
+fn normalize_profile_credential_ref(
+    mut profile: TargetProfile,
+) -> Result<TargetProfile, CoreRuntimeError> {
+    if let Some(credential_ref) = profile.credential_ref.as_mut() {
+        credential_ref.id =
+            normalize_credential_ref(&credential_ref.id).map_err(vault_error_to_runtime)?;
+        credential_ref.provider = "vault".into();
+    }
+    Ok(profile)
+}
+
 fn to_target_profile(
     configured: &StandaloneTargetProfile,
 ) -> Result<TargetProfile, CoreRuntimeError> {
@@ -3687,17 +3937,23 @@ fn to_target_profile(
             }
         })
         .collect::<bridgingio_domain::MetadataMap>();
+    let credential_ref = configured
+        .credential_ref
+        .as_ref()
+        .map(|reference| {
+            normalize_credential_ref(reference).map(|normalized| bridgingio_domain::CredentialRef {
+                id: normalized,
+                provider: "vault".into(),
+            })
+        })
+        .transpose()
+        .map_err(vault_error_to_runtime)?;
     Ok(TargetProfile {
         id: configured.id.clone(),
         name: configured.display_name.clone(),
         kind: configured.kind.clone(),
         connection,
-        credential_ref: configured.credential_ref.as_ref().map(|reference| {
-            bridgingio_domain::CredentialRef {
-                id: reference.clone(),
-                provider: "vault".into(),
-            }
-        }),
+        credential_ref,
         default_policy: bridgingio_domain::PolicyProfile::default(),
         notes: configured.notes.clone(),
         metadata,
@@ -3824,7 +4080,9 @@ fn to_standalone_target_profile(
         credential_ref: profile
             .credential_ref
             .as_ref()
-            .map(|value| value.id.clone()),
+            .map(|value| normalize_credential_ref(&value.id))
+            .transpose()
+            .map_err(vault_error_to_runtime)?,
         notes: profile.notes.clone(),
         connection,
         terminal: StandaloneTerminalSection {
@@ -5963,6 +6221,7 @@ mod tests {
             contender,
             "echo ping".into(),
             "artifact-contender".into(),
+            None,
         );
         match result {
             ToolResult::Error { message } => {
@@ -6328,6 +6587,95 @@ enabled = true
     }
 
     #[test]
+    fn secret_backed_ssh_delivery_injects_broker_args_and_tracks_lifecycle() {
+        let root = temp_dir("secret-backed-ssh-delivery");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        runtime
+            .vault_router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch vault backend");
+        runtime
+            .vault_router
+            .put("vault:ssh-key:ops", "OPS-KEY", "ops key")
+            .expect("store key");
+
+        let mut target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        target.metadata.insert(
+            "ssh.delivery_mode".to_string(),
+            "ssh-agent-broker".to_string(),
+        );
+        target
+            .metadata
+            .insert("ssh.host_key_policy".to_string(), "accept-new".to_string());
+        target.credential_ref = Some(bridgingio_domain::CredentialRef {
+            id: "vault:ssh-key:ops".into(),
+            provider: "vault".into(),
+        });
+
+        let mut invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        let session_id = runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-ssh-broker",
+                    "run-ssh-broker",
+                    "client-ssh-broker",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut invocation,
+                Some("channel-ssh-1"),
+            )
+            .expect("prepare delivery")
+            .expect("broker session id");
+
+        assert!(invocation
+            .args
+            .iter()
+            .any(|arg| arg.contains("IdentityAgent=")));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|arg| arg.contains("StrictHostKeyChecking=accept-new")));
+        assert!(invocation
+            .resolution
+            .warnings
+            .iter()
+            .any(|line| line.contains("ssh broker session")));
+
+        let summary = runtime
+            .vault_router
+            .ssh_agent_broker_session_summary(&session_id)
+            .expect("summary");
+        assert_eq!(summary.state.as_str(), "attached");
+        assert_eq!(summary.attached_channel_count, 1);
+
+        runtime
+            .vault_router
+            .detach_ssh_agent_broker_session(&session_id, "channel-ssh-1")
+            .expect("detach");
+        let closed = runtime
+            .vault_router
+            .close_ssh_agent_broker_session(&session_id, "test cleanup")
+            .expect("close");
+        assert_eq!(closed.state.as_str(), "closed");
+    }
+
+    #[test]
     fn invocation_json_separates_host_runtime_and_target_terminal_dimensions() {
         let root = temp_dir("invocation-dimension-separation");
         let settings = bridgingio_engine::CoreSettings::from_toml_str(
@@ -6583,6 +6931,79 @@ exit 1
         assert_eq!(
             standalone.terminal_provider.shell.as_deref(),
             Some("powershell")
+        );
+    }
+
+    #[test]
+    fn upsert_profile_normalizes_legacy_credential_ref_before_persisting() {
+        let root = temp_dir("legacy-credential-ref");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let config_path = root.join("managed-core.toml");
+        fs::write(
+            &config_path,
+            bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("write config");
+        runtime.settings_store.runtime_metadata.config_path =
+            Some(config_path.to_string_lossy().to_string());
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "upsert-legacy-ref".into(),
+            context: request_context(),
+            command: AppCommand::UpsertProfile {
+                profile: TargetProfile {
+                    id: "legacy-ref-target".into(),
+                    name: "Legacy Ref Target".into(),
+                    kind: TargetKind::Ssh,
+                    connection: ConnectionConfig::Ssh {
+                        host: "127.0.0.1".into(),
+                        port: 22,
+                        username: "dev".into(),
+                    },
+                    credential_ref: Some(bridgingio_domain::CredentialRef {
+                        id: "vault:ssh-key:ops_prod".into(),
+                        provider: "legacy".into(),
+                    }),
+                    default_policy: PolicyProfile::default(),
+                    notes: None,
+                    metadata: BTreeMap::new(),
+                    toolchains: BTreeMap::new(),
+                },
+            },
+        });
+        match response {
+            ApiResponse::Accepted { apply_strategy, .. } => {
+                assert_eq!(apply_strategy.as_deref(), Some("live_applied"));
+            }
+            other => panic!("unexpected upsert response: {other:?}"),
+        }
+
+        let profile_response = runtime.handle_app_request(ApiRequest {
+            request_id: "get-legacy-ref".into(),
+            context: request_context(),
+            command: AppCommand::GetProfile {
+                target_id: "legacy-ref-target".into(),
+            },
+        });
+        let payload_json = match profile_response {
+            ApiResponse::Profile { payload_json, .. } => payload_json,
+            other => panic!("unexpected profile response: {other:?}"),
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_json).expect("profile payload json");
+        assert_eq!(
+            payload["credential_ref"].as_str(),
+            Some("vault://bridgingio/ssh-private-key/ops-prod")
         );
     }
 

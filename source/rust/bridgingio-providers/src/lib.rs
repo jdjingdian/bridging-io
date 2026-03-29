@@ -4,12 +4,14 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use bridgingio_artifacts::{ArtifactRefineMode, InMemoryArtifactStore};
+use bridgingio_connectors::CommandInvocation;
 use bridgingio_domain::{ArtifactRecord, CapabilitySummary, PolicyProfile};
 use bridgingio_platform::{
     detect_host_platform_adapter, HostPlatformAdapter, InteractiveShellDiagnostics,
     LocalShellRuntimeSnapshot, RuntimeLogCategory, RuntimeLogLevel,
 };
 use bridgingio_policy::{evaluate, OperationKind, PolicyDecision};
+use bridgingio_secrets::{command_audit_preview, RuntimeRedactionRegistry};
 
 const INTERACTIVE_LAUNCH_STRUCTURED: &str = "structured_interactive_invocation";
 const INTERACTIVE_LAUNCH_HOST_BASELINE: &str = "host_baseline";
@@ -41,6 +43,7 @@ pub fn terminal_provider_capability() -> CapabilitySummary {
 pub struct TerminalProvider {
     pub artifacts: InMemoryArtifactStore,
     host_platform_adapter: Box<dyn HostPlatformAdapter>,
+    redaction_registry: RuntimeRedactionRegistry,
     interactive_contexts: HashMap<String, InteractiveShellContext>,
     next_shell_seq: u64,
     next_command_seq: u64,
@@ -92,6 +95,7 @@ impl Default for TerminalProvider {
         Self {
             artifacts: InMemoryArtifactStore::default(),
             host_platform_adapter: detect_host_platform_adapter("info"),
+            redaction_registry: RuntimeRedactionRegistry::default(),
             interactive_contexts: HashMap::new(),
             next_shell_seq: 0,
             next_command_seq: 0,
@@ -100,6 +104,18 @@ impl Default for TerminalProvider {
 }
 
 impl TerminalProvider {
+    pub fn register_sensitive_value(&mut self, value: &str) {
+        self.redaction_registry.register(value);
+    }
+
+    pub fn redact_for_display(&self, text: &str) -> String {
+        self.redaction_registry.redact(text)
+    }
+
+    pub fn command_preview(&self, command: &str) -> String {
+        command_audit_preview(&self.redact_for_display(command))
+    }
+
     pub fn exec_local(
         &mut self,
         logical_session_id: &str,
@@ -130,17 +146,71 @@ impl TerminalProvider {
             logical_session_id.to_string(),
             channel_id.map(ToString::to_string),
             transport_session_id.map(ToString::to_string),
-            command.to_string(),
+            self.command_preview(command),
             "terminal command output",
             SystemTime::now(),
         );
 
         for line in output.stdout_lines {
-            self.artifacts.append_chunk(&created.id, line);
+            self.artifacts
+                .append_chunk(&created.id, self.redact_for_display(&line));
         }
         for line in output.stderr_lines {
+            self.artifacts.append_chunk(
+                &created.id,
+                self.redact_for_display(&format!("stderr: {line}")),
+            );
+        }
+
+        Ok(created)
+    }
+
+    pub fn exec_structured_invocation(
+        &mut self,
+        logical_session_id: &str,
+        channel_id: Option<&str>,
+        transport_session_id: Option<&str>,
+        invocation: &CommandInvocation,
+        source_command: &str,
+        artifact_id: &str,
+        policy: &PolicyProfile,
+    ) -> Result<ArtifactRecord, ProviderError> {
+        if matches!(
+            evaluate(policy, OperationKind::Write),
+            PolicyDecision::RequireApproval
+        ) && source_command.contains("rm ")
+        {
+            return Err(ProviderError {
+                message: "command requires approval".into(),
+            });
+        }
+
+        let output = Command::new(&invocation.program)
+            .args(&invocation.args)
+            .output()
+            .map_err(|err| ProviderError {
+                message: format!("failed to execute structured invocation: {err}"),
+            })?;
+
+        let created = self.artifacts.create_raw(
+            artifact_id.to_string(),
+            logical_session_id.to_string(),
+            channel_id.map(ToString::to_string),
+            transport_session_id.map(ToString::to_string),
+            self.command_preview(source_command),
+            "terminal command output",
+            SystemTime::now(),
+        );
+
+        for line in decode_command_output_lines(&output.stdout) {
             self.artifacts
-                .append_chunk(&created.id, format!("stderr: {line}"));
+                .append_chunk(&created.id, self.redact_for_display(&line));
+        }
+        for line in decode_command_output_lines(&output.stderr) {
+            self.artifacts.append_chunk(
+                &created.id,
+                self.redact_for_display(&format!("stderr: {line}")),
+            );
         }
 
         Ok(created)
@@ -256,18 +326,24 @@ impl TerminalProvider {
             context.logical_session_id.clone(),
             Some(context.channel_id.clone()),
             context.transport_session_id.clone(),
-            command.trim().to_string(),
+            self.command_preview(command.trim()),
             "interactive shell output",
             SystemTime::now(),
         );
 
         for line in &outcome.output_lines {
-            self.artifacts.append_chunk(&created.id, line.clone());
+            self.artifacts
+                .append_chunk(&created.id, self.redact_for_display(line));
         }
+        let redacted_output_lines = outcome
+            .output_lines
+            .iter()
+            .map(|line| self.redact_for_display(line))
+            .collect::<Vec<_>>();
 
         Ok(InteractiveShellWriteResult {
             shell_id: shell_id.to_string(),
-            output: outcome.output_lines.join("\n"),
+            output: redacted_output_lines.join("\n"),
             prompt: outcome.snapshot.prompt,
             cwd: outcome.snapshot.cwd,
             artifact_id: created.id,
@@ -286,6 +362,12 @@ impl TerminalProvider {
             .local_shell_runtime()
             .read_interactive_transcript(shell_id, offset, limit)
             .map_err(runtime_error_to_provider_error)
+            .map(|lines| {
+                lines
+                    .into_iter()
+                    .map(|line| self.redact_for_display(&line))
+                    .collect()
+            })
     }
 
     pub fn get_interactive_shell(
@@ -305,7 +387,13 @@ impl TerminalProvider {
             .local_shell_runtime()
             .interactive_shell_state(shell_id)
             .map_err(runtime_error_to_provider_error)?;
-        Ok(runtime_state_to_provider_state(context, snapshot))
+        let mut state = runtime_state_to_provider_state(context, snapshot);
+        state.transcript = state
+            .transcript
+            .into_iter()
+            .map(|line| self.redact_for_display(&line))
+            .collect();
+        Ok(state)
     }
 
     pub fn interrupt_interactive_shell(&mut self, shell_id: &str) -> Result<(), ProviderError> {
@@ -447,6 +535,15 @@ fn parse_artifact_refine_mode(mode_label: &str) -> Result<ArtifactRefineMode, Pr
             message: format!("invalid artifact refine mode: {other}"),
         }),
     }
+}
+
+fn decode_command_output_lines(bytes: &[u8]) -> Vec<String> {
+    let normalized = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    normalized
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 pub struct GitProvider {
@@ -601,6 +698,91 @@ mod tests {
     }
 
     #[test]
+    fn exec_local_redacts_sensitive_output_and_uses_command_preview() {
+        let mut provider = TerminalProvider::default();
+        provider.register_sensitive_value("super-secret-token");
+        let policy = PolicyProfile::default();
+        #[cfg(windows)]
+        let command = "echo super-secret-token";
+        #[cfg(not(windows))]
+        let command = "printf 'super-secret-token\\n'";
+
+        let artifact = provider
+            .exec_local(
+                "session",
+                Some("ch-redact"),
+                Some("ts-redact"),
+                command,
+                "art-redact",
+                &policy,
+            )
+            .expect("exec command");
+        let stored = provider
+            .artifacts
+            .artifacts
+            .get(&artifact.id)
+            .expect("stored artifact");
+        let source_command = stored.source_command.clone().unwrap_or_default();
+        assert!(source_command.contains("cmd#"));
+        assert!(!source_command.contains("super-secret-token"));
+
+        let chunks = provider.artifacts.read_chunks(&artifact.id, 0, 20);
+        assert!(chunks.iter().any(|line| line.contains("[REDACTED]")));
+        assert!(!chunks
+            .iter()
+            .any(|line| line.contains("super-secret-token")));
+    }
+
+    #[test]
+    fn exec_structured_invocation_runs_program_args_directly() {
+        let mut provider = TerminalProvider::default();
+        let policy = PolicyProfile::default();
+        #[cfg(windows)]
+        let invocation = bridgingio_connectors::CommandInvocation {
+            program: "cmd".into(),
+            args: vec!["/C".into(), "echo structured-direct-ok".into()],
+            invocation_kind: bridgingio_connectors::InvocationKind::OneShot,
+            target_terminal_family: bridgingio_domain::TerminalTargetFamily::Terminal,
+            target_terminal_concurrency_policy:
+                bridgingio_domain::TerminalConcurrencyPolicy::Multiplexed,
+            target_shell_dialect: bridgingio_connectors::TargetShellDialect::SshPosix,
+            resolution: bridgingio_connectors::InvocationResolution::default(),
+            quoting_boundary: bridgingio_connectors::InvocationQuotingBoundary::default(),
+        };
+        #[cfg(not(windows))]
+        let invocation = bridgingio_connectors::CommandInvocation {
+            program: "/bin/sh".into(),
+            args: vec!["-lc".into(), "printf 'structured-direct-ok\\n'".into()],
+            invocation_kind: bridgingio_connectors::InvocationKind::OneShot,
+            target_terminal_family: bridgingio_domain::TerminalTargetFamily::Terminal,
+            target_terminal_concurrency_policy:
+                bridgingio_domain::TerminalConcurrencyPolicy::Multiplexed,
+            target_shell_dialect: bridgingio_connectors::TargetShellDialect::SshPosix,
+            resolution: bridgingio_connectors::InvocationResolution::default(),
+            quoting_boundary: bridgingio_connectors::InvocationQuotingBoundary::default(),
+        };
+
+        let artifact = provider
+            .exec_structured_invocation(
+                "session",
+                Some("ch-structured"),
+                Some("ts-structured"),
+                &invocation,
+                "__do_not_execute_this_via_shell__",
+                "art-structured",
+                &policy,
+            )
+            .expect("exec structured invocation");
+        let chunks = provider.artifacts.read_chunks(&artifact.id, 0, 20);
+        assert!(
+            chunks
+                .iter()
+                .any(|line| line.contains("structured-direct-ok")),
+            "artifact chunks: {chunks:?}"
+        );
+    }
+
+    #[test]
     fn interactive_shell_preserves_env_and_cwd_per_channel() {
         let mut provider = TerminalProvider::default();
         let policy = PolicyProfile::default();
@@ -663,6 +845,31 @@ mod tests {
             .write_interactive_shell(&shell.shell_id, "echo after-close", "s2", &policy)
             .expect_err("must reject");
         assert!(err.message.contains("closed"));
+    }
+
+    #[test]
+    fn interactive_transcript_is_redacted_via_shared_registry() {
+        let mut provider = TerminalProvider::default();
+        provider.register_sensitive_value("transcript-secret");
+        let policy = PolicyProfile::default();
+        let shell = provider
+            .open_interactive_shell("ls-redact", "ch-1", Some("ts-1"), "ssh")
+            .expect("open shell");
+        #[cfg(windows)]
+        let write_command = "echo transcript-secret";
+        #[cfg(not(windows))]
+        let write_command = "printf 'transcript-secret\\n'";
+        provider
+            .write_interactive_shell(&shell.shell_id, write_command, "a-redact", &policy)
+            .expect("write secret");
+
+        let transcript = provider
+            .read_interactive_transcript(&shell.shell_id, 0, 200)
+            .expect("read transcript");
+        assert!(transcript.iter().any(|line| line.contains("[REDACTED]")));
+        assert!(!transcript
+            .iter()
+            .any(|line| line.contains("transcript-secret")));
     }
 
     #[test]

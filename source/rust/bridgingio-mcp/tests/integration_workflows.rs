@@ -298,6 +298,7 @@ fn validates_ssh_adb_git_flow_with_artifacts_and_approval() {
         context: ssh_context.clone(),
         command: command_info_boot_error_panic().into(),
         artifact_id: "artifact-ssh-raw".into(),
+        invocation: None,
     });
     let ssh_artifact = match ssh_exec {
         ToolResult::Execution { artifact_id, .. } => artifact_id,
@@ -346,6 +347,7 @@ fn validates_ssh_adb_git_flow_with_artifacts_and_approval() {
         ),
         command: command_shell_ok().into(),
         artifact_id: "artifact-adb-raw".into(),
+        invocation: None,
     });
     assert!(matches!(adb_exec, ToolResult::Execution { .. }));
 
@@ -382,6 +384,7 @@ fn validates_cross_target_artifact_reanalysis_without_ssh_adb_semantics() {
         ),
         command: command_system_server_netd().into(),
         artifact_id: "artifact-http-raw".into(),
+        invocation: None,
     });
     let source_artifact_id = match exec {
         ToolResult::Execution { artifact_id, .. } => artifact_id,
@@ -431,6 +434,7 @@ fn validates_multi_agent_isolation_resume_and_multi_channel() {
             context: context(agent, "run-1", "client-shared", reuse_policy),
             command: command_ok().into(),
             artifact_id: artifact_id.into(),
+            invocation: None,
         }
     };
 

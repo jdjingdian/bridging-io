@@ -91,9 +91,11 @@ name = "bridgingio-providers"
 version = "0.1.0"
 dependencies = [
  "bridgingio-artifacts",
+ "bridgingio-connectors",
  "bridgingio-domain",
  "bridgingio-platform",
  "bridgingio-policy",
+ "bridgingio-secrets",
 ]
 
 [[package]]

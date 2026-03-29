@@ -6,6 +6,8 @@ license = "MIT"
 
 [dependencies]
 bridgingio-artifacts = { path = "../bridgingio-artifacts" }
+bridgingio-connectors = { path = "../bridgingio-connectors" }
 bridgingio-domain = { path = "../bridgingio-domain" }
 bridgingio-platform = { path = "../bridgingio-platform" }
 bridgingio-policy = { path = "../bridgingio-policy" }
+bridgingio-secrets = { path = "../bridgingio-secrets" }

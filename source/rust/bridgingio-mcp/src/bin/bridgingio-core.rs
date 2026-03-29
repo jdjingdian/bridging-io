@@ -12,8 +12,8 @@ use bridgingio_connectors::{
 };
 use bridgingio_domain::{PolicyProfile, SessionReusePolicy, TargetKind};
 use bridgingio_engine::{
-    CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile, StandaloneTerminalSection,
-    TerminalProviderSection,
+    ConfigError, CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile,
+    StandaloneTerminalSection, TerminalProviderSection,
 };
 use bridgingio_mcp::{
     control_plane_socket_path, CoreHostMode, CoreRuntimeError, ModelPlaneHttpServer,
@@ -24,6 +24,10 @@ use bridgingio_platform::{
     RuntimeLogLevel,
 };
 use bridgingio_providers::TerminalProvider;
+use bridgingio_secrets::{
+    normalize_credential_ref, LocalAdminActionKind, SecretVaultRouter,
+    SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, VaultError,
+};
 use serde_json::json;
 
 #[cfg(unix)]
@@ -112,7 +116,7 @@ fn run_self_test() -> Result<(), String> {
     let marker_runtime = "BRIDGINGIO_SELFTEST_RUNTIME_OK";
     let cwd_hint = "bridgingio selftest cwd";
 
-    println!("self-test [1/6] validating terminal provider one-shot execution...");
+    println!("self-test [1/8] validating terminal provider one-shot execution...");
     let mut provider = TerminalProvider::default();
     let one_shot_artifact = provider
         .exec_local(
@@ -135,7 +139,7 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("self-test [ok] terminal provider one-shot execution");
 
-    println!("self-test [2/6] validating interactive shell open/write/read/interrupt/close...");
+    println!("self-test [2/8] validating interactive shell open/write/read/interrupt/close...");
     let shell = provider
         .open_interactive_shell(
             "self-test-session",
@@ -160,7 +164,7 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("self-test [ok] interactive shell lifecycle");
 
-    println!("self-test [3/6] validating interactive cwd/env semantics...");
+    println!("self-test [3/8] validating interactive cwd/env semantics...");
     let interactive_cwd = self_test_root.join(cwd_hint);
     fs::create_dir_all(&interactive_cwd)
         .map_err(|err| format!("create self-test cwd dir failed: {err}"))?;
@@ -268,7 +272,7 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("self-test [ok] interactive cwd/env semantics");
 
-    println!("self-test [4/6] validating space-containing path/argument handling...");
+    println!("self-test [4/8] validating space-containing path/argument handling...");
     let spaced_file = interactive_cwd.join("file with space.txt");
     fs::write(&spaced_file, format!("{marker_space}\n"))
         .map_err(|err| format!("write self-test spaced file failed: {err}"))?;
@@ -361,7 +365,11 @@ fn run_self_test() -> Result<(), String> {
     }
     println!("self-test [ok] interactive transcript/checkpoint");
 
-    println!("self-test [5/7] validating default model-plane bind probe...");
+    println!("self-test [5/8] validating vault and auth contract smoke...");
+    validate_vault_and_auth_contract_smoke()?;
+    println!("self-test [ok] vault and auth contract smoke");
+
+    println!("self-test [6/8] validating default model-plane bind probe...");
     let runtime_root = self_test_root.join("runtime");
     let state_dir = runtime_root.join("state");
     let artifacts_dir = runtime_root.join("artifacts");
@@ -391,7 +399,7 @@ fn run_self_test() -> Result<(), String> {
         bind_probe_host, bind_probe_port
     );
 
-    println!("self-test [6/7] validating standalone runtime execute path without config file...");
+    println!("self-test [7/8] validating standalone runtime execute path without config file...");
     settings.model_plane.http.enabled = false;
     settings.targets = vec![StandaloneTargetProfile {
         id: "self-test-local".into(),
@@ -500,7 +508,7 @@ fn run_self_test() -> Result<(), String> {
 
     println!("self-test [ok] standalone runtime execute path");
 
-    println!("self-test [7/7] validating host platform contract snapshot...");
+    println!("self-test [8/8] validating host platform contract snapshot...");
     let host_platform_adapter = detect_host_platform_adapter("info");
     let snapshot = host_platform_adapter.snapshot();
     if snapshot.host_platform == HostPlatform::Unknown {
@@ -589,6 +597,215 @@ fn probe_model_plane_bind(settings: &CoreSettings, config_hint: &Path) -> Result
         format!("self-test model-plane bind probe failed at {host}:{port}: {err:?}")
     })?;
     drop(server);
+    Ok(())
+}
+
+fn validate_vault_and_auth_contract_smoke() -> Result<(), String> {
+    let canonical = normalize_credential_ref("vault:ssh-key:ops_prod")
+        .map_err(|err| format!("normalize credential ref failed: {err:?}"))?;
+    if canonical != "vault://bridgingio/ssh-private-key/ops-prod" {
+        return Err(format!(
+            "credential ref canonicalization mismatch: {canonical}"
+        ));
+    }
+
+    let mut router = SecretVaultRouter::default();
+    match router.put("vault:ssh-key:dev", "SELF-TEST-DEV-KEY", "dev key") {
+        Err(VaultError::FailClosed(_)) => {}
+        other => {
+            return Err(format!(
+                "degraded backend must fail closed before explicit allow: {other:?}"
+            ))
+        }
+    }
+    let diag = router
+        .active_backend_diagnostics()
+        .map_err(|err| format!("read degraded backend diagnostics failed: {err:?}"))?;
+    if !diag.fail_closed {
+        return Err("degraded vault backend diagnostics must remain fail-closed".into());
+    }
+
+    router
+        .set_active_backend("builtin-encrypted")
+        .map_err(|err| format!("switch builtin-encrypted backend failed: {err:?}"))?;
+    router
+        .put(
+            "vault:infra:token:self_test",
+            "SELF-TEST-HTTP-TOKEN",
+            "self-test token",
+        )
+        .map_err(|err| format!("store self-test http token failed: {err:?}"))?;
+    router
+        .put(
+            "vault:ssh-key:self-test",
+            "SELF-TEST-SSH-KEY",
+            "self-test ssh key",
+        )
+        .map_err(|err| format!("store self-test ssh key failed: {err:?}"))?;
+
+    match router.get("vault:infra:token:self_test") {
+        Err(VaultError::PlaintextAccessDisabled(_)) => {}
+        other => {
+            return Err(format!(
+                "plaintext get must remain disabled on canonical vault refs: {other:?}"
+            ))
+        }
+    }
+
+    let lease = router
+        .use_for_http_auth("vault:infra:token:self_test", "provider:self-test")
+        .map_err(|err| format!("issue broker lease for http auth failed: {err:?}"))?;
+    let leased_secret =
+        lease.with_secret_bytes(|bytes| std::str::from_utf8(bytes).unwrap_or_default().to_string());
+    if leased_secret != "SELF-TEST-HTTP-TOKEN" {
+        return Err(format!(
+            "brokered http secret mismatch: expected SELF-TEST-HTTP-TOKEN, got {leased_secret}"
+        ));
+    }
+    let redacted = router
+        .redaction_registry()
+        .redact("Authorization: Bearer SELF-TEST-HTTP-TOKEN");
+    if redacted.contains("SELF-TEST-HTTP-TOKEN") || !redacted.contains("[REDACTED]") {
+        return Err(format!(
+            "redaction registry failed to mask brokered token: {redacted}"
+        ));
+    }
+
+    let intent = router
+        .create_local_admin_intent(
+            LocalAdminActionKind::RevealSecret,
+            "vault:ssh-key:self-test",
+            "self-test-admin",
+            Duration::from_secs(60),
+        )
+        .map_err(|err| format!("create local admin intent failed: {err:?}"))?;
+    let attestation = router
+        .verify_local_admin_intent(
+            &intent.intent_id,
+            "self-test-admin",
+            "passkey",
+            Duration::from_secs(30),
+        )
+        .map_err(|err| format!("verify local admin intent failed: {err:?}"))?;
+    let revealed = router
+        .reveal_for_local_admin(
+            "vault:ssh-key:self-test",
+            &intent.intent_id,
+            &attestation.attestation_id,
+            "self-test-admin",
+        )
+        .map_err(|err| format!("reveal for local admin failed: {err:?}"))?;
+    if revealed.expose_utf8_for_use() != Some("SELF-TEST-SSH-KEY") {
+        return Err("local admin reveal returned unexpected secret".into());
+    }
+    match router.reveal_for_local_admin(
+        "vault:ssh-key:self-test",
+        &intent.intent_id,
+        &attestation.attestation_id,
+        "self-test-admin",
+    ) {
+        Err(VaultError::LocalAdminVerificationRequired(_))
+        | Err(VaultError::LocalAdminAttestationMismatch(_)) => {}
+        Err(err) => {
+            return Err(format!(
+                "local admin intent/attestation returned unexpected error on second use: {err:?}"
+            ))
+        }
+        Ok(_) => return Err("local admin intent/attestation must be single-use".into()),
+    }
+
+    let host_platform = if cfg!(windows) { "windows" } else { "unix" };
+    let prepared = router
+        .prepare_ssh_agent_broker_session(SshAgentBrokerPrepareRequest {
+            target_id: "self-test-target".into(),
+            credential_ref: "vault:ssh-key:self-test".into(),
+            principal_id: "self-test-agent".into(),
+            logical_session_id: Some("self-test-logical-session".into()),
+            host_platform: host_platform.into(),
+            allow_identity_fallback: true,
+            host_key_policy: SshHostKeyPolicy::AcceptNew,
+            key_passphrase_handling: SshKeyPassphraseHandling::ImportTimeOnly,
+            runtime_passphrase_requested: false,
+            session_ttl: Some(Duration::from_secs(30)),
+        })
+        .map_err(|err| format!("prepare ssh broker session failed: {err:?}"))?;
+    if !prepared
+        .ssh_option_args
+        .iter()
+        .any(|arg| arg.contains("IdentityAgent=") || arg == "-i")
+    {
+        return Err(format!(
+            "ssh broker smoke did not emit broker/fallback ssh args: {:?}",
+            prepared.ssh_option_args
+        ));
+    }
+    let attached = router
+        .attach_ssh_agent_broker_session(&prepared.session.broker_session_id, "channel-self-test")
+        .map_err(|err| format!("attach ssh broker session failed: {err:?}"))?;
+    if attached.attached_channel_count != 1 {
+        return Err(format!(
+            "ssh broker attach count mismatch: {}",
+            attached.attached_channel_count
+        ));
+    }
+    let detached = router
+        .detach_ssh_agent_broker_session(&prepared.session.broker_session_id, "channel-self-test")
+        .map_err(|err| format!("detach ssh broker session failed: {err:?}"))?;
+    if detached.attached_channel_count != 0 {
+        return Err(format!(
+            "ssh broker detach count mismatch: {}",
+            detached.attached_channel_count
+        ));
+    }
+    let closed = router
+        .close_ssh_agent_broker_session(&prepared.session.broker_session_id, "self-test cleanup")
+        .map_err(|err| format!("close ssh broker session failed: {err:?}"))?;
+    if closed.state.as_str() != "closed" {
+        return Err(format!(
+            "ssh broker session must close after cleanup, got {}",
+            closed.state.as_str()
+        ));
+    }
+    let ssh_diag = router
+        .ssh_agent_broker_diagnostics(&prepared.session.broker_session_id)
+        .map_err(|err| format!("read ssh broker diagnostics failed: {err:?}"))?;
+    if !ssh_diag
+        .iter()
+        .any(|line| line.contains("principal scope: self-test-agent"))
+    {
+        return Err(format!(
+            "ssh broker diagnostics missing principal scope: {ssh_diag:?}"
+        ));
+    }
+    if !ssh_diag
+        .iter()
+        .any(|line| line.contains("logical session scope: self-test-logical-session"))
+    {
+        return Err(format!(
+            "ssh broker diagnostics missing logical session scope: {ssh_diag:?}"
+        ));
+    }
+
+    let mut invalid =
+        CoreSettings::minimal_example().replace("host = \"127.0.0.1\"", "host = \"0.0.0.0\"");
+    match CoreSettings::from_toml_str(&invalid) {
+        Err(ConfigError::NonLoopbackExplicitEnableRequired(_)) => {}
+        other => {
+            return Err(format!(
+                "non-loopback host must require explicit enable: {other:?}"
+            ))
+        }
+    }
+    invalid = invalid.replace("allow_non_loopback = false", "allow_non_loopback = true");
+    match CoreSettings::from_toml_str(&invalid) {
+        Err(ConfigError::NonLoopbackAuthRequired(_)) => {}
+        other => {
+            return Err(format!(
+                "non-loopback host must require auth mode when protection is enabled: {other:?}"
+            ))
+        }
+    }
+
     Ok(())
 }
 
