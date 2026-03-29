@@ -464,6 +464,42 @@
       flex-wrap: wrap;
     }
 
+    .token-once-panel {
+      margin-top: var(--space-3);
+      border-color: rgba(3, 105, 161, 0.36);
+      background: linear-gradient(140deg, rgba(224, 242, 254, 0.72), rgba(255, 255, 255, 0.95));
+    }
+
+    .token-once-title {
+      margin: 0 0 var(--space-1) 0;
+      font-size: 14px;
+      font-weight: 700;
+      color: #0b486a;
+    }
+
+    .token-once-token {
+      min-height: 86px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .token-once-feedback {
+      margin: var(--space-1) 0 0 0;
+      font-size: 12px;
+      color: #1f4f67;
+      min-height: 18px;
+    }
+
+    .token-once-feedback.ok {
+      color: var(--ok);
+    }
+
+    .token-once-feedback.warn {
+      color: var(--warn);
+    }
+
     .status-text {
       margin-top: var(--space-3);
       min-height: 20px;
@@ -852,6 +888,27 @@
                 <button id="vault-unlock-btn" type="button" class="btn btn-accent">Unlock Vault (Trusted Verification)</button>
                 <button id="vault-issue-btn" type="button" class="btn btn-primary">Issue Long-Lived Token</button>
               </div>
+              <div id="vault-token-once-panel" class="token-once-panel hidden" role="status" aria-live="polite">
+                <h3 class="token-once-title">One-Time Token Result</h3>
+                <p class="muted">This plaintext token is shown once. Close or refresh clears this panel, and token summaries never show plaintext values.</p>
+                <div class="grid-2">
+                  <div>
+                    <label for="vault-issued-label">Issued Label</label>
+                    <input id="vault-issued-label" readonly />
+                  </div>
+                  <div>
+                    <label for="vault-issued-token-id">Token Summary ID</label>
+                    <input id="vault-issued-token-id" readonly />
+                  </div>
+                </div>
+                <label for="vault-issued-token">Plaintext Token</label>
+                <textarea id="vault-issued-token" class="token-once-token" readonly spellcheck="false"></textarea>
+                <p id="vault-issued-copy-feedback" class="token-once-feedback"></p>
+                <div class="row">
+                  <button id="vault-copy-token-btn" type="button" class="btn btn-primary">Copy Token</button>
+                  <button id="vault-dismiss-token-btn" type="button" class="btn btn-secondary">Close One-Time Result</button>
+                </div>
+              </div>
             </article>
           </section>
 
@@ -876,6 +933,9 @@
       transcript: "",
       restartState: "idle",
       targetDrafts: new Map(),
+      issuedTokenResult: null,
+      issuedTokenCopyFeedback: "",
+      issuedTokenCopyFeedbackKind: "",
     };
 
     const el = {
@@ -924,6 +984,13 @@
       vaultTtl: document.getElementById("vault-ttl"),
       vaultUnlockBtn: document.getElementById("vault-unlock-btn"),
       vaultIssueBtn: document.getElementById("vault-issue-btn"),
+      vaultTokenOncePanel: document.getElementById("vault-token-once-panel"),
+      vaultIssuedLabel: document.getElementById("vault-issued-label"),
+      vaultIssuedTokenId: document.getElementById("vault-issued-token-id"),
+      vaultIssuedToken: document.getElementById("vault-issued-token"),
+      vaultIssuedCopyFeedback: document.getElementById("vault-issued-copy-feedback"),
+      vaultCopyTokenBtn: document.getElementById("vault-copy-token-btn"),
+      vaultDismissTokenBtn: document.getElementById("vault-dismiss-token-btn"),
       loadingOverlay: document.getElementById("host-loading"),
       loadingText: document.getElementById("host-loading-text"),
     };
@@ -1412,6 +1479,57 @@
       }
     }
 
+    function renderIssuedTokenResult() {
+      const result = state.issuedTokenResult;
+      if (!result) {
+        el.vaultTokenOncePanel.classList.add("hidden");
+        el.vaultIssuedLabel.value = "";
+        el.vaultIssuedTokenId.value = "";
+        el.vaultIssuedToken.value = "";
+        el.vaultIssuedCopyFeedback.textContent = "";
+        el.vaultIssuedCopyFeedback.className = "token-once-feedback";
+        return;
+      }
+
+      el.vaultTokenOncePanel.classList.remove("hidden");
+      el.vaultIssuedLabel.value = text(result.label, "n/a");
+      el.vaultIssuedTokenId.value = text(result.tokenId, "pending-summary");
+      el.vaultIssuedToken.value = text(result.plaintextToken, "");
+      el.vaultIssuedCopyFeedback.textContent = state.issuedTokenCopyFeedback || "";
+      const feedbackKind = state.issuedTokenCopyFeedbackKind || "";
+      el.vaultIssuedCopyFeedback.className = `token-once-feedback ${feedbackKind}`.trim();
+    }
+
+    function clearIssuedTokenResult() {
+      state.issuedTokenResult = null;
+      state.issuedTokenCopyFeedback = "";
+      state.issuedTokenCopyFeedbackKind = "";
+      renderIssuedTokenResult();
+    }
+
+    async function copyIssuedTokenResult() {
+      const plaintextToken = state.issuedTokenResult?.plaintextToken;
+      if (!plaintextToken) {
+        return;
+      }
+
+      try {
+        if (!navigator?.clipboard?.writeText) {
+          throw new Error("Clipboard API unavailable in current host context.");
+        }
+        await navigator.clipboard.writeText(plaintextToken);
+        state.issuedTokenCopyFeedback = "Token copied to clipboard.";
+        state.issuedTokenCopyFeedbackKind = "ok";
+        setStatus("One-time token copied to clipboard.", "ok");
+      } catch (err) {
+        state.issuedTokenCopyFeedback = err?.message || "Copy failed. Token remains visible for manual copy.";
+        state.issuedTokenCopyFeedbackKind = "warn";
+        setStatus("Clipboard copy failed. Token remains visible for manual copy.", "warn");
+      }
+
+      renderIssuedTokenResult();
+    }
+
     function refreshStatusBar() {
       const runtimePath = state.bootstrap?.runtime_root?.path || state.bootstrap?.settings?.data_dir || "not-selected";
       const readiness = text(state.bootstrap?.readiness_state, "unknown");
@@ -1672,9 +1790,20 @@
           scope: defaultTokenScope(),
           attestation_id: "trusted-host-local-verification",
         });
-        if (result?.result?.plaintext_token) {
-          setStatus(`Long-lived token issued for ${label}. Plaintext token returned once.`, "ok");
+        const created = result?.result || {};
+        const plaintextToken = created?.plaintext_token;
+        if (plaintextToken) {
+          state.issuedTokenResult = {
+            label,
+            tokenId: created?.summary?.token_id || "",
+            plaintextToken,
+          };
+          state.issuedTokenCopyFeedback = "";
+          state.issuedTokenCopyFeedbackKind = "";
+          renderIssuedTokenResult();
+          setStatus(`Long-lived token issued for ${label}. One-time token result is shown below.`, "ok");
         } else {
+          clearIssuedTokenResult();
           setStatus(`Long-lived token issued for ${label}.`, "ok");
         }
         el.vaultLabel.value = "";
@@ -1733,6 +1862,8 @@
     }
 
     async function loadWorkspace(showStatus = true) {
+      // One-time token reveal is tied to the current UI session and is cleared when bootstrap state is rebuilt.
+      clearIssuedTokenResult();
       setHostLoading(
         true,
         "Preparing runtime and connecting to trusted host bridge. If a stale core exists, it will be cleaned up in background."
@@ -1798,6 +1929,8 @@
       el.refreshTokensBtn.addEventListener("click", loadTokens);
       el.vaultUnlockBtn.addEventListener("click", unlockVault);
       el.vaultIssueBtn.addEventListener("click", issueToken);
+      el.vaultCopyTokenBtn.addEventListener("click", copyIssuedTokenResult);
+      el.vaultDismissTokenBtn.addEventListener("click", clearIssuedTokenResult);
       el.loadTranscriptBtn.addEventListener("click", loadTranscript);
     }
 

@@ -121,6 +121,9 @@ mod tests {
             "id=\"refresh-tokens-btn\"",
             "id=\"vault-unlock-btn\"",
             "id=\"vault-issue-btn\"",
+            "id=\"vault-token-once-panel\"",
+            "id=\"vault-copy-token-btn\"",
+            "id=\"vault-dismiss-token-btn\"",
             "trusted local verification",
         ];
 
@@ -210,10 +213,35 @@ mod tests {
             "id=\"vault-unlock-btn\"",
             "requiretrustedverification(\"vault_unlock\")",
             "bridgecommand(\"unlock_vault\"",
+            "id=\"vault-token-once-panel\"",
+            "id=\"vault-copy-token-btn\"",
+            "id=\"vault-dismiss-token-btn\"",
+            "function copyissuedtokenresult()",
         ] {
             assert!(
                 html.contains(&snippet.to_ascii_lowercase()),
                 "settings security contract missing: {snippet}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_security_ui_contract_covers_one_time_token_result_lifecycle() {
+        let spec = TauriShellHostSpec::new("/tmp/bridgingio-core");
+        let html = spec.bundled_index_html().to_ascii_lowercase();
+        for snippet in [
+            "one-time token result",
+            "this plaintext token is shown once",
+            "function renderissuedtokenresult()",
+            "function clearissuedtokenresult()",
+            "clearissuedtokenresult();",
+            "state.issuedtokenresult = null",
+            "plaintext token is shown once",
+            "token summaries never show plaintext values",
+        ] {
+            assert!(
+                html.contains(&snippet.to_ascii_lowercase()),
+                "one-time token result contract missing: {snippet}"
             );
         }
     }
