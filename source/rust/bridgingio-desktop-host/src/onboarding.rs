@@ -4,7 +4,7 @@ use crate::storage::{
     validate_runtime_root, RuntimeRootPreferenceStore, RuntimeRootValidationError,
 };
 
-const ONBOARDING_HTML: &str = include_str!("../assets/onboarding.html");
+const ONBOARDING_HTML: &str = include_str!("../../../ui/tauri-console-web/onboarding.html");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OnboardingAction {

@@ -98,6 +98,8 @@ Out of current MVP:
   user-flow contract in `docs/testing/UI_PLATFORM_CONTRACT.md`.
 - Bundled desktop console contract updates must run
   `cargo test -p bridgingio-desktop-host`.
+- Tauri desktop host smoke verification must run
+  `scripts/testing/run-tauri-shell-smoke.sh`.
 
 Default test command:
 
@@ -110,6 +112,33 @@ Cross-platform contract baseline:
 
 ```bash
 scripts/testing/run-core-platform-contract.sh
+```
+
+Tauri shell startup smoke:
+
+```bash
+scripts/testing/run-tauri-shell-smoke.sh
+```
+
+## Tauri Shell Host Layout
+
+Cross-platform desktop host implementation lives under:
+
+- `source/ui/tauri-console-web/src-tauri` (Tauri app crate)
+- `source/rust/bridgingio-desktop-host` (host contract/state library)
+- `source/ui/tauri-console-web/*.html` (bundled page source of truth)
+
+`bridgingio-core` sidecar path conventions:
+
+1. `BRIDGINGIO_CORE_SIDECAR` (explicit override)
+2. `source/ui/tauri-console-web/src-tauri/bin/bridgingio-core[.exe]` (staged)
+3. `source/rust/target/{debug,release}/bridgingio-core[.exe]` (local build)
+4. packaged sidecar directory adjacent to app executable
+
+Sidecar staging helper:
+
+```bash
+source/ui/tauri-console-web/src-tauri/scripts/stage-sidecar.sh debug
 ```
 
 ## Standalone Core Quick Start

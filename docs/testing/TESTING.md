@@ -45,6 +45,12 @@ cd source/rust
 cargo test -p bridgingio-desktop-host
 ```
 
+Tauri shell host smoke verification:
+
+```bash
+scripts/testing/run-tauri-shell-smoke.sh
+```
+
 ## Core Platform Contract
 
 Cross-platform core verification must follow:

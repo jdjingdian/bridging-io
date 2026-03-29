@@ -128,6 +128,9 @@
 
   <script>
     const invoke = window.__TAURI__?.core?.invoke || window.__TAURI__?.invoke;
+    const parentInvoke = (window.parent && window.parent !== window)
+      ? window.parent.__BRIDGING_TRUSTED_INVOKE
+      : null;
     const pathField = document.getElementById("runtime-root-path");
     const status = document.getElementById("onboarding-status");
     const continueButton = document.getElementById("continue-workspace");
@@ -141,12 +144,33 @@
       return pathField.value.trim();
     }
 
+    async function invokeHost(names, payload = {}) {
+      const candidates = Array.isArray(names) ? names : [names];
+      if (invoke) {
+        let lastErr;
+        for (const name of candidates) {
+          try {
+            return await invoke(name, payload);
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+        throw lastErr || new Error("invoke failed");
+      }
+      if (typeof parentInvoke === "function") {
+        return parentInvoke(candidates, payload);
+      }
+      throw new Error("Trusted host bridge is unavailable.");
+    }
+
     async function chooseDirectory() {
-      if (!invoke) {
-        setStatus("Trusted host bridge is unavailable.", false);
+      let path;
+      try {
+        path = await invokeHost(["pick_runtime_root_dir"]);
+      } catch (err) {
+        setStatus(err?.message || "Trusted host bridge is unavailable.", false);
         return;
       }
-      const path = await invoke("pick_runtime_root_dir");
       if (path && path.trim().length > 0) {
         pathField.value = path;
         continueButton.disabled = true;
@@ -155,16 +179,18 @@
     }
 
     async function validateDirectory() {
-      if (!invoke) {
-        setStatus("Trusted host bridge is unavailable.", false);
-        return;
-      }
       const path = selectedPath();
       if (!path) {
         setStatus("Select a runtime root first.", false);
         return;
       }
-      const result = await invoke("validate_runtime_root", { path });
+      let result;
+      try {
+        result = await invokeHost(["validate_runtime_root"], { path });
+      } catch (err) {
+        setStatus(err?.message || "Trusted host bridge is unavailable.", false);
+        return;
+      }
       if (result?.ok) {
         continueButton.disabled = false;
         setStatus("Runtime root is writable. You can continue.", true);
@@ -175,18 +201,28 @@
     }
 
     async function completeOnboarding() {
-      if (!invoke) {
-        setStatus("Trusted host bridge is unavailable.", false);
-        return;
-      }
       const path = selectedPath();
       if (!path) {
         setStatus("Select and validate a runtime root first.", false);
         return;
       }
-      const result = await invoke("complete_onboarding_runtime_root", { path });
+      let result;
+      try {
+        result = await invokeHost(["complete_onboarding_runtime_root"], { path });
+      } catch (err) {
+        setStatus(err?.message || "Trusted host bridge is unavailable.", false);
+        return;
+      }
       if (result?.ok) {
         setStatus("Runtime root saved. Opening workspace...", true);
+        if (window.parent && window.parent !== window) {
+          window.parent.location.hash = "#/workspace/targets";
+          if (typeof window.parent.dispatchEvent === "function") {
+            window.parent.dispatchEvent(new HashChangeEvent("hashchange"));
+          }
+        } else {
+          window.location.hash = "#/workspace/targets";
+        }
       } else {
         continueButton.disabled = true;
         setStatus(result?.message || "Could not save runtime root.", false);

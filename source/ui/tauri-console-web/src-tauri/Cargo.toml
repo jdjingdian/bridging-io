@@ -1,0 +1,22 @@
+[package]
+name = "bridgingio-tauri-console-shell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "BridgingIO cross-platform Tauri shell host"
+
+[lib]
+name = "bridgingio_tauri_console_shell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+bridgingio-app-api = { path = "../../../rust/bridgingio-app-api" }
+bridgingio-desktop-host = { path = "../../../rust/bridgingio-desktop-host" }
+bridgingio-platform = { path = "../../../rust/bridgingio-platform" }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }

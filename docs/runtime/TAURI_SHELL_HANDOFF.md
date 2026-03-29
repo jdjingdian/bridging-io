@@ -68,6 +68,17 @@ Bundled UI contract tests must pass before archive:
   - token revoke entrypoint in settings
   - vault unlock trusted verification entrypoint
 
+## Platform Transport Follow-up
+
+- Current Tauri host baseline treats non-Unix local control-plane transport as
+  deferred/unsupported and surfaces explicit diagnostics rather than pretending
+  workspace attach succeeded.
+- Unix hosts use `state/control-plane.sock` for trusted attach.
+- Windows remains blocked on named pipe runtime server/client wiring. Endpoint
+  naming contract is fixed (`\\.\pipe\bridgingio-<instance>-control-plane`),
+  but production attach/read-write lifecycle must be completed before claiming
+  true cross-platform runtime support.
+
 ## Design Reference For macOS Refactor
 
 The cross-platform desktop console design assets are the reference baseline for

@@ -1,11 +1,7 @@
 use std::path::{Path, PathBuf};
 
-const BUNDLED_INDEX_HTML: &str = include_str!("../assets/index.html");
-const BUNDLED_ONBOARDING_HTML: &str = include_str!("../assets/onboarding.html");
-#[cfg(test)]
-const SOURCE_INDEX_HTML: &str = include_str!("../../../ui/tauri-console-web/index.html");
-#[cfg(test)]
-const SOURCE_ONBOARDING_HTML: &str = include_str!("../../../ui/tauri-console-web/onboarding.html");
+const BUNDLED_INDEX_HTML: &str = include_str!("../../../ui/tauri-console-web/index.html");
+const BUNDLED_ONBOARDING_HTML: &str = include_str!("../../../ui/tauri-console-web/onboarding.html");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidecarSpec {
@@ -180,16 +176,6 @@ mod tests {
         validate_workspace_markup(spec.bundled_index_html()).expect("workspace markup contract");
         validate_onboarding_ui_contract(spec.bundled_onboarding_html())
             .expect("onboarding markup contract");
-    }
-
-    #[test]
-    fn bundled_assets_match_tauri_console_web_sources() {
-        let spec = TauriShellHostSpec::new("/tmp/bridgingio-core");
-        assert_eq!(spec.bundled_index_html(), super::SOURCE_INDEX_HTML);
-        assert_eq!(
-            spec.bundled_onboarding_html(),
-            super::SOURCE_ONBOARDING_HTML
-        );
     }
 
     #[test]

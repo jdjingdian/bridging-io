@@ -7,3 +7,4 @@ version = "0.1.0"
 [dependencies]
 bridgingio-app-api = { path = "../bridgingio-app-api" }
 bridgingio-domain = { path = "../bridgingio-domain" }
+bridgingio-platform = { path = "../bridgingio-platform" }

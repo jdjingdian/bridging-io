@@ -493,6 +493,48 @@
       font-size: 13px;
     }
 
+    .host-loading {
+      position: fixed;
+      inset: 0;
+      z-index: 120;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(8, 47, 73, 0.26);
+      backdrop-filter: blur(2px);
+    }
+
+    .host-loading-card {
+      min-width: 300px;
+      max-width: 560px;
+      margin: 20px;
+      border-radius: 14px;
+      border: 1px solid rgba(3, 105, 161, 0.26);
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: var(--shadow-2);
+      padding: 16px 18px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .host-loading-spinner {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      border: 2px solid rgba(14, 165, 233, 0.24);
+      border-top-color: #0369a1;
+      animation: spin 900ms linear infinite;
+      flex: 0 0 20px;
+    }
+
+    .host-loading-text {
+      font-size: 13px;
+      color: #0f4f70;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
     @keyframes fade-in {
       from {
         opacity: 0;
@@ -510,6 +552,15 @@
       to {
         opacity: 1;
         transform: translateY(0);
+      }
+    }
+
+    @keyframes spin {
+      from {
+        transform: rotate(0);
+      }
+      to {
+        transform: rotate(360deg);
       }
     }
 
@@ -587,6 +638,12 @@
   </style>
 </head>
 <body>
+  <div id="host-loading" class="host-loading hidden" aria-live="polite" role="status">
+    <div class="host-loading-card">
+      <span class="host-loading-spinner" aria-hidden="true"></span>
+      <span id="host-loading-text" class="host-loading-text">Connecting to trusted host bridge...</span>
+    </div>
+  </div>
   <div class="root">
     <iframe id="onboarding-frame" src="./onboarding.html" title="BridgingIO Onboarding" class="hidden"></iframe>
 
@@ -867,11 +924,23 @@
       vaultTtl: document.getElementById("vault-ttl"),
       vaultUnlockBtn: document.getElementById("vault-unlock-btn"),
       vaultIssueBtn: document.getElementById("vault-issue-btn"),
+      loadingOverlay: document.getElementById("host-loading"),
+      loadingText: document.getElementById("host-loading-text"),
     };
 
     function setStatus(text, kind = "") {
       el.status.textContent = text;
       el.status.className = `status-text ${kind}`.trim();
+    }
+
+    function setHostLoading(active, message = "Connecting to trusted host bridge...") {
+      if (el.loadingText) {
+        el.loadingText.textContent = message;
+      }
+      if (!el.loadingOverlay) {
+        return;
+      }
+      el.loadingOverlay.classList.toggle("hidden", !active);
     }
 
     function text(value, fallback = "n/a") {
@@ -1029,6 +1098,13 @@
       }
       throw lastError || new Error("invoke failed");
     }
+
+    // Expose a parent-window invoke proxy so same-origin iframes (for example onboarding)
+    // can still route trusted host commands through the top-level Tauri bridge.
+    window.__BRIDGING_TRUSTED_INVOKE = async function trustedInvoke(names, payload = {}) {
+      const commandNames = Array.isArray(names) ? names : [String(names)];
+      return invokeCandidates(commandNames, payload);
+    };
 
     async function bridgeCommand(command, payload = {}) {
       return invokeCandidates(
@@ -1657,6 +1733,10 @@
     }
 
     async function loadWorkspace(showStatus = true) {
+      setHostLoading(
+        true,
+        "Preparing runtime and connecting to trusted host bridge. If a stale core exists, it will be cleaned up in background."
+      );
       try {
         let bootstrap;
         try {
@@ -1684,6 +1764,8 @@
         }
       } catch (err) {
         setStatus(err?.message || "Failed to load workspace state.", "error");
+      } finally {
+        setHostLoading(false);
       }
     }
 
@@ -1719,8 +1801,41 @@
       el.loadTranscriptBtn.addEventListener("click", loadTranscript);
     }
 
+    async function syncStartupRouteFromHost() {
+      if (!invoke) {
+        return;
+      }
+      try {
+        const startup = await invokeCandidates(
+          ["get_startup_state", "desktop_get_startup_state", "trusted_get_startup_state"],
+          {}
+        );
+        if (startup?.route === "workspace") {
+          if (!(window.location.hash || "").toLowerCase().startsWith("#/workspace")) {
+            window.location.hash = "#/workspace/targets";
+          }
+        } else {
+          if (!(window.location.hash || "").toLowerCase().startsWith("#/onboarding")) {
+            window.location.hash = "#/onboarding";
+          }
+        }
+        if (startup?.transport_status && startup.transport_status !== "ready") {
+          const diagnostics = Array.isArray(startup?.transport_diagnostics)
+            ? startup.transport_diagnostics.join(" | ")
+            : "";
+          setStatus(
+            `Local transport is ${startup.transport_status} (${text(startup.transport_kind, "unknown")}). ${diagnostics}`,
+            "warn"
+          );
+        }
+      } catch (err) {
+        setStatus(err?.message || "Failed to sync startup route from trusted host.", "warn");
+      }
+    }
+
     async function init() {
       bindEvents();
+      await syncStartupRouteFromHost();
       applyRoute();
       if (state.route === "workspace") {
         await loadWorkspace(true);

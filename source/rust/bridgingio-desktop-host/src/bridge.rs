@@ -208,6 +208,10 @@ impl<T: BridgeTransport> TrustedControlPlaneBridge<T> {
         }
     }
 
+    pub fn send_command(&mut self, command: AppCommand) -> Result<ApiResponse, BridgeError> {
+        self.send(command)
+    }
+
     fn send(&mut self, command: AppCommand) -> Result<ApiResponse, BridgeError> {
         self.request_sequence += 1;
         let request = ApiRequest {
