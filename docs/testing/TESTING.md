@@ -26,6 +26,9 @@ This document defines testing conventions for Rust core and platform UI tests.
   - timeline source grouping (`token_label` + `http_fingerprint`)
   - token revoke in trusted settings
   - vault unlock trusted verification entrypoint
+  - vault locked/unavailable/uninitialized state projection in settings
+  - one-time token reveal lifecycle (create -> reveal -> dismiss)
+  - trusted settings issue/revoke token flow with runtime vault state refresh
 
 Future platform UI test suites should mirror the same required flows.
 
@@ -43,6 +46,13 @@ Bundled desktop console contract suite:
 ```bash
 cd source/rust
 cargo test -p bridgingio-desktop-host
+```
+
+Canonical vault/operator management surface smoke:
+
+```bash
+cd source/rust
+cargo test -p bridgingio-mcp --bin bridgingio-core
 ```
 
 Tauri shell host smoke verification:

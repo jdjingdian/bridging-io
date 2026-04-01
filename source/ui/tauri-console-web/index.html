@@ -874,6 +874,7 @@
             <article class="panel" id="settings-vault">
               <h2>Vault</h2>
               <p id="vault-summary" class="muted"></p>
+              <div id="vault-state-detail" class="detail-grid"></div>
               <div class="grid-2">
                 <div>
                   <label for="vault-label">Long-Lived Token Label</label>
@@ -926,6 +927,7 @@
       view: "targets",
       bootstrap: null,
       settings: null,
+      vaultState: null,
       tokens: [],
       selectedTargetId: null,
       selectedActorKey: null,
@@ -980,6 +982,7 @@
       tokenList: document.getElementById("token-list"),
       refreshTokensBtn: document.getElementById("refresh-tokens-btn"),
       vaultSummary: document.getElementById("vault-summary"),
+      vaultStateDetail: document.getElementById("vault-state-detail"),
       vaultLabel: document.getElementById("vault-label"),
       vaultTtl: document.getElementById("vault-ttl"),
       vaultUnlockBtn: document.getElementById("vault-unlock-btn"),
@@ -1440,6 +1443,9 @@
       const cache = settings.artifact_cache || {};
       const logs = settings.runtime_logs || {};
       const vault = settings.vault || {};
+      const runtimeVaultState = state.vaultState && typeof state.vaultState === "object" ? state.vaultState : null;
+      const lockState = text(runtimeVaultState?.lock_state, text(vault.status, "unknown"));
+      const lockStateLower = lockState.toLowerCase();
 
       el.settingsHost.value = text(model.host, "");
       el.settingsPort.value = Number(model.port || 0) || "";
@@ -1450,7 +1456,41 @@
       el.settingsCachePolicy.value = text(cache.eviction_policy, "lru");
       el.settingsLogsRoot.value = text(logs.root, "");
       el.settingsStorageMeta.textContent = `Cache used ${fmtBytes(cache.used_bytes)} across ${text(cache.artifact_count, "0")} artifacts. Runtime logs use ${fmtBytes(logs.used_bytes)}.`;
-      el.vaultSummary.textContent = `Vault status: ${text(vault.status, "unknown")}. Configured backend: ${text(vault.configured_backend, "n/a")}. Binding backend: ${text(vault.binding_backend, "n/a")}.`;
+      if (runtimeVaultState) {
+        const protector = runtimeVaultState.protector_summary || {};
+        const unlockPolicy = runtimeVaultState.unlock_policy_summary || {};
+        const allowedMethods = Array.isArray(unlockPolicy.allowed_methods) && unlockPolicy.allowed_methods.length
+          ? unlockPolicy.allowed_methods.join(", ")
+          : "none";
+        const secrets = Array.isArray(runtimeVaultState.secrets) ? runtimeVaultState.secrets : [];
+        const secretSummary = secrets.length
+          ? secrets
+            .slice(0, 4)
+            .map((item) => `${text(item.reference, "unknown")} (${text(item.status, "unknown")})`)
+            .join(" | ")
+          : "none";
+        const configuredBackend = text(runtimeVaultState.configured_backend, text(vault.configured_backend, "n/a"));
+        const activeBackend = text(runtimeVaultState.active_backend, text(vault.binding_backend, "n/a"));
+        const blocked = lockStateLower !== "unlocked";
+        const guardedHint = blocked
+          ? "Secret-backed actions remain gated until vault is unlocked."
+          : "Secret-backed actions are available under current policy.";
+        el.vaultSummary.textContent = `Vault lock state: ${lockState}. Configured backend: ${configuredBackend}. Active backend: ${activeBackend}. ${guardedHint}`;
+        el.vaultStateDetail.innerHTML = "";
+        el.vaultStateDetail.appendChild(detailRow("Protector primary", text(protector.primary, "none")));
+        el.vaultStateDetail.appendChild(detailRow("Protectors recovery/retired", `${text(protector.recovery, "0")} / ${text(protector.retired, "0")}`));
+        el.vaultStateDetail.appendChild(detailRow("Fail-closed", protector.fail_closed ? "true" : "false"));
+        el.vaultStateDetail.appendChild(detailRow("Unlock policy", `${text(unlockPolicy.trigger_policy, "manual-only")} · methods: ${allowedMethods}`));
+        el.vaultStateDetail.appendChild(detailRow("Unlock verification", `preferred=${text(unlockPolicy.preferred_method, "none")} · cache_ttl_sec=${text(unlockPolicy.cache_ttl_sec, "n/a")} · fresh_uv=${unlockPolicy.require_fresh_user_verification ? "true" : "false"}`));
+        el.vaultStateDetail.appendChild(detailRow("Secret summary", `${secrets.length} items · ${secretSummary}`));
+      } else {
+        el.vaultSummary.textContent = `Vault status: ${text(vault.status, "unknown")}. Configured backend: ${text(vault.configured_backend, "n/a")}. Binding backend: ${text(vault.binding_backend, "n/a")}. Runtime state projection unavailable.`;
+        el.vaultStateDetail.innerHTML = "";
+        el.vaultStateDetail.appendChild(detailRow("Vault projection", "Runtime get_vault_state is unavailable in current host session."));
+      }
+
+      el.vaultIssueBtn.disabled = lockStateLower !== "unlocked";
+      el.vaultUnlockBtn.disabled = lockStateLower === "unavailable" || lockStateLower === "uninitialized";
 
       renderTokens();
     }
@@ -1688,7 +1728,7 @@
       }
     }
 
-    async function loadTokens() {
+    async function loadTokens(reportError = true) {
       try {
         const result = await bridgeCommand("list_agent_tokens", {});
         if (Array.isArray(result)) {
@@ -1700,7 +1740,21 @@
         }
         renderTokens();
       } catch (err) {
-        setStatus(err?.message || "Failed to load token summaries.", "warn");
+        if (reportError) {
+          setStatus(err?.message || "Failed to load token summaries.", "warn");
+        }
+      }
+    }
+
+    async function loadVaultState(reportError = true) {
+      try {
+        const result = await bridgeCommand("get_vault_state", {});
+        state.vaultState = result && typeof result === "object" ? result : null;
+      } catch (err) {
+        state.vaultState = null;
+        if (reportError) {
+          setStatus(err?.message || "Failed to load vault state projection.", "warn");
+        }
       }
     }
 
@@ -1770,6 +1824,10 @@
     }
 
     async function issueToken() {
+      if (el.vaultIssueBtn.disabled) {
+        setStatus("Vault must be unlocked before issuing a long-lived token.", "warn");
+        return;
+      }
       const verified = await requireTrustedVerification("issue_long_lived_token");
       if (!verified) {
         return;
@@ -1788,14 +1846,16 @@
           label,
           expires_in_seconds: ttl ? Math.trunc(ttl) : undefined,
           scope: defaultTokenScope(),
-          attestation_id: "trusted-host-local-verification",
         });
         const created = result?.result || {};
-        const plaintextToken = created?.plaintext_token;
+        const summary = created?.summary || {};
+        const plaintextToken = typeof created?.plaintext_token === "string"
+          ? created.plaintext_token.trim()
+          : "";
         if (plaintextToken) {
           state.issuedTokenResult = {
-            label,
-            tokenId: created?.summary?.token_id || "",
+            label: text(summary.label, label),
+            tokenId: text(summary.token_id, ""),
             plaintextToken,
           };
           state.issuedTokenCopyFeedback = "";
@@ -1808,7 +1868,8 @@
         }
         el.vaultLabel.value = "";
         el.vaultTtl.value = "";
-        await loadTokens();
+        await Promise.all([loadTokens(false), loadVaultState(false)]);
+        renderSettings();
       } catch (err) {
         setStatus(err?.message || "Failed to issue long-lived token.", "error");
       }
@@ -1887,7 +1948,7 @@
           state.settings = state.settings || state.bootstrap.settings;
         }
 
-        await loadTokens();
+        await Promise.all([loadTokens(false), loadVaultState(false)]);
         ensureTargetSelection();
         renderAll();
         if (showStatus) {

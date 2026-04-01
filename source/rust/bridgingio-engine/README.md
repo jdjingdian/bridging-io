@@ -12,6 +12,10 @@ The MVP standalone config format is TOML with:
 - `[storage]`
 - `[storage.artifacts]`
 - `[vault]`
+- `[vault.unlock]`
+- `[vault.protectors.primary]`
+- `[[vault.protectors.recovery]]`
+- `[vault.ssh]`
 - `[control_plane]`
 - `[model_plane.http]`
 - `[model_plane.http.auth]`

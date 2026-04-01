@@ -381,6 +381,50 @@ pub async fn trusted_create_agent_token(
 }
 
 #[tauri::command]
+pub async fn get_vault_state(state: State<'_, SharedHostState>) -> Result<Value, String> {
+    workspace_bridge_command(state, "get_vault_state".to_string(), Some(json!({}))).await
+}
+
+#[tauri::command]
+pub async fn desktop_get_vault_state(state: State<'_, SharedHostState>) -> Result<Value, String> {
+    get_vault_state(state).await
+}
+
+#[tauri::command]
+pub async fn trusted_get_vault_state(state: State<'_, SharedHostState>) -> Result<Value, String> {
+    get_vault_state(state).await
+}
+
+#[tauri::command]
+pub async fn lock_vault(
+    state: State<'_, SharedHostState>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    workspace_bridge_command(
+        state,
+        "lock_vault".to_string(),
+        Some(json!({ "reason": reason })),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn desktop_lock_vault(
+    state: State<'_, SharedHostState>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    lock_vault(state, reason).await
+}
+
+#[tauri::command]
+pub async fn trusted_lock_vault(
+    state: State<'_, SharedHostState>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    lock_vault(state, reason).await
+}
+
+#[tauri::command]
 pub async fn read_artifact(
     state: State<'_, SharedHostState>,
     artifact_id: String,
@@ -452,11 +496,17 @@ pub async fn trusted_upsert_profile(
 pub async fn unlock_vault(
     state: State<'_, SharedHostState>,
     trigger: Option<String>,
+    passphrase: Option<String>,
+    attestation_id: Option<String>,
 ) -> Result<Value, String> {
     workspace_bridge_command(
         state,
         "unlock_vault".to_string(),
-        Some(json!({ "trigger": trigger })),
+        Some(json!({
+            "trigger": trigger,
+            "passphrase": passphrase,
+            "attestation_id": attestation_id,
+        })),
     )
     .await
 }
@@ -465,14 +515,18 @@ pub async fn unlock_vault(
 pub async fn desktop_unlock_vault(
     state: State<'_, SharedHostState>,
     trigger: Option<String>,
+    passphrase: Option<String>,
+    attestation_id: Option<String>,
 ) -> Result<Value, String> {
-    unlock_vault(state, trigger).await
+    unlock_vault(state, trigger, passphrase, attestation_id).await
 }
 
 #[tauri::command]
 pub async fn trusted_unlock_vault(
     state: State<'_, SharedHostState>,
     trigger: Option<String>,
+    passphrase: Option<String>,
+    attestation_id: Option<String>,
 ) -> Result<Value, String> {
-    unlock_vault(state, trigger).await
+    unlock_vault(state, trigger, passphrase, attestation_id).await
 }

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -25,8 +27,12 @@ use bridgingio_platform::{
 };
 use bridgingio_providers::TerminalProvider;
 use bridgingio_secrets::{
-    normalize_credential_ref, LocalAdminActionKind, SecretVaultRouter,
-    SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, VaultError,
+    local_admin_create_token_target, local_admin_payload_digest_for_create_agent_token,
+    local_admin_payload_digest_for_unlock_vault, local_admin_unlock_vault_target,
+    normalize_credential_ref, CreateAgentTokenRequest, LocalAdminActionKind, SecretBytes,
+    SecretVaultRouter, SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling,
+    TokenScopeInput, UnlockVaultRequest, VaultError, VaultReadinessState, VaultUnlockPolicy,
+    VaultUnlockTriggerPolicy,
 };
 use serde_json::json;
 
@@ -42,12 +48,94 @@ enum LaunchMode {
     StandaloneDetachedChild,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ManagementCommand {
+    VaultInit,
+    VaultImport {
+        reference: String,
+        label: Option<String>,
+        input: SecretInputRoute,
+    },
+    VaultUnlock {
+        method: Option<String>,
+        input: SecretInputRoute,
+    },
+    AuthTokenCreate {
+        label: String,
+        expires_in_seconds: Option<u64>,
+    },
+    AuthTokenRevoke {
+        token_id: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SecretInputRoute {
+    fd: Option<i32>,
+    from_stdin: bool,
+    file: Option<PathBuf>,
+    from_tty_prompt: bool,
+}
+
+impl SecretInputRoute {
+    fn explicit_count(&self) -> usize {
+        let mut count = 0usize;
+        if self.fd.is_some() {
+            count += 1;
+        }
+        if self.from_stdin {
+            count += 1;
+        }
+        if self.file.is_some() {
+            count += 1;
+        }
+        if self.from_tty_prompt {
+            count += 1;
+        }
+        count
+    }
+
+    fn has_explicit_source(&self) -> bool {
+        self.explicit_count() > 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecretSourceKind {
+    Fd,
+    Stdin,
+    File,
+    TtyPrompt,
+}
+
+impl SecretSourceKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fd => "fd",
+            Self::Stdin => "stdin",
+            Self::File => "file",
+            Self::TtyPrompt => "tty-prompt",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SecretInputCapture {
+    secret: String,
+    source_kind: SecretSourceKind,
+    source_summary: String,
+    source_locator_digest: String,
+    byte_length: usize,
+}
+
 #[derive(Debug)]
 struct CliArgs {
     config_path: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
     control_plane_socket_override: Option<PathBuf>,
     mode: LaunchMode,
+    management_command: Option<ManagementCommand>,
 }
 
 fn main() {
@@ -69,6 +157,10 @@ fn main() {
 fn run(args: CliArgs) -> Result<(), String> {
     if args.mode == LaunchMode::SelfTest {
         return run_self_test();
+    }
+    if let Some(command) = args.management_command.clone() {
+        let config_path = resolve_config_path(&args)?;
+        return run_management_command(&config_path, command);
     }
     let config_path = resolve_config_path(&args)?;
     match args.mode {
@@ -94,6 +186,188 @@ fn run(args: CliArgs) -> Result<(), String> {
             args.control_plane_socket_override.as_deref(),
         ),
         LaunchMode::SelfTest => unreachable!("self-test handled before config resolution"),
+    }
+}
+
+fn run_management_command(config_path: &Path, command: ManagementCommand) -> Result<(), String> {
+    let (settings, mut router) = load_management_router(config_path)?;
+    let operator_principal = management_operator_principal();
+    match command {
+        ManagementCommand::VaultInit => {
+            let lock_state = router.vault_lock_state().as_str().to_string();
+            let secret_count = router.list_secret_summaries().len();
+            println!(
+                "vault initialized (data_dir={}, backend={}, lock_state={}, secret_count={secret_count})",
+                settings.core.data_dir,
+                router.active_backend(),
+                lock_state,
+            );
+            emit_management_audit("vault.init", &operator_principal, None, None, "ok");
+            Ok(())
+        }
+        ManagementCommand::VaultImport {
+            reference,
+            label,
+            input,
+        } => {
+            validate_secret_input_route(&input)?;
+            let capture = read_secret_input(&input, "Enter secret to import: ")?;
+            let final_label = label.unwrap_or_else(|| reference.clone());
+            let imported = router
+                .put_with_actor(
+                    &reference,
+                    SecretBytes::from_utf8(&capture.secret),
+                    final_label,
+                    &operator_principal,
+                    Some("standalone-cli import".to_string()),
+                )
+                .map_err(|err| format!("vault import failed: {err:?}"))?;
+            println!(
+                "vault secret imported: reference={} status={} version={}",
+                imported.reference,
+                imported.status.as_str(),
+                imported.version
+            );
+            emit_management_audit(
+                "vault.import",
+                &operator_principal,
+                None,
+                Some(&capture),
+                "ok",
+            );
+            Ok(())
+        }
+        ManagementCommand::VaultUnlock { method, input } => {
+            validate_secret_input_route(&input)?;
+            let unlock_method = normalize_cli_vault_method(
+                &method.unwrap_or_else(|| router.unlock_policy().preferred_method.clone()),
+            );
+            let passphrase_capture = if unlock_method == "passphrase" {
+                Some(read_secret_input(
+                    &input,
+                    "Enter vault passphrase for unlock: ",
+                )?)
+            } else {
+                if input.has_explicit_source() {
+                    return Err(format!(
+                        "vault unlock method `{unlock_method}` does not consume secret input sources"
+                    ));
+                }
+                None
+            };
+            let payload_digest = local_admin_payload_digest_for_unlock_vault(&unlock_method);
+            let intent = router
+                .create_local_admin_intent_with_digest(
+                    LocalAdminActionKind::UnlockVault,
+                    local_admin_unlock_vault_target(),
+                    &payload_digest,
+                    &operator_principal,
+                    Duration::from_secs(300),
+                )
+                .map_err(|err| format!("create unlock intent failed: {err:?}"))?;
+            let attestation = router
+                .complete_local_admin_attestation(
+                    &intent.intent_id,
+                    &operator_principal,
+                    "standalone-cli",
+                    Duration::from_secs(120),
+                )
+                .map_err(|err| format!("complete unlock attestation failed: {err:?}"))?;
+            router
+                .unlock_vault_with_attestation(UnlockVaultRequest {
+                    method: unlock_method.clone(),
+                    passphrase: passphrase_capture
+                        .as_ref()
+                        .map(|capture| trim_single_trailing_newline(capture.secret.clone())),
+                    requested_by: operator_principal.clone(),
+                    attestation_id: attestation.attestation_id.clone(),
+                })
+                .map_err(|err| format!("unlock vault failed: {err:?}"))?;
+            let state = router.vault_lock_state().as_str().to_string();
+            println!("vault unlock completed: method={unlock_method} lock_state={state}");
+            emit_management_audit(
+                "vault.unlock",
+                &operator_principal,
+                Some(&intent.intent_id),
+                passphrase_capture.as_ref(),
+                "ok",
+            );
+            Ok(())
+        }
+        ManagementCommand::AuthTokenCreate {
+            label,
+            expires_in_seconds,
+        } => {
+            let mut create_request = CreateAgentTokenRequest {
+                label,
+                created_by: operator_principal.clone(),
+                expires_in: expires_in_seconds.map(Duration::from_secs),
+                idle_timeout_sec: None,
+                scope: TokenScopeInput {
+                    scope_profile: Some("strict-default".to_string()),
+                    target_ids: Vec::new(),
+                    tool_ids: Vec::new(),
+                    max_risk_envelope: Some("deny-all".to_string()),
+                    allow_open_shell: Some(false),
+                    allow_write_shell_input: Some(false),
+                    allow_artifact_cross_principal: Some(false),
+                    allow_delegation: Some(false),
+                    allow_admin_actions: Some(false),
+                },
+                attestation_id: None,
+            };
+            let payload_digest = local_admin_payload_digest_for_create_agent_token(&create_request);
+            let intent = router
+                .create_local_admin_intent_with_digest(
+                    LocalAdminActionKind::CreateAgentToken,
+                    local_admin_create_token_target(),
+                    &payload_digest,
+                    &operator_principal,
+                    Duration::from_secs(300),
+                )
+                .map_err(|err| format!("create token intent failed: {err:?}"))?;
+            let attestation = router
+                .complete_local_admin_attestation(
+                    &intent.intent_id,
+                    &operator_principal,
+                    "standalone-cli",
+                    Duration::from_secs(120),
+                )
+                .map_err(|err| format!("complete token attestation failed: {err:?}"))?;
+            create_request.attestation_id = Some(attestation.attestation_id.clone());
+            let created = router
+                .create_agent_token(create_request)
+                .map_err(|err| format!("create token failed: {err:?}"))?;
+            println!("token created (one-time reveal): {}", created.plaintext_token);
+            println!(
+                "token summary: id={} status={} scope={} targets={}",
+                created.summary.token_id,
+                created.summary.status.as_str(),
+                created.summary.scope_profile,
+                created.summary.target_scope_summary
+            );
+            emit_management_audit(
+                "auth.token.create",
+                &operator_principal,
+                Some(&intent.intent_id),
+                None,
+                "ok",
+            );
+            Ok(())
+        }
+        ManagementCommand::AuthTokenRevoke { token_id, reason } => {
+            let summary = router
+                .revoke_agent_token(&token_id, reason)
+                .map_err(|err| format!("revoke token failed: {err:?}"))?;
+            println!(
+                "token revoked: id={} status={} reason={}",
+                summary.token_id,
+                summary.status.as_str(),
+                summary.revoke_reason.as_deref().unwrap_or("none")
+            );
+            emit_management_audit("auth.token.revoke", &operator_principal, None, None, "ok");
+            Ok(())
+        }
     }
 }
 
@@ -407,6 +681,9 @@ fn run_self_test() -> Result<(), String> {
         kind: TargetKind::Other("self-test".into()),
         enabled: true,
         aliases: vec!["local".into()],
+        storage_class: "plain".into(),
+        access_class: "anonymous-local".into(),
+        sealed_profile_ref: None,
         credential_ref: None,
         notes: Some("self-test synthetic local target".into()),
         connection: StandaloneConnectionSection::default(),
@@ -608,21 +885,69 @@ fn validate_vault_and_auth_contract_smoke() -> Result<(), String> {
             "credential ref canonicalization mismatch: {canonical}"
         ));
     }
+    let legacy = CoreSettings::minimal_example().replace(
+        "credential_ref = \"vault://bridgingio/ssh-private-key/local\"",
+        "credential_ref = \"vault:ssh-key:local\"",
+    );
+    let parsed_legacy = CoreSettings::from_toml_str(&legacy)
+        .map_err(|err| format!("parse legacy vault config failed: {err:?}"))?;
+    if parsed_legacy.vault.backend != "builtin-encrypted" {
+        return Err(format!(
+            "legacy vault backend must canonicalize to builtin-encrypted, got {}",
+            parsed_legacy.vault.backend
+        ));
+    }
+    if parsed_legacy.vault.protectors.primary.kind != "os-native" {
+        return Err(format!(
+            "legacy vault primary protector must canonicalize to os-native, got {}",
+            parsed_legacy.vault.protectors.primary.kind
+        ));
+    }
+    if parsed_legacy
+        .targets
+        .first()
+        .and_then(|target| target.credential_ref.as_deref())
+        != Some("vault://bridgingio/ssh-private-key/local")
+    {
+        return Err("legacy credential_ref must canonicalize to vault://...".to_string());
+    }
+    let rewritten_legacy = parsed_legacy.to_toml_string();
+    if !rewritten_legacy.contains("[vault.unlock]")
+        || !rewritten_legacy.contains("[vault.protectors.primary]")
+        || !rewritten_legacy.contains("[vault.ssh]")
+        || rewritten_legacy.contains("backend = \"os-native\"")
+    {
+        return Err("legacy vault config rewrite must emit canonical vault sections".to_string());
+    }
 
     let mut router = SecretVaultRouter::default();
-    match router.put("vault:ssh-key:dev", "SELF-TEST-DEV-KEY", "dev key") {
-        Err(VaultError::FailClosed(_)) => {}
-        other => {
-            return Err(format!(
-                "degraded backend must fail closed before explicit allow: {other:?}"
-            ))
-        }
-    }
     let diag = router
         .active_backend_diagnostics()
-        .map_err(|err| format!("read degraded backend diagnostics failed: {err:?}"))?;
-    if !diag.fail_closed {
-        return Err("degraded vault backend diagnostics must remain fail-closed".into());
+        .map_err(|err| format!("read os-native backend diagnostics failed: {err:?}"))?;
+    match diag.status {
+        VaultReadinessState::Ready => {
+            router
+                .put("vault:ssh-key:dev", "SELF-TEST-DEV-KEY", "dev key")
+                .map_err(|err| format!("ready os-native backend should allow writes: {err:?}"))?;
+        }
+        VaultReadinessState::Degraded => {
+            match router.put("vault:ssh-key:dev", "SELF-TEST-DEV-KEY", "dev key") {
+                Err(VaultError::FailClosed(_)) => {}
+                other => {
+                    return Err(format!(
+                        "degraded backend must fail closed before explicit allow: {other:?}"
+                    ))
+                }
+            }
+            if !diag.fail_closed {
+                return Err("degraded vault backend diagnostics must remain fail-closed".into());
+            }
+        }
+        other => {
+            return Err(format!(
+                "unexpected os-native readiness status during self-test: {other:?}"
+            ));
+        }
     }
 
     router
@@ -712,6 +1037,46 @@ fn validate_vault_and_auth_contract_smoke() -> Result<(), String> {
             ))
         }
         Ok(_) => return Err("local admin intent/attestation must be single-use".into()),
+    }
+    match router.create_agent_token(CreateAgentTokenRequest {
+        label: "self-test-synthetic".into(),
+        created_by: "self-test-admin".into(),
+        expires_in: None,
+        idle_timeout_sec: None,
+        scope: TokenScopeInput {
+            scope_profile: Some("strict-default".into()),
+            target_ids: Vec::new(),
+            tool_ids: Vec::new(),
+            max_risk_envelope: Some("deny-all".into()),
+            allow_open_shell: Some(false),
+            allow_write_shell_input: Some(false),
+            allow_artifact_cross_principal: Some(false),
+            allow_delegation: Some(false),
+            allow_admin_actions: Some(false),
+        },
+        attestation_id: Some("attn-placeholder".into()),
+    }) {
+        Err(VaultError::LocalAdminVerificationRequired(_))
+        | Err(VaultError::LocalAdminAttestationMismatch(_)) => {}
+        other => {
+            return Err(format!(
+                "synthetic attestation id must be rejected for token create: {other:?}"
+            ))
+        }
+    }
+    match router.unlock_vault_with_attestation(UnlockVaultRequest {
+        method: "os-native".into(),
+        passphrase: None,
+        requested_by: "self-test-admin".into(),
+        attestation_id: "attn-placeholder".into(),
+    }) {
+        Err(VaultError::LocalAdminVerificationRequired(_))
+        | Err(VaultError::LocalAdminAttestationMismatch(_)) => {}
+        other => {
+            return Err(format!(
+                "synthetic attestation id must be rejected for vault unlock: {other:?}"
+            ))
+        }
     }
 
     let host_platform = if cfg!(windows) { "windows" } else { "unix" };
@@ -1226,13 +1591,8 @@ where
 {
     let args = args.into_iter().collect::<Vec<_>>();
     reject_plaintext_secret_argv(&args)?;
-    if matches!(
-        args.first().map(String::as_str),
-        Some("auth") | Some("token")
-    ) {
-        return Err(
-            "future standalone route is reserved for `bridgingio-core auth token create/list/revoke/update-scope` and must reuse the same control-plane token service; plaintext token argv is forbidden".to_string(),
-        );
+    if let Some(management) = parse_management_cli_args(&args)? {
+        return Ok(management);
     }
 
     let mut mode = LaunchMode::StandaloneRun;
@@ -1316,7 +1676,425 @@ where
         runtime_root,
         control_plane_socket_override,
         mode,
+        management_command: None,
     })
+}
+
+fn parse_management_cli_args(args: &[String]) -> Result<Option<CliArgs>, String> {
+    let Some(route) = args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    match route {
+        "vault" => parse_vault_management_cli(args).map(Some),
+        "auth" => parse_auth_management_cli(args).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn parse_vault_management_cli(args: &[String]) -> Result<CliArgs, String> {
+    let subcommand = args
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| "vault route requires subcommand: init|import|unlock".to_string())?;
+    let mut config_path = None::<PathBuf>;
+    let mut method = None::<String>;
+    let mut reference = None::<String>;
+    let mut label = None::<String>;
+    let mut input = SecretInputRoute::default();
+    let mut iter = args.iter().skip(2);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => {
+                let path = iter
+                    .next()
+                    .ok_or_else(|| "--config requires a path".to_string())?;
+                config_path = Some(PathBuf::from(path));
+            }
+            "--method" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--method requires a value".to_string())?;
+                method = Some(value.to_string());
+            }
+            "--reference" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--reference requires a value".to_string())?;
+                reference = Some(value.to_string());
+            }
+            "--label" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--label requires a value".to_string())?;
+                label = Some(value.to_string());
+            }
+            "--from-fd" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--from-fd requires an integer fd".to_string())?;
+                let fd = value
+                    .parse::<i32>()
+                    .map_err(|_| "--from-fd requires an integer fd".to_string())?;
+                if fd < 0 {
+                    return Err("--from-fd requires a non-negative fd".to_string());
+                }
+                input.fd = Some(fd);
+            }
+            "--from-stdin" => input.from_stdin = true,
+            "--from-file" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--from-file requires a path".to_string())?;
+                input.file = Some(PathBuf::from(value));
+            }
+            "--from-tty-prompt" => input.from_tty_prompt = true,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => return Err(format!("unknown argument for vault {subcommand}: {arg}")),
+        }
+    }
+    validate_secret_input_route(&input)?;
+    let management_command = match subcommand {
+        "init" => {
+            if method.is_some()
+                || reference.is_some()
+                || label.is_some()
+                || input.has_explicit_source()
+            {
+                return Err(
+                    "vault init only accepts --config and does not consume secret input flags"
+                        .to_string(),
+                );
+            }
+            ManagementCommand::VaultInit
+        }
+        "import" => ManagementCommand::VaultImport {
+            reference: reference.ok_or_else(|| {
+                "vault import requires --reference <credential-ref>".to_string()
+            })?,
+            label,
+            input,
+        },
+        "unlock" => {
+            if reference.is_some() || label.is_some() {
+                return Err(
+                    "vault unlock does not accept --reference/--label (use --method and secret input flags)"
+                        .to_string(),
+                );
+            }
+            ManagementCommand::VaultUnlock { method, input }
+        }
+        other => {
+            return Err(format!(
+                "unknown vault subcommand `{other}` (expected init|import|unlock)"
+            ))
+        }
+    };
+
+    if config_path.is_none() {
+        return Err("missing required argument: --config <path>".to_string());
+    }
+    Ok(CliArgs {
+        config_path,
+        runtime_root: None,
+        control_plane_socket_override: None,
+        mode: LaunchMode::StandaloneRun,
+        management_command: Some(management_command),
+    })
+}
+
+fn parse_auth_management_cli(args: &[String]) -> Result<CliArgs, String> {
+    let route = args
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| "auth route requires subcommand group `token`".to_string())?;
+    if route != "token" {
+        return Err(format!(
+            "unknown auth subcommand group `{route}` (expected `token`)"
+        ));
+    }
+    let subcommand = args
+        .get(2)
+        .map(String::as_str)
+        .ok_or_else(|| "auth token requires subcommand: create|revoke".to_string())?;
+    let mut config_path = None::<PathBuf>;
+    let mut label = None::<String>;
+    let mut expires_in_seconds = None::<u64>;
+    let mut token_id = None::<String>;
+    let mut reason = None::<String>;
+    let mut iter = args.iter().skip(3);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => {
+                let path = iter
+                    .next()
+                    .ok_or_else(|| "--config requires a path".to_string())?;
+                config_path = Some(PathBuf::from(path));
+            }
+            "--label" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--label requires a value".to_string())?;
+                label = Some(value.to_string());
+            }
+            "--expires-in-seconds" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--expires-in-seconds requires a u64".to_string())?;
+                expires_in_seconds = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "--expires-in-seconds requires a u64".to_string())?,
+                );
+            }
+            "--token-id" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--token-id requires a value".to_string())?;
+                token_id = Some(value.to_string());
+            }
+            "--reason" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--reason requires a value".to_string())?;
+                reason = Some(value.to_string());
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => {
+                return Err(format!(
+                    "unknown argument for auth token {subcommand}: {arg}"
+                ))
+            }
+        }
+    }
+    let management_command = match subcommand {
+        "create" => ManagementCommand::AuthTokenCreate {
+            label: label.ok_or_else(|| "auth token create requires --label <name>".to_string())?,
+            expires_in_seconds,
+        },
+        "revoke" => {
+            if label.is_some() || expires_in_seconds.is_some() {
+                return Err(
+                    "auth token revoke does not accept --label/--expires-in-seconds".to_string(),
+                );
+            }
+            ManagementCommand::AuthTokenRevoke {
+                token_id: token_id
+                    .ok_or_else(|| "auth token revoke requires --token-id <id>".to_string())?,
+                reason,
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown auth token subcommand `{other}` (expected create|revoke)"
+            ))
+        }
+    };
+
+    if config_path.is_none() {
+        return Err("missing required argument: --config <path>".to_string());
+    }
+    Ok(CliArgs {
+        config_path,
+        runtime_root: None,
+        control_plane_socket_override: None,
+        mode: LaunchMode::StandaloneRun,
+        management_command: Some(management_command),
+    })
+}
+
+fn validate_secret_input_route(input: &SecretInputRoute) -> Result<(), String> {
+    if input.explicit_count() > 1 {
+        return Err(
+            "secret input source conflict: choose exactly one of --from-fd/--from-stdin/--from-file/--from-tty-prompt"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn read_secret_input(input: &SecretInputRoute, prompt: &str) -> Result<SecretInputCapture, String> {
+    validate_secret_input_route(input)?;
+    let (kind, locator, summary, bytes) = if let Some(fd) = input.fd {
+        let path = format!("/dev/fd/{fd}");
+        let bytes = fs::read(&path).map_err(|err| format!("read --from-fd failed ({path}): {err}"))?;
+        (SecretSourceKind::Fd, path, "explicit:fd".to_string(), bytes)
+    } else if input.from_stdin {
+        let bytes = read_all_stdin()?;
+        (
+            SecretSourceKind::Stdin,
+            "stdin:explicit".to_string(),
+            "explicit:stdin".to_string(),
+            bytes,
+        )
+    } else if let Some(path) = input.file.as_ref() {
+        let bytes = fs::read(path)
+            .map_err(|err| format!("read --from-file failed ({}): {err}", path.display()))?;
+        (
+            SecretSourceKind::File,
+            path.to_string_lossy().to_string(),
+            "explicit:file".to_string(),
+            bytes,
+        )
+    } else if input.from_tty_prompt {
+        let bytes = read_secret_from_tty_prompt(prompt)?;
+        (
+            SecretSourceKind::TtyPrompt,
+            "tty-prompt:explicit".to_string(),
+            "explicit:tty-prompt".to_string(),
+            bytes,
+        )
+    } else if !io::stdin().is_terminal() {
+        let bytes = read_all_stdin()?;
+        (
+            SecretSourceKind::Stdin,
+            "stdin:auto".to_string(),
+            "auto:stdin".to_string(),
+            bytes,
+        )
+    } else {
+        let bytes = read_secret_from_tty_prompt(prompt)?;
+        (
+            SecretSourceKind::TtyPrompt,
+            "tty-prompt:auto".to_string(),
+            "auto:tty-prompt".to_string(),
+            bytes,
+        )
+    };
+
+    if bytes.is_empty() {
+        return Err("secret input is empty".to_string());
+    }
+    let secret = String::from_utf8(bytes.clone())
+        .map_err(|_| "secret input must be valid UTF-8".to_string())?;
+    Ok(SecretInputCapture {
+        secret,
+        source_kind: kind,
+        source_summary: summary,
+        source_locator_digest: stable_locator_digest(&locator),
+        byte_length: bytes.len(),
+    })
+}
+
+fn read_all_stdin() -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    io::stdin()
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("read stdin failed: {err}"))?;
+    Ok(bytes)
+}
+
+fn read_secret_from_tty_prompt(prompt: &str) -> Result<Vec<u8>, String> {
+    if !io::stdin().is_terminal() {
+        return Err("tty prompt requested but stdin is not a tty".to_string());
+    }
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|err| format!("flush tty prompt failed: {err}"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|err| format!("read tty prompt input failed: {err}"))?;
+    Ok(trim_single_trailing_newline(line).into_bytes())
+}
+
+fn trim_single_trailing_newline(value: String) -> String {
+    let mut value = value;
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn stable_locator_digest(locator: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    locator.hash(&mut hasher);
+    format!("siphash64:{:016x}", hasher.finish())
+}
+
+fn emit_management_audit(
+    action: &str,
+    operator_principal: &str,
+    intent_id: Option<&str>,
+    input: Option<&SecretInputCapture>,
+    status: &str,
+) {
+    let payload = json!({
+        "kind": "standalone_management_audit",
+        "action": action,
+        "status": status,
+        "operator_principal": operator_principal,
+        "intent_id": intent_id,
+        "source_kind": input.map(|capture| capture.source_kind.as_str()),
+        "source_summary": input.map(|capture| capture.source_summary.clone()),
+        "source_locator_digest": input.map(|capture| capture.source_locator_digest.clone()),
+        "byte_length": input.map(|capture| capture.byte_length),
+    });
+    eprintln!(
+        "{}",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{\"kind\":\"standalone_management_audit\",\"status\":\"encode-failed\"}".to_string())
+    );
+}
+
+fn management_operator_principal() -> String {
+    let user = env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!("standalone-cli:{user}")
+}
+
+fn normalize_cli_vault_method(method: &str) -> String {
+    method.trim().to_ascii_lowercase()
+}
+
+fn load_management_router(config_path: &Path) -> Result<(CoreSettings, SecretVaultRouter), String> {
+    let settings = CoreSettings::load_from_file(config_path)
+        .map_err(|err| format!("invalid config: {err:?}"))?;
+    let vault_root = Path::new(&settings.core.data_dir).join("vault");
+    fs::create_dir_all(&vault_root).map_err(|err| {
+        format!(
+            "create vault store dir failed: {} ({err})",
+            vault_root.display()
+        )
+    })?;
+    let mut router = SecretVaultRouter::with_persistent_store(&vault_root)
+        .map_err(|err| format!("open vault persistent store failed: {err:?}"))?;
+    router
+        .set_active_backend(&settings.vault.backend)
+        .map_err(|err| format!("set active vault backend failed: {err:?}"))?;
+    router
+        .set_unlock_policy(vault_unlock_policy_from_settings(&settings)?)
+        .map_err(|err| format!("set vault unlock policy failed: {err:?}"))?;
+    Ok((settings, router))
+}
+
+fn vault_unlock_policy_from_settings(settings: &CoreSettings) -> Result<VaultUnlockPolicy, String> {
+    Ok(VaultUnlockPolicy {
+        trigger_policy: parse_vault_trigger_policy(&settings.vault.unlock.trigger_policy)?,
+        allowed_methods: settings.vault.unlock.allowed_methods.clone(),
+        preferred_method: settings.vault.unlock.preferred_method.clone(),
+        cache_ttl_sec: settings.vault.unlock.cache_ttl_sec,
+        require_fresh_user_verification: settings.vault.unlock.require_fresh_user_verification,
+    })
+}
+
+fn parse_vault_trigger_policy(raw: &str) -> Result<VaultUnlockTriggerPolicy, String> {
+    match normalize_cli_vault_method(raw).as_str() {
+        "on-core-start" => Ok(VaultUnlockTriggerPolicy::OnCoreStart),
+        "on-first-secret-access" => Ok(VaultUnlockTriggerPolicy::OnFirstSecretAccess),
+        "on-every-secret-access" => Ok(VaultUnlockTriggerPolicy::OnEverySecretAccess),
+        "manual-only" => Ok(VaultUnlockTriggerPolicy::ManualOnly),
+        other => Err(format!("unsupported vault unlock trigger policy: {other}")),
+    }
 }
 
 fn reject_plaintext_secret_argv(args: &[String]) -> Result<(), String> {
@@ -1340,8 +2118,11 @@ fn print_usage() {
     eprintln!("  bridgingio-core -d --config <path-to-standalone.toml>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --runtime-root <runtime-root-dir>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-managed-core.toml>");
-    eprintln!("  future route (not yet implemented): bridgingio-core auth token create|list|revoke|update-scope");
-    eprintln!("    route must reuse control-plane token service/records; plaintext token argv is forbidden");
+    eprintln!("  bridgingio-core vault init --config <path-to-standalone.toml>");
+    eprintln!("  bridgingio-core vault import --config <path> --reference <vault://...> [--label <label>] [--from-fd N|--from-stdin|--from-file <path>|--from-tty-prompt]");
+    eprintln!("  bridgingio-core vault unlock --config <path> [--method os-native|passphrase] [--from-fd N|--from-stdin|--from-file <path>|--from-tty-prompt]");
+    eprintln!("  bridgingio-core auth token create --config <path> --label <name> [--expires-in-seconds <u64>]");
+    eprintln!("  bridgingio-core auth token revoke --config <path> --token-id <token-id> [--reason <reason>]");
     eprintln!("  debug/testing escape hatch: --control-plane-socket-override <path-or-endpoint>");
 }
 
@@ -1473,6 +2254,7 @@ allow_non_loopback = false
 [model_plane.http.auth]
 mode = "none"
 required_when_non_loopback = true
+allow_loopback_anonymous_compat = true
 
 [policies.defaults]
 reuse_policy = "resume_or_create"
@@ -1500,7 +2282,7 @@ mod tests {
 
     use bridgingio_engine::CoreSettings;
 
-    use super::{parse_args_from, CliArgs, LaunchMode};
+    use super::{parse_args_from, CliArgs, LaunchMode, ManagementCommand, SecretInputRoute};
 
     fn parse(items: &[&str]) -> LaunchMode {
         let args = items
@@ -1574,19 +2356,71 @@ mod tests {
     }
 
     #[test]
-    fn reserves_future_standalone_auth_token_route() {
-        let args = [
+    fn parses_auth_token_create_management_route() {
+        let parsed = parse_cli(&[
             "auth",
             "token",
             "create",
             "--config",
             "/tmp/standalone.toml",
+            "--label",
+            "nightly-runner",
+            "--expires-in-seconds",
+            "1800",
+        ]);
+        assert_eq!(parsed.mode, LaunchMode::StandaloneRun);
+        assert!(parsed.control_plane_socket_override.is_none());
+        assert_eq!(
+            parsed.management_command,
+            Some(ManagementCommand::AuthTokenCreate {
+                label: "nightly-runner".to_string(),
+                expires_in_seconds: Some(1800),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_vault_unlock_management_route_with_explicit_input_source() {
+        let parsed = parse_cli(&[
+            "vault",
+            "unlock",
+            "--config",
+            "/tmp/standalone.toml",
+            "--method",
+            "passphrase",
+            "--from-file",
+            "/tmp/passphrase.txt",
+        ]);
+        assert_eq!(
+            parsed.management_command,
+            Some(ManagementCommand::VaultUnlock {
+                method: Some("passphrase".to_string()),
+                input: SecretInputRoute {
+                    fd: None,
+                    from_stdin: false,
+                    file: Some(PathBuf::from("/tmp/passphrase.txt")),
+                    from_tty_prompt: false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_secret_input_sources_in_management_route() {
+        let args = [
+            "vault",
+            "unlock",
+            "--config",
+            "/tmp/standalone.toml",
+            "--from-stdin",
+            "--from-file",
+            "/tmp/passphrase.txt",
         ]
         .iter()
         .map(|item| item.to_string())
         .collect::<Vec<_>>();
-        let err = parse_args_from(args).expect_err("must reserve future auth token route");
-        assert!(err.contains("future standalone route"));
+        let err = parse_args_from(args).expect_err("must reject conflicting secret sources");
+        assert!(err.contains("secret input source conflict"));
     }
 
     #[test]

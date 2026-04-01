@@ -245,4 +245,27 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn settings_security_ui_contract_covers_locked_state_unlock_and_issue_revoke_flow() {
+        let spec = TauriShellHostSpec::new("/tmp/bridgingio-core");
+        let html = spec.bundled_index_html().to_ascii_lowercase();
+        for snippet in [
+            "function rendersettings()",
+            "lockstatelower !== \"unlocked\"",
+            "lockstatelower === \"unavailable\" || lockstatelower === \"uninitialized\"",
+            "vault must be unlocked before issuing a long-lived token.",
+            "bridgecommand(\"get_vault_state\"",
+            "bridgecommand(\"unlock_vault\"",
+            "bridgecommand(\"create_agent_token\"",
+            "bridgecommand(\"revoke_agent_token\"",
+            "vault unlock flow completed through trusted host verification.",
+            "renderissuedtokenresult();",
+        ] {
+            assert!(
+                html.contains(&snippet.to_ascii_lowercase()),
+                "settings locked/unlock/token flow contract missing: {snippet}"
+            );
+        }
+    }
 }

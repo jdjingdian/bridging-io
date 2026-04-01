@@ -16,8 +16,27 @@ max_bytes = 268435456
 eviction_policy = "lru"
 
 [vault]
-backend = "os-native"
+backend = "builtin-encrypted"
 namespace = "io.bridgingio"
+
+[vault.unlock]
+trigger_policy = "on-first-secret-access"
+allowed_methods = ["os-native", "passphrase"]
+preferred_method = "os-native"
+cache_ttl_sec = 600
+require_fresh_user_verification = true
+
+[vault.protectors.primary]
+kind = "os-native"
+
+[[vault.protectors.recovery]]
+kind = "passphrase"
+kdf = "argon2id"
+profile = "interactive-default"
+
+[vault.ssh]
+delivery_mode = "ssh-agent-broker"
+fallback_delivery_mode = "ephemeral-identity-file"
 
 [control_plane]
 enabled = true
@@ -33,6 +52,7 @@ allow_non_loopback = false
 [model_plane.http.auth]
 mode = "none"
 required_when_non_loopback = true
+allow_loopback_anonymous_compat = true
 
 [policies.defaults]
 reuse_policy = "resume_or_create"
@@ -46,7 +66,7 @@ display_name = "Local SSH"
 kind = "ssh"
 enabled = true
 aliases = ["local"]
-credential_ref = "vault://bridgingio/ssh/local"
+credential_ref = "vault://bridgingio/ssh-private-key/local"
 
 [targets.connection]
 host = "127.0.0.1"

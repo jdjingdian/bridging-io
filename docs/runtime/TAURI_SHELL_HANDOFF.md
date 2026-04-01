@@ -19,12 +19,22 @@ Core/control-plane responsibilities:
 - keep management continuity independent from model-plane HTTP address changes
 - persist config updates and return apply strategy (`live_applied` /
   `restart_required`)
+- enforce canonical vault lock/protector truth and attestation gates for
+  high-risk management actions
 
 Bundled webview responsibilities:
 
 - render onboarding, workspace navigation, timeline, settings security views
 - call host bridge only (no external localhost management dependency)
 - remain display-safe for token/vault projections
+
+Standalone management responsibilities:
+
+- expose `vault init/import/unlock` and `auth token create/revoke` entrypoints
+  without introducing plaintext argv secret paths
+- preserve trusted verification semantics for unlock/token create
+- emit minimal audit metadata (`source_kind`, `intent_id`, source digest)
+  without secret/plaintext leakage
 
 ## Bridge Contract Checklist
 
@@ -55,6 +65,8 @@ Reference tests:
   - `timeline_payload_and_bootstrap_include_source_group_summary`
   - `control_plane_create_list_revoke_agent_token_contract`
   - `control_plane_get_settings_includes_vault_status_projection`
+  - `bridgingio-core --self-test` vault/auth contract smoke (canonicalization,
+    attestation enforcement, single-use, SSH broker lifecycle)
 
 ## UI Contract Automation Gate
 
@@ -88,3 +100,7 @@ future macOS UI restructuring:
 
 Do not treat current SwiftUI layout as the only source of truth when planning
 the next macOS console iteration.
+
+## Operator Reference
+
+- `docs/runtime/CANONICAL_VAULT_OPERATOR.md`

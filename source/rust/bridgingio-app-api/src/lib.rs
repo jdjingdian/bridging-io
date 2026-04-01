@@ -7,6 +7,10 @@ use bridgingio_domain::{
     TARGET_TERMINAL_SHELL_METADATA_KEY,
 };
 
+const TARGET_STORAGE_CLASS_METADATA_KEY: &str = "target.storage_class";
+const TARGET_ACCESS_CLASS_METADATA_KEY: &str = "target.access_class";
+const TARGET_SEALED_PROFILE_REF_METADATA_KEY: &str = "target.sealed_profile_ref";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiRequestContext {
     pub agent_id: String,
@@ -127,6 +131,66 @@ pub struct CreateAgentTokenResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAdminActionIntentView {
+    pub intent_id: String,
+    pub action_kind: String,
+    pub target_object_ref: String,
+    pub requested_by_principal: String,
+    pub requested_payload_digest: String,
+    pub created_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAdminAttestationView {
+    pub attestation_id: String,
+    pub intent_id: String,
+    pub verified_principal: String,
+    pub verification_method: String,
+    pub issued_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub consumed_at: Option<SystemTime>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultProtectorSummaryView {
+    pub primary: String,
+    pub recovery: Vec<String>,
+    pub retired: Vec<String>,
+    pub fail_closed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultUnlockPolicySummaryView {
+    pub trigger_policy: String,
+    pub allowed_methods: Vec<String>,
+    pub preferred_method: String,
+    pub cache_ttl_sec: u64,
+    pub require_fresh_user_verification: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultSecretSummaryView {
+    pub reference: String,
+    pub kind: String,
+    pub label: String,
+    pub status: String,
+    pub active_version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultStateProjectionView {
+    pub lock_state: String,
+    pub configured_backend: String,
+    pub active_backend: String,
+    pub protector_summary: VaultProtectorSummaryView,
+    pub unlock_policy_summary: VaultUnlockPolicySummaryView,
+    pub secrets: Vec<VaultSecretSummaryView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimelineSourceGroupSummaryView {
     pub group_key: String,
     pub group_kind: String,
@@ -201,6 +265,26 @@ pub enum AppCommand {
         scope: AgentTokenScopeView,
         reason: Option<String>,
         attestation_id: Option<String>,
+    },
+    CreateLocalAdminIntent {
+        action_kind: String,
+        target_object_ref: String,
+        requested_payload_digest: Option<String>,
+        ttl_seconds: Option<u64>,
+    },
+    CompleteLocalAdminAttestation {
+        intent_id: String,
+        verification_method: String,
+        ttl_seconds: Option<u64>,
+    },
+    GetVaultState,
+    UnlockVault {
+        method: String,
+        passphrase: Option<String>,
+        attestation_id: String,
+    },
+    LockVault {
+        reason: Option<String>,
     },
     OpenSession {
         target_id: String,
@@ -358,6 +442,26 @@ pub enum ApiResponse {
     AgentTokenRevoked {
         request_id: String,
         summary: AgentTokenSummaryView,
+    },
+    LocalAdminIntentCreated {
+        request_id: String,
+        intent: LocalAdminActionIntentView,
+    },
+    LocalAdminAttestationCompleted {
+        request_id: String,
+        attestation: LocalAdminAttestationView,
+    },
+    VaultState {
+        request_id: String,
+        state: VaultStateProjectionView,
+    },
+    VaultUnlocked {
+        request_id: String,
+        lock_state: String,
+    },
+    VaultLocked {
+        request_id: String,
+        lock_state: String,
     },
     Session {
         request_id: String,
@@ -539,6 +643,64 @@ impl AppApiLineCodec {
                     base.push_str(&format!("|attestation_id={}", escape(value)));
                 }
             }
+            AppCommand::CreateLocalAdminIntent {
+                action_kind,
+                target_object_ref,
+                requested_payload_digest,
+                ttl_seconds,
+            } => {
+                base.push_str("|command=create_local_admin_intent");
+                base.push_str(&format!(
+                    "|action_kind={}|target_object_ref={}",
+                    escape(action_kind),
+                    escape(target_object_ref)
+                ));
+                if let Some(value) = requested_payload_digest {
+                    base.push_str(&format!("|requested_payload_digest={}", escape(value)));
+                }
+                if let Some(value) = ttl_seconds {
+                    base.push_str(&format!("|ttl_seconds={value}"));
+                }
+            }
+            AppCommand::CompleteLocalAdminAttestation {
+                intent_id,
+                verification_method,
+                ttl_seconds,
+            } => {
+                base.push_str("|command=complete_local_admin_attestation");
+                base.push_str(&format!(
+                    "|intent_id={}|verification_method={}",
+                    escape(intent_id),
+                    escape(verification_method)
+                ));
+                if let Some(value) = ttl_seconds {
+                    base.push_str(&format!("|ttl_seconds={value}"));
+                }
+            }
+            AppCommand::GetVaultState => {
+                base.push_str("|command=get_vault_state");
+            }
+            AppCommand::UnlockVault {
+                method,
+                passphrase,
+                attestation_id,
+            } => {
+                base.push_str("|command=unlock_vault");
+                base.push_str(&format!(
+                    "|method={}|attestation_id={}",
+                    escape(method),
+                    escape(attestation_id)
+                ));
+                if let Some(value) = passphrase.as_ref() {
+                    base.push_str(&format!("|passphrase={}", escape(value)));
+                }
+            }
+            AppCommand::LockVault { reason } => {
+                base.push_str("|command=lock_vault");
+                if let Some(value) = reason.as_ref() {
+                    base.push_str(&format!("|reason={}", escape(value)));
+                }
+            }
             AppCommand::OpenSession { target_id } => {
                 base.push_str("|command=open_session");
                 base.push_str(&format!("|target_id={target_id}"));
@@ -588,6 +750,24 @@ impl AppApiLineCodec {
                     .get(TARGET_TERMINAL_CONCURRENCY_METADATA_KEY)
                 {
                     base.push_str(&format!("|target_terminal_concurrency={}", escape(policy)));
+                }
+                if let Some(storage_class) = profile.metadata.get(TARGET_STORAGE_CLASS_METADATA_KEY)
+                {
+                    base.push_str(&format!(
+                        "|target_storage_class={}",
+                        escape(storage_class)
+                    ));
+                }
+                if let Some(access_class) = profile.metadata.get(TARGET_ACCESS_CLASS_METADATA_KEY) {
+                    base.push_str(&format!("|target_access_class={}", escape(access_class)));
+                }
+                if let Some(sealed_profile_ref) =
+                    profile.metadata.get(TARGET_SEALED_PROFILE_REF_METADATA_KEY)
+                {
+                    base.push_str(&format!(
+                        "|target_sealed_profile_ref={}",
+                        escape(sealed_profile_ref)
+                    ));
                 }
                 if let Some(notes) = profile.notes.as_ref() {
                     base.push_str(&format!("|notes={}", escape(notes)));
@@ -753,6 +933,26 @@ impl AppApiLineCodec {
                 scope: parse_scope_from_fields(&map)?,
                 reason: optional(&map, "reason").map(unescape),
                 attestation_id: optional(&map, "attestation_id").map(unescape),
+            },
+            "create_local_admin_intent" => AppCommand::CreateLocalAdminIntent {
+                action_kind: unescape(required(&map, "action_kind")?),
+                target_object_ref: unescape(required(&map, "target_object_ref")?),
+                requested_payload_digest: optional(&map, "requested_payload_digest").map(unescape),
+                ttl_seconds: parse_optional_u64(optional(&map, "ttl_seconds"))?,
+            },
+            "complete_local_admin_attestation" => AppCommand::CompleteLocalAdminAttestation {
+                intent_id: unescape(required(&map, "intent_id")?),
+                verification_method: unescape(required(&map, "verification_method")?),
+                ttl_seconds: parse_optional_u64(optional(&map, "ttl_seconds"))?,
+            },
+            "get_vault_state" => AppCommand::GetVaultState,
+            "unlock_vault" => AppCommand::UnlockVault {
+                method: unescape(required(&map, "method")?),
+                passphrase: optional(&map, "passphrase").map(unescape),
+                attestation_id: unescape(required(&map, "attestation_id")?),
+            },
+            "lock_vault" => AppCommand::LockVault {
+                reason: optional(&map, "reason").map(unescape),
             },
             "open_session" => AppCommand::OpenSession {
                 target_id: required(&map, "target_id")?.to_string(),
@@ -967,6 +1167,39 @@ impl AppApiLineCodec {
                 append_agent_token_summary_fields(&mut line, summary, "");
                 line
             }
+            ApiResponse::LocalAdminIntentCreated { request_id, intent } => {
+                let mut line = format!("kind=local_admin_intent_created|request_id={request_id}");
+                append_local_admin_intent_fields(&mut line, intent, "");
+                line
+            }
+            ApiResponse::LocalAdminAttestationCompleted {
+                request_id,
+                attestation,
+            } => {
+                let mut line =
+                    format!("kind=local_admin_attestation_completed|request_id={request_id}");
+                append_local_admin_attestation_fields(&mut line, attestation, "");
+                line
+            }
+            ApiResponse::VaultState { request_id, state } => {
+                let mut line = format!("kind=vault_state|request_id={request_id}");
+                append_vault_state_fields(&mut line, state);
+                line
+            }
+            ApiResponse::VaultUnlocked {
+                request_id,
+                lock_state,
+            } => format!(
+                "kind=vault_unlocked|request_id={request_id}|lock_state={}",
+                escape(lock_state)
+            ),
+            ApiResponse::VaultLocked {
+                request_id,
+                lock_state,
+            } => format!(
+                "kind=vault_locked|request_id={request_id}|lock_state={}",
+                escape(lock_state)
+            ),
             ApiResponse::Session {
                 request_id,
                 session,
@@ -1111,6 +1344,28 @@ impl AppApiLineCodec {
             "agent_token_revoked" => Ok(ApiResponse::AgentTokenRevoked {
                 request_id,
                 summary: parse_agent_token_summary_from_fields(&map, "")?,
+            }),
+            "local_admin_intent_created" => Ok(ApiResponse::LocalAdminIntentCreated {
+                request_id,
+                intent: parse_local_admin_intent_from_fields(&map, "")?,
+            }),
+            "local_admin_attestation_completed" => {
+                Ok(ApiResponse::LocalAdminAttestationCompleted {
+                    request_id,
+                    attestation: parse_local_admin_attestation_from_fields(&map, "")?,
+                })
+            }
+            "vault_state" => Ok(ApiResponse::VaultState {
+                request_id,
+                state: parse_vault_state_from_fields(&map)?,
+            }),
+            "vault_unlocked" => Ok(ApiResponse::VaultUnlocked {
+                request_id,
+                lock_state: unescape(required(&map, "lock_state")?),
+            }),
+            "vault_locked" => Ok(ApiResponse::VaultLocked {
+                request_id,
+                lock_state: unescape(required(&map, "lock_state")?),
             }),
             "settings" => Ok(ApiResponse::Settings {
                 request_id,
@@ -1474,6 +1729,244 @@ fn parse_agent_token_summary_from_fields(
     })
 }
 
+fn append_local_admin_intent_fields(
+    line: &mut String,
+    intent: &LocalAdminActionIntentView,
+    prefix: &str,
+) {
+    line.push_str(&format!("|{prefix}intent_id={}", escape(&intent.intent_id)));
+    line.push_str(&format!(
+        "|{prefix}action_kind={}",
+        escape(&intent.action_kind)
+    ));
+    line.push_str(&format!(
+        "|{prefix}target_object_ref={}",
+        escape(&intent.target_object_ref)
+    ));
+    line.push_str(&format!(
+        "|{prefix}requested_by_principal={}",
+        escape(&intent.requested_by_principal)
+    ));
+    line.push_str(&format!(
+        "|{prefix}requested_payload_digest={}",
+        escape(&intent.requested_payload_digest)
+    ));
+    line.push_str(&format!(
+        "|{prefix}created_at_ms={}",
+        to_unix_millis(intent.created_at)
+    ));
+    line.push_str(&format!(
+        "|{prefix}expires_at_ms={}",
+        to_unix_millis(intent.expires_at)
+    ));
+    line.push_str(&format!("|{prefix}status={}", escape(&intent.status)));
+}
+
+fn parse_local_admin_intent_from_fields(
+    map: &std::collections::HashMap<String, String>,
+    prefix: &str,
+) -> Result<LocalAdminActionIntentView, ApiError> {
+    let key = |suffix: &str| -> String { format!("{prefix}{suffix}") };
+    Ok(LocalAdminActionIntentView {
+        intent_id: unescape(required(map, &key("intent_id"))?),
+        action_kind: unescape(required(map, &key("action_kind"))?),
+        target_object_ref: unescape(required(map, &key("target_object_ref"))?),
+        requested_by_principal: unescape(required(map, &key("requested_by_principal"))?),
+        requested_payload_digest: unescape(required(map, &key("requested_payload_digest"))?),
+        created_at: parse_optional_system_time_ms(optional(map, &key("created_at_ms")))?
+            .ok_or_else(|| invalid_request("missing field: created_at_ms"))?,
+        expires_at: parse_optional_system_time_ms(optional(map, &key("expires_at_ms")))?
+            .ok_or_else(|| invalid_request("missing field: expires_at_ms"))?,
+        status: unescape(required(map, &key("status"))?),
+    })
+}
+
+fn append_local_admin_attestation_fields(
+    line: &mut String,
+    attestation: &LocalAdminAttestationView,
+    prefix: &str,
+) {
+    line.push_str(&format!(
+        "|{prefix}attestation_id={}",
+        escape(&attestation.attestation_id)
+    ));
+    line.push_str(&format!(
+        "|{prefix}intent_id={}",
+        escape(&attestation.intent_id)
+    ));
+    line.push_str(&format!(
+        "|{prefix}verified_principal={}",
+        escape(&attestation.verified_principal)
+    ));
+    line.push_str(&format!(
+        "|{prefix}verification_method={}",
+        escape(&attestation.verification_method)
+    ));
+    line.push_str(&format!(
+        "|{prefix}issued_at_ms={}",
+        to_unix_millis(attestation.issued_at)
+    ));
+    line.push_str(&format!(
+        "|{prefix}expires_at_ms={}",
+        to_unix_millis(attestation.expires_at)
+    ));
+    if let Some(value) = attestation.consumed_at {
+        line.push_str(&format!(
+            "|{prefix}consumed_at_ms={}",
+            to_unix_millis(value)
+        ));
+    }
+    line.push_str(&format!("|{prefix}status={}", escape(&attestation.status)));
+}
+
+fn parse_local_admin_attestation_from_fields(
+    map: &std::collections::HashMap<String, String>,
+    prefix: &str,
+) -> Result<LocalAdminAttestationView, ApiError> {
+    let key = |suffix: &str| -> String { format!("{prefix}{suffix}") };
+    Ok(LocalAdminAttestationView {
+        attestation_id: unescape(required(map, &key("attestation_id"))?),
+        intent_id: unescape(required(map, &key("intent_id"))?),
+        verified_principal: unescape(required(map, &key("verified_principal"))?),
+        verification_method: unescape(required(map, &key("verification_method"))?),
+        issued_at: parse_optional_system_time_ms(optional(map, &key("issued_at_ms")))?
+            .ok_or_else(|| invalid_request("missing field: issued_at_ms"))?,
+        expires_at: parse_optional_system_time_ms(optional(map, &key("expires_at_ms")))?
+            .ok_or_else(|| invalid_request("missing field: expires_at_ms"))?,
+        consumed_at: parse_optional_system_time_ms(optional(map, &key("consumed_at_ms")))?,
+        status: unescape(required(map, &key("status"))?),
+    })
+}
+
+fn append_vault_state_fields(line: &mut String, state: &VaultStateProjectionView) {
+    line.push_str(&format!("|lock_state={}", escape(&state.lock_state)));
+    line.push_str(&format!(
+        "|configured_backend={}",
+        escape(&state.configured_backend)
+    ));
+    line.push_str(&format!("|active_backend={}", escape(&state.active_backend)));
+    line.push_str(&format!(
+        "|protector_primary={}",
+        escape(&state.protector_summary.primary)
+    ));
+    line.push_str(&format!(
+        "|protector_recovery={}",
+        escape(&encode_string_list(&state.protector_summary.recovery))
+    ));
+    line.push_str(&format!(
+        "|protector_retired={}",
+        escape(&encode_string_list(&state.protector_summary.retired))
+    ));
+    line.push_str(&format!(
+        "|protector_fail_closed={}",
+        state.protector_summary.fail_closed
+    ));
+    line.push_str(&format!(
+        "|unlock_trigger_policy={}",
+        escape(&state.unlock_policy_summary.trigger_policy)
+    ));
+    line.push_str(&format!(
+        "|unlock_allowed_methods={}",
+        escape(&encode_string_list(&state.unlock_policy_summary.allowed_methods))
+    ));
+    line.push_str(&format!(
+        "|unlock_preferred_method={}",
+        escape(&state.unlock_policy_summary.preferred_method)
+    ));
+    line.push_str(&format!(
+        "|unlock_cache_ttl_sec={}",
+        state.unlock_policy_summary.cache_ttl_sec
+    ));
+    line.push_str(&format!(
+        "|unlock_require_fresh_user_verification={}",
+        state
+            .unlock_policy_summary
+            .require_fresh_user_verification
+    ));
+    line.push_str(&format!("|secret_count={}", state.secrets.len()));
+    for (index, secret) in state.secrets.iter().enumerate() {
+        line.push_str(&format!(
+            "|secret_{index}_reference={}",
+            escape(&secret.reference)
+        ));
+        line.push_str(&format!("|secret_{index}_kind={}", escape(&secret.kind)));
+        line.push_str(&format!("|secret_{index}_label={}", escape(&secret.label)));
+        line.push_str(&format!("|secret_{index}_status={}", escape(&secret.status)));
+        if let Some(value) = secret.active_version_id.as_ref() {
+            line.push_str(&format!(
+                "|secret_{index}_active_version_id={}",
+                escape(value)
+            ));
+        }
+    }
+}
+
+fn parse_vault_state_from_fields(
+    map: &std::collections::HashMap<String, String>,
+) -> Result<VaultStateProjectionView, ApiError> {
+    let secret_count = optional(map, "secret_count")
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|_| invalid_request("secret_count must be usize"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let mut secrets = Vec::with_capacity(secret_count);
+    for index in 0..secret_count {
+        let key = |suffix: &str| -> String { format!("secret_{index}_{suffix}") };
+        secrets.push(VaultSecretSummaryView {
+            reference: unescape(required(map, &key("reference"))?),
+            kind: unescape(required(map, &key("kind"))?),
+            label: unescape(required(map, &key("label"))?),
+            status: unescape(required(map, &key("status"))?),
+            active_version_id: optional(map, &key("active_version_id")).map(unescape),
+        });
+    }
+
+    Ok(VaultStateProjectionView {
+        lock_state: unescape(required(map, "lock_state")?),
+        configured_backend: unescape(required(map, "configured_backend")?),
+        active_backend: unescape(required(map, "active_backend")?),
+        protector_summary: VaultProtectorSummaryView {
+            primary: unescape(required(map, "protector_primary")?),
+            recovery: parse_string_list(
+                optional(map, "protector_recovery")
+                    .map(unescape)
+                    .as_deref(),
+            ),
+            retired: parse_string_list(
+                optional(map, "protector_retired")
+                    .map(unescape)
+                    .as_deref(),
+            ),
+            fail_closed: required(map, "protector_fail_closed")?
+                .parse::<bool>()
+                .map_err(|_| invalid_request("protector_fail_closed must be bool"))?,
+        },
+        unlock_policy_summary: VaultUnlockPolicySummaryView {
+            trigger_policy: unescape(required(map, "unlock_trigger_policy")?),
+            allowed_methods: parse_string_list(
+                optional(map, "unlock_allowed_methods")
+                    .map(unescape)
+                    .as_deref(),
+            ),
+            preferred_method: unescape(required(map, "unlock_preferred_method")?),
+            cache_ttl_sec: required(map, "unlock_cache_ttl_sec")?
+                .parse::<u64>()
+                .map_err(|_| invalid_request("unlock_cache_ttl_sec must be u64"))?,
+            require_fresh_user_verification: required(
+                map,
+                "unlock_require_fresh_user_verification",
+            )?
+            .parse::<bool>()
+            .map_err(|_| {
+                invalid_request("unlock_require_fresh_user_verification must be bool")
+            })?,
+        },
+        secrets,
+    })
+}
+
 fn parse_reuse_policy(raw: &str) -> Result<SessionReusePolicy, ApiError> {
     match raw {
         "always_new" => Ok(SessionReusePolicy::AlwaysNew),
@@ -1551,6 +2044,24 @@ fn parse_profile_from_fields(
                 TARGET_TERMINAL_CONCURRENCY_METADATA_KEY.to_string(),
                 normalized,
             );
+        }
+    }
+    if let Some(storage_class) = optional(map, "target_storage_class").map(unescape) {
+        let normalized = storage_class.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            metadata.insert(TARGET_STORAGE_CLASS_METADATA_KEY.to_string(), normalized);
+        }
+    }
+    if let Some(access_class) = optional(map, "target_access_class").map(unescape) {
+        let normalized = access_class.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            metadata.insert(TARGET_ACCESS_CLASS_METADATA_KEY.to_string(), normalized);
+        }
+    }
+    if let Some(sealed_profile_ref) = optional(map, "target_sealed_profile_ref").map(unescape) {
+        let normalized = sealed_profile_ref.trim().to_string();
+        if !normalized.is_empty() {
+            metadata.insert(TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(), normalized);
         }
     }
 
@@ -1643,7 +2154,11 @@ mod tests {
     use super::{
         AgentTokenScopeView, AgentTokenSummaryView, ApiRequest, ApiRequestContext, ApiResponse,
         AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ControlPlaneView, CoreSettingsView,
-        CreateAgentTokenResult, ModelPlaneHttpView, RuntimeLogSettingsView, VaultStatusView,
+        CreateAgentTokenResult, LocalAdminActionIntentView, LocalAdminAttestationView,
+        ModelPlaneHttpView, RuntimeLogSettingsView, VaultStatusView,
+        TARGET_ACCESS_CLASS_METADATA_KEY, TARGET_SEALED_PROFILE_REF_METADATA_KEY,
+        TARGET_STORAGE_CLASS_METADATA_KEY, VaultProtectorSummaryView, VaultSecretSummaryView,
+        VaultStateProjectionView, VaultUnlockPolicySummaryView,
     };
 
     #[test]
@@ -1801,6 +2316,19 @@ mod tests {
             "adb".to_string(),
             "/Applications/AndroidStudio.app/adb".to_string(),
         );
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "sealed-overlay".to_string(),
+        );
+        metadata.insert(
+            TARGET_ACCESS_CLASS_METADATA_KEY.to_string(),
+            "token-scoped".to_string(),
+        );
+        metadata.insert(
+            TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(),
+            "vault://bridgingio/targets/android-emulator".to_string(),
+        );
         let request = ApiRequest {
             request_id: "req-upsert-profile".into(),
             context: ApiRequestContext {
@@ -1821,7 +2349,7 @@ mod tests {
                     credential_ref: None,
                     default_policy: bridgingio_domain::PolicyProfile::default(),
                     notes: None,
-                    metadata: BTreeMap::new(),
+                    metadata,
                     toolchains,
                 },
             },
@@ -1834,6 +2362,27 @@ mod tests {
                 assert_eq!(
                     profile.toolchains.get("adb").map(String::as_str),
                     Some("/Applications/AndroidStudio.app/adb")
+                );
+                assert_eq!(
+                    profile
+                        .metadata
+                        .get(TARGET_STORAGE_CLASS_METADATA_KEY)
+                        .map(String::as_str),
+                    Some("sealed-overlay")
+                );
+                assert_eq!(
+                    profile
+                        .metadata
+                        .get(TARGET_ACCESS_CLASS_METADATA_KEY)
+                        .map(String::as_str),
+                    Some("token-scoped")
+                );
+                assert_eq!(
+                    profile
+                        .metadata
+                        .get(TARGET_SEALED_PROFILE_REF_METADATA_KEY)
+                        .map(String::as_str),
+                    Some("vault://bridgingio/targets/android-emulator")
                 );
             }
             other => panic!("expected upsert_profile command, got {other:?}"),
@@ -1991,6 +2540,233 @@ mod tests {
                 assert_eq!(items[0].token_id, "token-000001");
             }
             other => panic!("expected token list response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_local_admin_intent_commands() {
+        let request = ApiRequest {
+            request_id: "req-intent-create".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::CreateLocalAdminIntent {
+                action_kind: "create-agent-token".into(),
+                target_object_ref: "token-authority://create-agent-token".into(),
+                requested_payload_digest: Some("ab12cd34ef56aa77".into()),
+                ttl_seconds: Some(300),
+            },
+        };
+        let line = AppApiLineCodec::encode_request_line(&request);
+        let parsed = AppApiLineCodec::decode_request_line(&line).expect("decode");
+        match parsed.command {
+            AppCommand::CreateLocalAdminIntent {
+                action_kind,
+                target_object_ref,
+                requested_payload_digest,
+                ttl_seconds,
+            } => {
+                assert_eq!(action_kind, "create-agent-token");
+                assert_eq!(target_object_ref, "token-authority://create-agent-token");
+                assert_eq!(
+                    requested_payload_digest.as_deref(),
+                    Some("ab12cd34ef56aa77")
+                );
+                assert_eq!(ttl_seconds, Some(300));
+            }
+            other => panic!("expected create_local_admin_intent command, got {other:?}"),
+        }
+
+        let complete = ApiRequest {
+            request_id: "req-intent-complete".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::CompleteLocalAdminAttestation {
+                intent_id: "intent-000001".into(),
+                verification_method: "passkey".into(),
+                ttl_seconds: Some(120),
+            },
+        };
+        let complete_line = AppApiLineCodec::encode_request_line(&complete);
+        let complete_parsed =
+            AppApiLineCodec::decode_request_line(&complete_line).expect("decode complete");
+        match complete_parsed.command {
+            AppCommand::CompleteLocalAdminAttestation {
+                intent_id,
+                verification_method,
+                ttl_seconds,
+            } => {
+                assert_eq!(intent_id, "intent-000001");
+                assert_eq!(verification_method, "passkey");
+                assert_eq!(ttl_seconds, Some(120));
+            }
+            other => panic!("expected complete_local_admin_attestation command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_local_admin_responses() {
+        let intent = LocalAdminActionIntentView {
+            intent_id: "intent-000001".into(),
+            action_kind: "create-agent-token".into(),
+            target_object_ref: "token-authority://create-agent-token".into(),
+            requested_by_principal: "control-plane:ui-agent:ui-run:ui-client".into(),
+            requested_payload_digest: "ab12cd34ef56aa77".into(),
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            expires_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(301),
+            status: "pending".into(),
+        };
+        let line = AppApiLineCodec::encode_response_line(&ApiResponse::LocalAdminIntentCreated {
+            request_id: "req-intent-create".into(),
+            intent: intent.clone(),
+        });
+        let parsed = AppApiLineCodec::decode_response_line(&line).expect("decode intent response");
+        match parsed {
+            ApiResponse::LocalAdminIntentCreated { intent: value, .. } => {
+                assert_eq!(value.intent_id, intent.intent_id);
+                assert_eq!(value.action_kind, intent.action_kind);
+            }
+            other => panic!("expected local_admin_intent_created response, got {other:?}"),
+        }
+
+        let attestation = LocalAdminAttestationView {
+            attestation_id: "attest-000001".into(),
+            intent_id: "intent-000001".into(),
+            verified_principal: "control-plane:ui-agent:ui-run:ui-client".into(),
+            verification_method: "passkey".into(),
+            issued_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+            expires_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(122),
+            consumed_at: None,
+            status: "active".into(),
+        };
+        let attestation_line = AppApiLineCodec::encode_response_line(
+            &ApiResponse::LocalAdminAttestationCompleted {
+                request_id: "req-intent-complete".into(),
+                attestation: attestation.clone(),
+            },
+        );
+        let attestation_parsed = AppApiLineCodec::decode_response_line(&attestation_line)
+            .expect("decode attestation response");
+        match attestation_parsed {
+            ApiResponse::LocalAdminAttestationCompleted {
+                attestation: value, ..
+            } => {
+                assert_eq!(value.attestation_id, attestation.attestation_id);
+                assert_eq!(value.intent_id, attestation.intent_id);
+            }
+            other => {
+                panic!("expected local_admin_attestation_completed response, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_vault_management_commands() {
+        let unlock = ApiRequest {
+            request_id: "req-unlock-vault".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::UnlockVault {
+                method: "passphrase".into(),
+                passphrase: Some("demo-passphrase".into()),
+                attestation_id: "attest-001".into(),
+            },
+        };
+        let unlock_line = AppApiLineCodec::encode_request_line(&unlock);
+        let unlock_parsed = AppApiLineCodec::decode_request_line(&unlock_line).expect("decode");
+        match unlock_parsed.command {
+            AppCommand::UnlockVault {
+                method,
+                passphrase,
+                attestation_id,
+            } => {
+                assert_eq!(method, "passphrase");
+                assert_eq!(passphrase.as_deref(), Some("demo-passphrase"));
+                assert_eq!(attestation_id, "attest-001");
+            }
+            other => panic!("expected unlock_vault command, got {other:?}"),
+        }
+
+        let lock = ApiRequest {
+            request_id: "req-lock-vault".into(),
+            context: ApiRequestContext {
+                agent_id: "ui-agent".into(),
+                run_id: "ui-run".into(),
+                client_session_id: "ui-client".into(),
+                reuse_policy: SessionReusePolicy::ReuseIfAlive,
+            },
+            command: AppCommand::LockVault {
+                reason: Some("manual-lock".into()),
+            },
+        };
+        let lock_line = AppApiLineCodec::encode_request_line(&lock);
+        let lock_parsed = AppApiLineCodec::decode_request_line(&lock_line).expect("decode");
+        match lock_parsed.command {
+            AppCommand::LockVault { reason } => {
+                assert_eq!(reason.as_deref(), Some("manual-lock"));
+            }
+            other => panic!("expected lock_vault command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_and_decodes_vault_state_projection_response() {
+        let response = ApiResponse::VaultState {
+            request_id: "req-vault-state".into(),
+            state: VaultStateProjectionView {
+                lock_state: "locked".into(),
+                configured_backend: "builtin-encrypted".into(),
+                active_backend: "builtin-encrypted".into(),
+                protector_summary: VaultProtectorSummaryView {
+                    primary: "os-native".into(),
+                    recovery: vec!["passphrase".into()],
+                    retired: vec!["legacy-memory-shim".into()],
+                    fail_closed: true,
+                },
+                unlock_policy_summary: VaultUnlockPolicySummaryView {
+                    trigger_policy: "on-first-secret-access".into(),
+                    allowed_methods: vec!["os-native".into(), "passphrase".into()],
+                    preferred_method: "os-native".into(),
+                    cache_ttl_sec: 600,
+                    require_fresh_user_verification: true,
+                },
+                secrets: vec![VaultSecretSummaryView {
+                    reference: "vault://bridgingio/ssh-private-key/local".into(),
+                    kind: "ssh-private-key".into(),
+                    label: "local".into(),
+                    status: "active".into(),
+                    active_version_id: Some("ver-000001".into()),
+                }],
+            },
+        };
+        let line = AppApiLineCodec::encode_response_line(&response);
+        let parsed = AppApiLineCodec::decode_response_line(&line).expect("decode");
+        match parsed {
+            ApiResponse::VaultState { state, .. } => {
+                assert_eq!(state.lock_state, "locked");
+                assert_eq!(state.protector_summary.primary, "os-native");
+                assert_eq!(
+                    state.unlock_policy_summary.allowed_methods,
+                    vec!["os-native", "passphrase"]
+                );
+                assert_eq!(state.secrets.len(), 1);
+                assert_eq!(
+                    state.secrets[0].reference,
+                    "vault://bridgingio/ssh-private-key/local"
+                );
+            }
+            other => panic!("expected vault_state response, got {other:?}"),
         }
     }
 }

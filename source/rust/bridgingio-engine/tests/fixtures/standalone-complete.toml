@@ -16,8 +16,27 @@ max_bytes = 1073741824
 eviction_policy = "lru"
 
 [vault]
-backend = "os-native"
+backend = "builtin-encrypted"
 namespace = "io.bridgingio"
+
+[vault.unlock]
+trigger_policy = "on-first-secret-access"
+allowed_methods = ["os-native", "passphrase"]
+preferred_method = "os-native"
+cache_ttl_sec = 600
+require_fresh_user_verification = true
+
+[vault.protectors.primary]
+kind = "os-native"
+
+[[vault.protectors.recovery]]
+kind = "passphrase"
+kdf = "argon2id"
+profile = "interactive-default"
+
+[vault.ssh]
+delivery_mode = "ssh-agent-broker"
+fallback_delivery_mode = "ephemeral-identity-file"
 
 [control_plane]
 enabled = true
@@ -33,6 +52,7 @@ allow_non_loopback = false
 [model_plane.http.auth]
 mode = "none"
 required_when_non_loopback = true
+allow_loopback_anonymous_compat = true
 
 [toolchains.ssh]
 path_override = ""
@@ -54,7 +74,7 @@ display_name = "Lab Ubuntu"
 kind = "ssh"
 enabled = true
 aliases = ["lab", "ubuntu-main"]
-credential_ref = "vault://bridgingio/ssh/lab"
+credential_ref = "vault://bridgingio/ssh-private-key/lab"
 notes = "Primary lab server"
 
 [targets.connection]

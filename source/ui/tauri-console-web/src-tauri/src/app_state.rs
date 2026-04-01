@@ -3,7 +3,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bridgingio_app_api::{AgentTokenScopeView, AgentTokenSummaryView, ApiResponse, AppCommand};
+use bridgingio_app_api::{
+    AgentTokenScopeView, AgentTokenSummaryView, ApiResponse, AppCommand, VaultStateProjectionView,
+};
 use bridgingio_desktop_host::bridge::{BridgeError, BridgeIdentity, TrustedControlPlaneBridge};
 use bridgingio_desktop_host::bundle::TauriShellHostSpec;
 use bridgingio_desktop_host::host::{DesktopShellHost, ManagedRestartStatus, NotificationLevel};
@@ -12,6 +14,11 @@ use bridgingio_desktop_host::storage::{
     validate_runtime_root, RuntimeRootPreferenceStore, RuntimeRootValidationError,
 };
 use bridgingio_platform::{detect_host_platform_adapter, CapabilityStatus};
+use bridgingio_secrets::{
+    local_admin_create_token_target, local_admin_payload_digest_for_create_agent_token,
+    local_admin_payload_digest_for_unlock_vault, local_admin_unlock_vault_target,
+    CreateAgentTokenRequest, TokenScopeInput,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -244,7 +251,25 @@ impl AppRuntimeState {
                 let expires_in_seconds = payload_u64(&payload, "expires_in_seconds");
                 let scope = parse_scope(payload_value(&payload, "scope"))
                     .unwrap_or_else(default_scope);
-                let attestation_id = payload_string(&payload, "attestation_id");
+                let attestation_id = if let Some(value) = payload_string(&payload, "attestation_id")
+                {
+                    value
+                } else {
+                    let request = CreateAgentTokenRequest {
+                        label: label.clone(),
+                        created_by: "desktop-host".to_string(),
+                        expires_in: expires_in_seconds.map(Duration::from_secs),
+                        idle_timeout_sec: None,
+                        scope: token_scope_input_from_view(&scope),
+                        attestation_id: None,
+                    };
+                    let digest = local_admin_payload_digest_for_create_agent_token(&request);
+                    self.ensure_local_admin_attestation(
+                        "create-agent-token",
+                        local_admin_create_token_target().to_string(),
+                        digest,
+                    )?
+                };
 
                 let response = self
                     .bridge_mut()?
@@ -252,7 +277,7 @@ impl AppRuntimeState {
                         label,
                         expires_in_seconds,
                         scope,
-                        attestation_id,
+                        attestation_id: Some(attestation_id),
                     })
                     .map_err(format_bridge_error)?;
                 match response {
@@ -267,6 +292,33 @@ impl AppRuntimeState {
                         "unexpected response for create_agent_token: {:?}",
                         other
                     )),
+                }
+            }
+            "get_vault_state" => {
+                self.ensure_bridge_ready()?;
+                let response = self
+                    .bridge_mut()?
+                    .send_command(AppCommand::GetVaultState)
+                    .map_err(format_bridge_error)?;
+                match response {
+                    ApiResponse::VaultState { state, .. } => Ok(vault_state_to_json(&state)),
+                    ApiResponse::Error { error, .. } => Err(error.message),
+                    other => Err(format!("unexpected response for get_vault_state: {:?}", other)),
+                }
+            }
+            "lock_vault" => {
+                self.ensure_bridge_ready()?;
+                let reason = payload_string(&payload, "reason");
+                let response = self
+                    .bridge_mut()?
+                    .send_command(AppCommand::LockVault { reason })
+                    .map_err(format_bridge_error)?;
+                match response {
+                    ApiResponse::VaultLocked { lock_state, .. } => {
+                        Ok(json!({ "lock_state": lock_state }))
+                    }
+                    ApiResponse::Error { error, .. } => Err(error.message),
+                    other => Err(format!("unexpected response for lock_vault: {:?}", other)),
                 }
             }
             "read_artifact" => {
@@ -300,10 +352,85 @@ impl AppRuntimeState {
                 "upsert_profile is deferred in current host baseline; trusted bootstrap/read paths are available"
                     .to_string(),
             ),
-            "unlock_vault" => Err(
-                "unlock_vault is deferred until control-plane command contract is finalized".to_string(),
-            ),
+            "unlock_vault" => {
+                self.ensure_bridge_ready()?;
+                let method = payload_string(&payload, "method")
+                    .or_else(|| payload_string(&payload, "trigger"))
+                    .unwrap_or_else(|| "os-native".to_string());
+                let passphrase = payload_string(&payload, "passphrase");
+                let attestation_id = if let Some(value) = payload_string(&payload, "attestation_id")
+                {
+                    value
+                } else {
+                    let digest = local_admin_payload_digest_for_unlock_vault(&method);
+                    self.ensure_local_admin_attestation(
+                        "unlock-vault",
+                        local_admin_unlock_vault_target().to_string(),
+                        digest,
+                    )?
+                };
+                let response = self
+                    .bridge_mut()?
+                    .send_command(AppCommand::UnlockVault {
+                        method,
+                        passphrase,
+                        attestation_id,
+                    })
+                    .map_err(format_bridge_error)?;
+                match response {
+                    ApiResponse::VaultUnlocked { lock_state, .. } => {
+                        Ok(json!({ "lock_state": lock_state }))
+                    }
+                    ApiResponse::Error { error, .. } => Err(error.message),
+                    other => Err(format!("unexpected response for unlock_vault: {:?}", other)),
+                }
+            }
             other => Err(format!("unsupported workspace command: {other}")),
+        }
+    }
+
+    fn ensure_local_admin_attestation(
+        &mut self,
+        action_kind: &str,
+        target_object_ref: String,
+        requested_payload_digest: String,
+    ) -> Result<String, String> {
+        let intent_response = self
+            .bridge_mut()?
+            .send_command(AppCommand::CreateLocalAdminIntent {
+                action_kind: action_kind.to_string(),
+                target_object_ref,
+                requested_payload_digest: Some(requested_payload_digest),
+                ttl_seconds: Some(300),
+            })
+            .map_err(format_bridge_error)?;
+        let intent_id = match intent_response {
+            ApiResponse::LocalAdminIntentCreated { intent, .. } => intent.intent_id,
+            ApiResponse::Error { error, .. } => return Err(error.message),
+            other => {
+                return Err(format!(
+                    "unexpected response for create_local_admin_intent: {:?}",
+                    other
+                ))
+            }
+        };
+        let attestation_response = self
+            .bridge_mut()?
+            .send_command(AppCommand::CompleteLocalAdminAttestation {
+                intent_id,
+                verification_method: "trusted-local-ui".to_string(),
+                ttl_seconds: Some(120),
+            })
+            .map_err(format_bridge_error)?;
+        match attestation_response {
+            ApiResponse::LocalAdminAttestationCompleted { attestation, .. } => {
+                Ok(attestation.attestation_id)
+            }
+            ApiResponse::Error { error, .. } => Err(error.message),
+            other => Err(format!(
+                "unexpected response for complete_local_admin_attestation: {:?}",
+                other
+            )),
         }
     }
 
@@ -600,6 +727,20 @@ fn default_scope() -> AgentTokenScopeView {
     }
 }
 
+fn token_scope_input_from_view(view: &AgentTokenScopeView) -> TokenScopeInput {
+    TokenScopeInput {
+        scope_profile: view.scope_profile.clone(),
+        target_ids: view.target_ids.clone(),
+        tool_ids: view.tool_ids.clone(),
+        max_risk_envelope: view.max_risk_envelope.clone(),
+        allow_open_shell: view.allow_open_shell,
+        allow_write_shell_input: view.allow_write_shell_input,
+        allow_artifact_cross_principal: view.allow_artifact_cross_principal,
+        allow_delegation: view.allow_delegation,
+        allow_admin_actions: view.allow_admin_actions,
+    }
+}
+
 fn settings_to_json(settings: &bridgingio_app_api::CoreSettingsView) -> Value {
     json!({
         "schema_version": settings.schema_version,
@@ -634,6 +775,38 @@ fn settings_to_json(settings: &bridgingio_app_api::CoreSettingsView) -> Value {
             "configured_backend": settings.vault.configured_backend,
             "binding_backend": settings.vault.binding_backend,
         },
+    })
+}
+
+fn vault_state_to_json(state: &VaultStateProjectionView) -> Value {
+    json!({
+        "lock_state": state.lock_state,
+        "configured_backend": state.configured_backend,
+        "active_backend": state.active_backend,
+        "protector_summary": {
+            "primary": state.protector_summary.primary,
+            "recovery": state.protector_summary.recovery,
+            "retired": state.protector_summary.retired,
+            "fail_closed": state.protector_summary.fail_closed,
+        },
+        "unlock_policy_summary": {
+            "trigger_policy": state.unlock_policy_summary.trigger_policy,
+            "allowed_methods": state.unlock_policy_summary.allowed_methods,
+            "preferred_method": state.unlock_policy_summary.preferred_method,
+            "cache_ttl_sec": state.unlock_policy_summary.cache_ttl_sec,
+            "require_fresh_user_verification": state
+                .unlock_policy_summary
+                .require_fresh_user_verification,
+        },
+        "secrets": state.secrets.iter().map(|item| {
+            json!({
+                "reference": item.reference,
+                "kind": item.kind,
+                "label": item.label,
+                "status": item.status,
+                "active_version_id": item.active_version_id,
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 

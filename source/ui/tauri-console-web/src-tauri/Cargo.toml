@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 bridgingio-app-api = { path = "../../../rust/bridgingio-app-api" }
 bridgingio-desktop-host = { path = "../../../rust/bridgingio-desktop-host" }
 bridgingio-platform = { path = "../../../rust/bridgingio-platform" }
+bridgingio-secrets = { path = "../../../rust/bridgingio-secrets" }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

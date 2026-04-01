@@ -10,8 +10,10 @@ use bridgingio_app_api::{
     AgentTokenScopeView, AgentTokenSummaryView, ApiError, ApiErrorCode, ApiRequest, ApiResponse,
     AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ArtifactReadView, ControlPlaneView,
     CoreSettingsView, CreateAgentTokenResult as ApiCreateAgentTokenResult, ModelPlaneHttpView,
+    LocalAdminActionIntentView, LocalAdminAttestationView,
     RuntimeLogSettingsView, TimelineEntry, TimelineSourceGroupSummaryView, ToolchainDiagnosticView,
-    VaultStatusView,
+    VaultProtectorSummaryView, VaultSecretSummaryView, VaultStateProjectionView, VaultStatusView,
+    VaultUnlockPolicySummaryView,
 };
 use bridgingio_artifacts::{
     ArtifactCacheBackend, ArtifactEvictionPolicy, ArtifactReadResult, ArtifactRefineMode,
@@ -25,7 +27,7 @@ use bridgingio_connectors::{
 };
 use bridgingio_domain::{
     AccessScope, ArtifactRecord, CapabilitySummary, ChannelKind, ChannelStatus, ConnectionConfig,
-    SessionRecord, SessionReusePolicy, SessionState, TargetKind, TargetProfile,
+    CredentialRef, SessionRecord, SessionReusePolicy, SessionState, TargetKind, TargetProfile,
 };
 use bridgingio_engine::{
     CoreSettings, CoreSettingsStore, StandaloneConnectionSection, StandaloneTargetProfile,
@@ -38,10 +40,13 @@ use bridgingio_platform::{
 use bridgingio_policy::{evaluate, OperationKind, PolicyDecision};
 use bridgingio_providers::{GitProvider, TerminalProvider};
 use bridgingio_secrets::{
-    normalize_credential_ref, AgentTokenSummary, CreateAgentTokenRequest, SecretVaultRouter,
+    normalize_credential_ref, AgentTokenSummary, CreateAgentTokenRequest, LocalAdminActionIntent,
+    LocalAdminActionKind, LocalAdminAttestationRecord, SecretVaultRouter,
     SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
-    UpdateAgentTokenScopeRequest, VaultError,
+    UnlockVaultRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
+    VaultReadinessState, VaultUnlockTriggerPolicy,
 };
+use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
 
 #[cfg(unix)]
@@ -51,6 +56,12 @@ const TARGET_SSH_HOST_KEY_POLICY_METADATA_KEY: &str = "ssh.host_key_policy";
 const TARGET_SSH_ALLOW_IDENTITY_FALLBACK_METADATA_KEY: &str = "ssh.allow_identity_fallback";
 const TARGET_SSH_RUNTIME_PASSPHRASE_PROMPT_METADATA_KEY: &str = "ssh.runtime_passphrase_prompt";
 const TARGET_SSH_DELIVERY_MODE_METADATA_KEY: &str = "ssh.delivery_mode";
+const TARGET_STORAGE_CLASS_METADATA_KEY: &str = "target.storage_class";
+const TARGET_ACCESS_CLASS_METADATA_KEY: &str = "target.access_class";
+const TARGET_SEALED_PROFILE_REF_METADATA_KEY: &str = "target.sealed_profile_ref";
+const TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY: &str = "target.catalog_projection_state";
+const TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY: &str =
+    "target.sealed_descriptor_diagnostic";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityEnvelope {
@@ -822,6 +833,63 @@ impl McpTargetResolutionPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetStorageClass {
+    Plain,
+    SealedOverlay,
+    SealedFull,
+}
+
+impl TargetStorageClass {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "plain" => Some(Self::Plain),
+            "sealed-overlay" => Some(Self::SealedOverlay),
+            "sealed-full" => Some(Self::SealedFull),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::SealedOverlay => "sealed-overlay",
+            Self::SealedFull => "sealed-full",
+        }
+    }
+
+    fn is_plain(self) -> bool {
+        matches!(self, Self::Plain)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetAccessClass {
+    AnonymousLocal,
+    TokenScoped,
+}
+
+impl TargetAccessClass {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "anonymous-local" => Some(Self::AnonymousLocal),
+            "token-scoped" => Some(Self::TokenScoped),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AnonymousLocal => "anonymous-local",
+            Self::TokenScoped => "token-scoped",
+        }
+    }
+
+    fn allows_anonymous_local(self) -> bool {
+        matches!(self, Self::AnonymousLocal)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct McpTargetDescriptor {
     target_id: String,
@@ -831,6 +899,9 @@ struct McpTargetDescriptor {
     aliases: Vec<String>,
     notes: Option<String>,
     connection_summary: String,
+    storage_class: TargetStorageClass,
+    access_class: TargetAccessClass,
+    sealed_profile_ref: Option<String>,
 }
 
 impl McpTargetDescriptor {
@@ -851,6 +922,10 @@ impl McpTargetDescriptor {
             refs.push(alias.as_str());
         }
         refs
+    }
+
+    fn allows_anonymous_execution(self: &Self) -> bool {
+        self.storage_class.is_plain() && self.access_class.allows_anonymous_local()
     }
 }
 
@@ -1070,6 +1145,17 @@ impl StandaloneCoreRuntime {
 
     fn capability_health_snapshot_json(&self) -> Value {
         let platform_snapshot = self.host_platform_adapter.snapshot();
+        let vault_diag = self.vault_router.active_backend_diagnostics().ok();
+        let vault_status = vault_diag
+            .as_ref()
+            .map(|diag| vault_readiness_to_capability_status(&diag.status))
+            .unwrap_or(platform_snapshot.native_vault_status);
+        let vault_message = vault_diag
+            .as_ref()
+            .map(|diag| diag.message.clone())
+            .unwrap_or_else(|| {
+                "vault readiness diagnostics unavailable; host capability snapshot is used".into()
+            });
         let unresolved_toolchains = self
             .toolchain_diagnostics
             .iter()
@@ -1089,7 +1175,7 @@ impl StandaloneCoreRuntime {
         };
         let statuses = [
             toolchain_status,
-            platform_snapshot.native_vault_status,
+            vault_status,
             platform_snapshot.runtime_logger_status,
             platform_snapshot.output_decoder_status,
         ];
@@ -1103,10 +1189,10 @@ impl StandaloneCoreRuntime {
                 "unresolved_targets": unresolved_toolchains,
             },
             "vault": {
-                "status": platform_snapshot.native_vault_status.as_str(),
+                "status": vault_status.as_str(),
                 "configured_backend": self.settings_store.settings.vault.backend.clone(),
                 "binding_backend": self.host_platform_adapter.native_vault_binding().backend_label(),
-                "degraded_reason": "os-native backend currently runs as an explicit degraded-memory shim until platform-native bindings land",
+                "readiness_message": vault_message,
             },
             "logger": {
                 "status": platform_snapshot.runtime_logger_status.as_str(),
@@ -1265,9 +1351,175 @@ impl StandaloneCoreRuntime {
     }
 
     fn resolve_target_profile_by_ref(&self, target_ref: &str) -> Option<TargetProfile> {
+        let target_id = self.resolve_target_id_by_ref(target_ref)?;
+        self.profiles.get(&target_id).cloned()
+    }
+
+    fn resolve_target_id_by_ref(&self, target_ref: &str) -> Option<String> {
+        let normalized = normalize_target_ref(target_ref);
+        self.target_refs.get(&normalized).cloned()
+    }
+
+    fn resolve_target_descriptor_by_ref(&self, target_ref: &str) -> Option<&McpTargetDescriptor> {
         let normalized = normalize_target_ref(target_ref);
         let target_id = self.target_refs.get(&normalized)?;
-        self.profiles.get(target_id).cloned()
+        self.target_descriptors.get(target_id)
+    }
+
+    fn catalog_projected_profiles(&mut self) -> Vec<TargetProfile> {
+        let mut target_ids = self.profiles.keys().cloned().collect::<Vec<_>>();
+        target_ids.sort();
+        target_ids
+            .into_iter()
+            .filter_map(|target_id| self.project_catalog_profile_by_id(&target_id).ok())
+            .collect()
+    }
+
+    fn project_catalog_profile_by_id(
+        &mut self,
+        target_id: &str,
+    ) -> Result<TargetProfile, CoreRuntimeError> {
+        let profile = self
+            .profiles
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_id}")))?;
+        let descriptor = self
+            .target_descriptors
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| CoreRuntimeError::Config(format!("target descriptor not found: {target_id}")))?;
+        if descriptor.storage_class.is_plain() {
+            let mut projected = profile;
+            apply_target_catalog_projection_metadata(&mut projected, "plain", None);
+            return Ok(projected);
+        }
+
+        if !matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+            return Ok(redacted_sealed_catalog_profile(
+                &profile,
+                "sealed-redacted-locked",
+                Some("sealed target descriptor is redacted while vault is locked"),
+            ));
+        }
+
+        match self.load_verified_sealed_overlay(&descriptor) {
+            Ok(overlay) => {
+                let mut projected = profile;
+                apply_sealed_overlay_to_target_profile(&mut projected, &overlay)
+                    .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?;
+                apply_target_catalog_projection_metadata(&mut projected, "sealed-resolved", None);
+                Ok(projected)
+            }
+            Err(CoreRuntimeError::Config(message)) => Ok(redacted_sealed_catalog_profile(
+                &profile,
+                "sealed-redacted-tamper",
+                Some(&message),
+            )),
+            Err(other) => Err(other),
+        }
+    }
+
+    fn resolve_target_profile_for_execution_by_ref(
+        &mut self,
+        target_ref: &str,
+    ) -> Result<TargetProfile, CoreRuntimeError> {
+        let target_id = self
+            .resolve_target_id_by_ref(target_ref)
+            .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
+        let mut target = self
+            .profiles
+            .get(&target_id)
+            .cloned()
+            .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
+        let descriptor = self
+            .target_descriptors
+            .get(&target_id)
+            .cloned()
+            .ok_or_else(|| {
+                CoreRuntimeError::Config(format!("target descriptor not found: {target_id}"))
+            })?;
+        if descriptor.storage_class.is_plain() {
+            return Ok(target);
+        }
+        if !matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+            return Err(CoreRuntimeError::Config(format!(
+                "sealed target `{}` requires unlocked vault before execution",
+                descriptor.target_id
+            )));
+        }
+        let overlay = self.load_verified_sealed_overlay(&descriptor)?;
+        apply_sealed_overlay_to_target_profile(&mut target, &overlay)
+            .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?;
+        Ok(target)
+    }
+
+    fn load_verified_sealed_overlay(
+        &mut self,
+        descriptor: &McpTargetDescriptor,
+    ) -> Result<Value, CoreRuntimeError> {
+        let sealed_profile_ref = descriptor
+            .sealed_profile_ref
+            .as_deref()
+            .ok_or_else(|| {
+                CoreRuntimeError::Config(format!(
+                    "sealed target `{}` is missing sealed_profile_ref",
+                    descriptor.target_id
+                ))
+            })?;
+        let lease = self
+            .vault_router
+            .use_for_signing(
+                sealed_profile_ref,
+                format!("target-overlay:{}", descriptor.target_id),
+            )
+            .map_err(vault_error_to_runtime)?;
+        let overlay_bytes = lease.with_secret_bytes(|bytes| bytes.to_vec());
+        let overlay: Value = serde_json::from_slice(&overlay_bytes).map_err(|err| {
+            CoreRuntimeError::Config(format!(
+                "sealed target `{}` overlay payload is not valid json: {err}",
+                descriptor.target_id
+            ))
+        })?;
+        let actual_digest = overlay
+            .get("public_descriptor_digest")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .ok_or_else(|| {
+                CoreRuntimeError::Config(format!(
+                    "sealed target `{}` overlay missing public_descriptor_digest",
+                    descriptor.target_id
+                ))
+            })?;
+        let expected_digest = public_descriptor_digest_for_target_descriptor(descriptor);
+        if actual_digest != expected_digest {
+            return Err(CoreRuntimeError::Config(format!(
+                "sealed target `{}` descriptor tamper detected (expected digest {}, got {})",
+                descriptor.target_id, expected_digest, actual_digest
+            )));
+        }
+        Ok(overlay)
+    }
+
+    fn anonymous_loopback_compat_enabled(&self) -> bool {
+        if !self
+            .settings_store
+            .settings
+            .model_plane
+            .http
+            .auth
+            .allow_loopback_anonymous_compat
+        {
+            return false;
+        }
+        self.settings_store
+            .settings
+            .model_plane
+            .http
+            .host
+            .parse::<IpAddr>()
+            .map(|host| host.is_loopback())
+            .unwrap_or(false)
     }
 
     fn resolve_target_for_mcp(&self, target_ref: &str) -> TargetResolutionResult {
@@ -1474,9 +1726,11 @@ impl StandaloneCoreRuntime {
         })
     }
 
-    fn target_candidate_summary_json(&self, candidate: &TargetResolutionCandidate) -> Value {
-        let descriptor = self.target_descriptors.get(&candidate.target_id);
-        let profile = self.profiles.get(&candidate.target_id);
+    fn target_candidate_summary_json(&mut self, candidate: &TargetResolutionCandidate) -> Value {
+        let descriptor = self.target_descriptors.get(&candidate.target_id).cloned();
+        let fallback_profile = self.profiles.get(&candidate.target_id).cloned();
+        let projected_profile = self.project_catalog_profile_by_id(&candidate.target_id).ok();
+        let profile = projected_profile.as_ref().or(fallback_profile.as_ref());
         let toolchain_summary = profile
             .and_then(|target| self.toolchain_diagnostic_for_target(target))
             .map(|diagnostic| {
@@ -1524,20 +1778,48 @@ impl StandaloneCoreRuntime {
         json!({
             "canonical_target_id": candidate.target_id,
             "display_name": descriptor
+                .as_ref()
                 .map(|item| item.display_name.clone())
                 .unwrap_or_else(|| candidate.target_id.clone()),
             "kind": descriptor
+                .as_ref()
                 .map(|item| target_kind_label(&item.kind))
                 .or_else(|| profile.map(|item| target_kind_label(&item.kind)))
                 .unwrap_or_else(|| "unknown".to_string()),
-            "enabled": descriptor.map(|item| item.enabled).unwrap_or(true),
+            "enabled": descriptor.as_ref().map(|item| item.enabled).unwrap_or(true),
             "aliases": descriptor
+                .as_ref()
                 .map(|item| item.aliases.clone())
                 .unwrap_or_default(),
-            "notes": descriptor.and_then(|item| item.notes.clone()),
+            "notes": profile
+                .and_then(|item| item.notes.clone())
+                .or_else(|| descriptor.as_ref().and_then(|item| item.notes.clone())),
+            "storage_class": descriptor
+                .as_ref()
+                .map(|item| item.storage_class.as_str())
+                .unwrap_or("plain"),
+            "access_class": descriptor
+                .as_ref()
+                .map(|item| item.access_class.as_str())
+                .unwrap_or("anonymous-local"),
+            "sealed_profile_ref": descriptor
+                .as_ref()
+                .and_then(|item| item.sealed_profile_ref.clone()),
+            "catalog_projection_state": profile
+                .and_then(|item| {
+                    item.metadata
+                        .get(TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
+                        .cloned()
+                }),
+            "sealed_descriptor_diagnostic": profile.and_then(|item| {
+                item.metadata
+                    .get(TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY)
+                    .cloned()
+            }),
             "match_reasons": candidate.reasons,
-            "connection_summary": descriptor
-                .map(|item| item.connection_summary.clone())
+            "connection_summary": profile
+                .map(target_connection_summary_from_profile)
+                .or_else(|| descriptor.as_ref().map(|item| item.connection_summary.clone()))
                 .unwrap_or_else(|| "unknown".to_string()),
             "diagnostic_summary": toolchain_summary,
             "session_summary": {
@@ -1549,7 +1831,7 @@ impl StandaloneCoreRuntime {
     }
 
     fn confirmation_payload_json(
-        &self,
+        &mut self,
         confirmation: &TargetResolutionConfirmation,
         tool_name: &str,
     ) -> Value {
@@ -1586,9 +1868,7 @@ impl StandaloneCoreRuntime {
         command: &str,
         artifact_id: Option<String>,
     ) -> Result<TargetCommandExecution, CoreRuntimeError> {
-        let target = self
-            .resolve_target_profile_by_ref(target_ref)
-            .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
+        let target = self.resolve_target_profile_for_execution_by_ref(target_ref)?;
         self.execute_target_command_on_profile(
             target_ref.to_string(),
             target,
@@ -1762,9 +2042,7 @@ impl StandaloneCoreRuntime {
         target_ref: &str,
         context: ToolRequestContext,
     ) -> Result<InteractiveShellHandle, CoreRuntimeError> {
-        let target = self
-            .resolve_target_profile_by_ref(target_ref)
-            .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
+        let target = self.resolve_target_profile_for_execution_by_ref(target_ref)?;
         self.open_interactive_shell_with_profile(target_ref.to_string(), target, context)
     }
 
@@ -2376,6 +2654,12 @@ impl StandaloneCoreRuntime {
     pub fn settings_view(&self) -> CoreSettingsView {
         let artifact_usage = self.tool_handler.artifact_service.usage();
         let platform_snapshot = self.host_platform_adapter.snapshot();
+        let vault_status = self
+            .vault_router
+            .active_backend_diagnostics()
+            .ok()
+            .map(|diag| vault_readiness_to_capability_status(&diag.status))
+            .unwrap_or(platform_snapshot.native_vault_status);
         let runtime_paths = self.host_platform_adapter.runtime_paths().runtime_paths(
             &self.settings_store.settings.core.instance_name,
             Path::new(&self.settings_store.settings.core.data_dir),
@@ -2449,7 +2733,7 @@ impl StandaloneCoreRuntime {
                 used_bytes: logs_used_bytes,
             },
             vault: VaultStatusView {
-                status: platform_snapshot.native_vault_status.as_str().to_string(),
+                status: vault_status.as_str().to_string(),
                 configured_backend: self.settings_store.settings.vault.backend.clone(),
                 binding_backend: self
                     .host_platform_adapter
@@ -2695,11 +2979,12 @@ impl StandaloneCoreRuntime {
     ) -> String {
         let settings = self.settings_view();
 
-        let mut targets = self.profiles.values().cloned().collect::<Vec<_>>();
-        targets.sort_by(|a, b| a.id.cmp(&b.id));
-        let targets_json = targets
-            .into_iter()
+        let mut projected_profiles = self.catalog_projected_profiles();
+        projected_profiles.sort_by(|a, b| a.id.cmp(&b.id));
+        let targets_json = projected_profiles
+            .iter()
             .map(|target| {
+                let descriptor = self.target_descriptors.get(&target.id);
                 let session = self
                     .sessions
                     .values()
@@ -2713,15 +2998,29 @@ impl StandaloneCoreRuntime {
                     "name": target.name,
                     "kind": target_kind_label(&target.kind),
                     "notes": target.notes,
+                    "storage_class": descriptor
+                        .map(|item| item.storage_class.as_str())
+                        .unwrap_or("plain"),
+                    "access_class": descriptor
+                        .map(|item| item.access_class.as_str())
+                        .unwrap_or("anonymous-local"),
+                    "sealed_profile_ref": descriptor
+                        .and_then(|item| item.sealed_profile_ref.clone()),
+                    "catalog_projection_state": target
+                        .metadata
+                        .get(TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
+                        .cloned(),
+                    "sealed_descriptor_diagnostic": target
+                        .metadata
+                        .get(TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY)
+                        .cloned(),
                     "session_id": session.as_ref().map(|s| s.id.clone()),
                     "session_state": session.as_ref().map(|s| session_state_label(&s.state)),
                     "capability_ids": capabilities,
                 })
             })
             .collect::<Vec<_>>();
-        let mut profiles = self.profiles.values().cloned().collect::<Vec<_>>();
-        profiles.sort_by(|a, b| a.id.cmp(&b.id));
-        let profiles_json = profiles
+        let profiles_json = projected_profiles
             .iter()
             .map(target_profile_json_value)
             .collect::<Vec<_>>();
@@ -3124,7 +3423,7 @@ impl StandaloneCoreRuntime {
                 }
             }
             AppCommand::ListTargets => {
-                let mut items = self.profiles.values().cloned().collect::<Vec<_>>();
+                let mut items = self.catalog_projected_profiles();
                 items.sort_by(|a, b| a.id.cmp(&b.id));
                 ApiResponse::Targets {
                     request_id: request.request_id,
@@ -3132,7 +3431,7 @@ impl StandaloneCoreRuntime {
                 }
             }
             AppCommand::ListProfiles => {
-                let mut items = self.profiles.values().cloned().collect::<Vec<_>>();
+                let mut items = self.catalog_projected_profiles();
                 items.sort_by(|a, b| a.id.cmp(&b.id));
                 ApiResponse::Profiles {
                     request_id: request.request_id,
@@ -3140,19 +3439,33 @@ impl StandaloneCoreRuntime {
                 }
             }
             AppCommand::GetProfile { target_id } => {
-                let profile = match self.profiles.get(&target_id) {
-                    Some(profile) => profile,
-                    None => {
+                if !self.profiles.contains_key(&target_id) {
+                    return error_response(
+                        request.request_id,
+                        ApiErrorCode::NotFound,
+                        "target profile not found",
+                    );
+                }
+                let profile = match self.project_catalog_profile_by_id(&target_id) {
+                    Ok(profile) => profile,
+                    Err(CoreRuntimeError::Config(message)) => {
                         return error_response(
                             request.request_id,
-                            ApiErrorCode::NotFound,
-                            "target profile not found",
+                            ApiErrorCode::ValidationFailed,
+                            &message,
+                        )
+                    }
+                    Err(err) => {
+                        return error_response(
+                            request.request_id,
+                            ApiErrorCode::Internal,
+                            &format!("{err:?}"),
                         )
                     }
                 };
                 ApiResponse::Profile {
                     request_id: request.request_id,
-                    payload_json: target_profile_payload_json(profile),
+                    payload_json: target_profile_payload_json(&profile),
                 }
             }
             AppCommand::UpsertProfile { profile } => {
@@ -3316,6 +3629,104 @@ impl StandaloneCoreRuntime {
                     Ok(_) => ApiResponse::Accepted {
                         request_id: request.request_id,
                         apply_strategy: Some("live_applied".to_string()),
+                    },
+                    Err(err) => token_vault_error_response(request.request_id, err),
+                }
+            }
+            AppCommand::CreateLocalAdminIntent {
+                action_kind,
+                target_object_ref,
+                requested_payload_digest,
+                ttl_seconds,
+            } => {
+                let actor = control_plane_request_actor(&request.context);
+                let action_kind = match LocalAdminActionKind::parse(&action_kind) {
+                    Some(value) => value,
+                    None => {
+                        return error_response(
+                            request.request_id,
+                            ApiErrorCode::ValidationFailed,
+                            "unsupported local_admin action_kind",
+                        )
+                    }
+                };
+                let ttl = Duration::from_secs(ttl_seconds.unwrap_or(300).max(1));
+                let created = if let Some(payload_digest) = requested_payload_digest.as_deref() {
+                    self.vault_router.create_local_admin_intent_with_digest(
+                        action_kind,
+                        &target_object_ref,
+                        payload_digest,
+                        &actor,
+                        ttl,
+                    )
+                } else {
+                    self.vault_router.create_local_admin_intent(
+                        action_kind,
+                        &target_object_ref,
+                        &actor,
+                        ttl,
+                    )
+                };
+                match created {
+                    Ok(intent) => ApiResponse::LocalAdminIntentCreated {
+                        request_id: request.request_id,
+                        intent: app_local_admin_intent(intent),
+                    },
+                    Err(err) => token_vault_error_response(request.request_id, err),
+                }
+            }
+            AppCommand::CompleteLocalAdminAttestation {
+                intent_id,
+                verification_method,
+                ttl_seconds,
+            } => {
+                let actor = control_plane_request_actor(&request.context);
+                let ttl = Duration::from_secs(ttl_seconds.unwrap_or(120).max(1));
+                match self.vault_router.complete_local_admin_attestation(
+                    &intent_id,
+                    &actor,
+                    &verification_method,
+                    ttl,
+                ) {
+                    Ok(attestation) => ApiResponse::LocalAdminAttestationCompleted {
+                        request_id: request.request_id,
+                        attestation: app_local_admin_attestation(attestation),
+                    },
+                    Err(err) => token_vault_error_response(request.request_id, err),
+                }
+            }
+            AppCommand::GetVaultState => match app_vault_state_projection(self) {
+                Ok(state) => ApiResponse::VaultState {
+                    request_id: request.request_id,
+                    state,
+                },
+                Err(err) => token_vault_error_response(request.request_id, err),
+            },
+            AppCommand::UnlockVault {
+                method,
+                passphrase,
+                attestation_id,
+            } => {
+                let actor = control_plane_request_actor(&request.context);
+                match self.vault_router.unlock_vault_with_attestation(UnlockVaultRequest {
+                    method,
+                    passphrase,
+                    requested_by: actor,
+                    attestation_id,
+                }) {
+                    Ok(()) => ApiResponse::VaultUnlocked {
+                        request_id: request.request_id,
+                        lock_state: self.vault_router.vault_lock_state().as_str().to_string(),
+                    },
+                    Err(err) => token_vault_error_response(request.request_id, err),
+                }
+            }
+            AppCommand::LockVault { reason } => {
+                let lock_reason = reason.unwrap_or_else(|| "manual lock".to_string());
+                match self.vault_router.lock_vault(&lock_reason) {
+                    Ok(()) => ApiResponse::VaultLocked {
+                        request_id: request.request_id,
+                        lock_state: self.vault_router.vault_lock_state().as_str().to_string(),
                     },
                     Err(err) => token_vault_error_response(request.request_id, err),
                 }
@@ -3550,6 +3961,81 @@ fn app_agent_token_summary(summary: AgentTokenSummary) -> AgentTokenSummaryView 
     }
 }
 
+fn app_local_admin_intent(intent: LocalAdminActionIntent) -> LocalAdminActionIntentView {
+    LocalAdminActionIntentView {
+        intent_id: intent.intent_id,
+        action_kind: intent.action_kind.as_str().to_string(),
+        target_object_ref: intent.target_object_ref,
+        requested_by_principal: intent.requested_by_principal,
+        requested_payload_digest: intent.requested_payload_digest,
+        created_at: intent.created_at,
+        expires_at: intent.expires_at,
+        status: format!("{:?}", intent.status).to_ascii_lowercase(),
+    }
+}
+
+fn app_local_admin_attestation(
+    attestation: LocalAdminAttestationRecord,
+) -> LocalAdminAttestationView {
+    LocalAdminAttestationView {
+        attestation_id: attestation.attestation_id,
+        intent_id: attestation.intent_id,
+        verified_principal: attestation.verified_principal,
+        verification_method: attestation.verification_method,
+        issued_at: attestation.issued_at,
+        expires_at: attestation.expires_at,
+        consumed_at: attestation.consumed_at,
+        status: format!("{:?}", attestation.status).to_ascii_lowercase(),
+    }
+}
+
+fn unlock_trigger_policy_label(policy: &VaultUnlockTriggerPolicy) -> &'static str {
+    match policy {
+        VaultUnlockTriggerPolicy::OnCoreStart => "on-core-start",
+        VaultUnlockTriggerPolicy::OnFirstSecretAccess => "on-first-secret-access",
+        VaultUnlockTriggerPolicy::OnEverySecretAccess => "on-every-secret-access",
+        VaultUnlockTriggerPolicy::ManualOnly => "manual-only",
+    }
+}
+
+fn app_vault_state_projection(
+    runtime: &StandaloneCoreRuntime,
+) -> Result<VaultStateProjectionView, VaultError> {
+    let protector = runtime.vault_router.protector_assembly()?;
+    let unlock_policy = runtime.vault_router.unlock_policy().clone();
+    let secrets = runtime
+        .vault_router
+        .list_secret_summaries()
+        .into_iter()
+        .map(|item| VaultSecretSummaryView {
+            reference: item.reference,
+            kind: item.kind,
+            label: item.label,
+            status: item.status.as_str().to_string(),
+            active_version_id: item.active_version_id,
+        })
+        .collect::<Vec<_>>();
+    Ok(VaultStateProjectionView {
+        lock_state: runtime.vault_router.vault_lock_state().as_str().to_string(),
+        configured_backend: runtime.settings_store.settings.vault.backend.clone(),
+        active_backend: runtime.vault_router.active_backend().to_string(),
+        protector_summary: VaultProtectorSummaryView {
+            primary: protector.primary,
+            recovery: protector.recovery,
+            retired: protector.retired,
+            fail_closed: protector.fail_closed,
+        },
+        unlock_policy_summary: VaultUnlockPolicySummaryView {
+            trigger_policy: unlock_trigger_policy_label(&unlock_policy.trigger_policy).to_string(),
+            allowed_methods: unlock_policy.allowed_methods,
+            preferred_method: unlock_policy.preferred_method,
+            cache_ttl_sec: unlock_policy.cache_ttl_sec,
+            require_fresh_user_verification: unlock_policy.require_fresh_user_verification,
+        },
+        secrets,
+    })
+}
+
 fn token_vault_error_response(request_id: String, err: VaultError) -> ApiResponse {
     match err {
         VaultError::AgentTokenNotFound(message) => {
@@ -3558,6 +4044,23 @@ fn token_vault_error_response(request_id: String, err: VaultError) -> ApiRespons
         VaultError::AgentTokenRejected(message) => {
             error_response(request_id, ApiErrorCode::ValidationFailed, &message)
         }
+        VaultError::PassphraseRejected => {
+            error_response(request_id, ApiErrorCode::ValidationFailed, "passphrase rejected")
+        }
+        VaultError::LocalAdminVerificationRequired(message)
+        | VaultError::LocalAdminIntentMismatch(message)
+        | VaultError::LocalAdminIntentExpired(message)
+        | VaultError::LocalAdminAttestationMismatch(message)
+        | VaultError::LocalAdminAttestationExpired(message)
+        | VaultError::UnlockMethodNotAllowed(message)
+        | VaultError::UnlockFailed(message) => {
+            error_response(request_id, ApiErrorCode::ValidationFailed, &message)
+        }
+        VaultError::PassphraseNotConfigured => error_response(
+            request_id,
+            ApiErrorCode::DependencyUnavailable,
+            "passphrase protector is not configured",
+        ),
         VaultError::FailClosed(message) | VaultError::BackendNotRegistered(message) => {
             error_response(request_id, ApiErrorCode::DependencyUnavailable, &message)
         }
@@ -3751,7 +4254,341 @@ fn target_connection_summary(configured: &StandaloneTargetProfile) -> String {
     }
 }
 
+fn target_connection_summary_from_profile(profile: &TargetProfile) -> String {
+    match &profile.connection {
+        ConnectionConfig::Ssh {
+            host,
+            port,
+            username,
+        } => format!("ssh://{username}@{host}:{port}"),
+        ConnectionConfig::Adb { serial, transport } => {
+            let serial = serial.as_deref().unwrap_or("<auto>");
+            let transport = transport.as_deref().unwrap_or("serial");
+            format!("adb({transport}={serial})")
+        }
+        ConnectionConfig::Serial { device, baud_rate } => format!("serial({device}@{baud_rate})"),
+        ConnectionConfig::Docker { container, context } => format!(
+            "docker({container}, context={})",
+            context.as_deref().unwrap_or("default")
+        ),
+        ConnectionConfig::Custom { description } => format!("custom({description})"),
+    }
+}
+
+fn apply_target_catalog_projection_metadata(
+    profile: &mut TargetProfile,
+    projection_state: &str,
+    diagnostic: Option<&str>,
+) {
+    profile.metadata.insert(
+        TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY.to_string(),
+        projection_state.to_string(),
+    );
+    match diagnostic.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            profile.metadata.insert(
+                TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY.to_string(),
+                value.to_string(),
+            );
+        }
+        None => {
+            profile
+                .metadata
+                .remove(TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY);
+        }
+    }
+}
+
+fn redacted_sealed_catalog_profile(
+    profile: &TargetProfile,
+    projection_state: &str,
+    diagnostic: Option<&str>,
+) -> TargetProfile {
+    let mut redacted = profile.clone();
+    redacted.notes = None;
+    redacted.credential_ref = None;
+    redacted.connection = match &profile.connection {
+        ConnectionConfig::Ssh { .. } => ConnectionConfig::Ssh {
+            host: "<sealed-redacted>".to_string(),
+            port: 0,
+            username: "<sealed-redacted>".to_string(),
+        },
+        ConnectionConfig::Adb { .. } => ConnectionConfig::Adb {
+            serial: None,
+            transport: None,
+        },
+        ConnectionConfig::Serial { .. } => ConnectionConfig::Serial {
+            device: "<sealed-redacted>".to_string(),
+            baud_rate: 0,
+        },
+        ConnectionConfig::Docker { .. } => ConnectionConfig::Docker {
+            container: "<sealed-redacted>".to_string(),
+            context: None,
+        },
+        ConnectionConfig::Custom { .. } => ConnectionConfig::Custom {
+            description: "sealed target descriptor redacted".to_string(),
+        },
+    };
+    apply_target_catalog_projection_metadata(&mut redacted, projection_state, diagnostic);
+    redacted
+}
+
+fn apply_sealed_overlay_to_target_profile(
+    profile: &mut TargetProfile,
+    overlay: &Value,
+) -> Result<(), CoreRuntimeError> {
+    let map = overlay.as_object().ok_or_else(|| {
+        CoreRuntimeError::Config("sealed overlay payload must be a JSON object".into())
+    })?;
+
+    if let Some(notes_value) = map.get("notes") {
+        profile.notes = match notes_value {
+            Value::Null => None,
+            Value::String(value) => Some(value.clone()),
+            _ => {
+                return Err(CoreRuntimeError::Config(
+                    "sealed overlay field `notes` must be string or null".into(),
+                ));
+            }
+        };
+    }
+
+    if let Some(credential_value) = map.get("credential_ref") {
+        profile.credential_ref = match credential_value {
+            Value::Null => None,
+            Value::String(raw_ref) => {
+                let normalized = normalize_credential_ref(raw_ref).map_err(vault_error_to_runtime)?;
+                Some(CredentialRef {
+                    id: normalized,
+                    provider: "vault".to_string(),
+                })
+            }
+            Value::Object(obj) => {
+                let id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay credential_ref object requires non-empty `id`".into(),
+                        )
+                    })?;
+                let provider = obj
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("vault")
+                    .to_string();
+                let normalized = normalize_credential_ref(id).map_err(vault_error_to_runtime)?;
+                Some(CredentialRef {
+                    id: normalized,
+                    provider,
+                })
+            }
+            _ => {
+                return Err(CoreRuntimeError::Config(
+                    "sealed overlay field `credential_ref` must be string, object, or null".into(),
+                ));
+            }
+        };
+    }
+
+    if let Some(connection_value) = map.get("connection") {
+        let connection = connection_value.as_object().ok_or_else(|| {
+            CoreRuntimeError::Config("sealed overlay field `connection` must be a JSON object".into())
+        })?;
+        match &mut profile.connection {
+            ConnectionConfig::Ssh {
+                host,
+                port,
+                username,
+            } => {
+                if let Some(value) = connection.get("host") {
+                    let host_value = value.as_str().ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay ssh connection.host must be string".into(),
+                        )
+                    })?;
+                    *host = host_value.to_string();
+                }
+                if let Some(value) = connection.get("port") {
+                    let port_value = value.as_u64().ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay ssh connection.port must be unsigned integer".into(),
+                        )
+                    })?;
+                    if port_value > u16::MAX as u64 {
+                        return Err(CoreRuntimeError::Config(
+                            "sealed overlay ssh connection.port exceeds u16 range".into(),
+                        ));
+                    }
+                    *port = port_value as u16;
+                }
+                if let Some(value) = connection.get("username") {
+                    let username_value = value.as_str().ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay ssh connection.username must be string".into(),
+                        )
+                    })?;
+                    *username = username_value.to_string();
+                }
+            }
+            ConnectionConfig::Adb { serial, transport } => {
+                if let Some(value) = connection.get("serial") {
+                    *serial = match value {
+                        Value::Null => None,
+                        Value::String(raw) => Some(raw.clone()),
+                        _ => {
+                            return Err(CoreRuntimeError::Config(
+                                "sealed overlay adb connection.serial must be string or null"
+                                    .into(),
+                            ));
+                        }
+                    };
+                }
+                if let Some(value) = connection.get("transport") {
+                    *transport = match value {
+                        Value::Null => None,
+                        Value::String(raw) => Some(raw.clone()),
+                        _ => {
+                            return Err(CoreRuntimeError::Config(
+                                "sealed overlay adb connection.transport must be string or null"
+                                    .into(),
+                            ));
+                        }
+                    };
+                }
+            }
+            ConnectionConfig::Serial { device, baud_rate } => {
+                if let Some(value) = connection.get("device") {
+                    let device_value = value.as_str().ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay serial connection.device must be string".into(),
+                        )
+                    })?;
+                    *device = device_value.to_string();
+                }
+                if let Some(value) = connection.get("baud_rate") {
+                    let baud_rate_value = value.as_u64().ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay serial connection.baud_rate must be unsigned integer"
+                                .into(),
+                        )
+                    })?;
+                    if baud_rate_value > u32::MAX as u64 {
+                        return Err(CoreRuntimeError::Config(
+                            "sealed overlay serial connection.baud_rate exceeds u32 range".into(),
+                        ));
+                    }
+                    *baud_rate = baud_rate_value as u32;
+                }
+            }
+            ConnectionConfig::Docker { container, context } => {
+                if let Some(value) = connection.get("container") {
+                    let container_value = value.as_str().ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay docker connection.container must be string".into(),
+                        )
+                    })?;
+                    *container = container_value.to_string();
+                }
+                if let Some(value) = connection.get("context") {
+                    *context = match value {
+                        Value::Null => None,
+                        Value::String(raw) => Some(raw.clone()),
+                        _ => {
+                            return Err(CoreRuntimeError::Config(
+                                "sealed overlay docker connection.context must be string or null"
+                                    .into(),
+                            ));
+                        }
+                    };
+                }
+            }
+            ConnectionConfig::Custom { description } => {
+                if let Some(value) = connection.get("description") {
+                    let description_value = value.as_str().ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay custom connection.description must be string".into(),
+                        )
+                    })?;
+                    *description = description_value.to_string();
+                }
+            }
+        }
+    }
+
+    if let Some(toolchains_value) = map.get("toolchains") {
+        let toolchains = toolchains_value.as_object().ok_or_else(|| {
+            CoreRuntimeError::Config("sealed overlay field `toolchains` must be a JSON object".into())
+        })?;
+        for (command, value) in toolchains {
+            match value {
+                Value::Null => {
+                    profile.toolchains.remove(command);
+                }
+                Value::String(path_override) => {
+                    if path_override.trim().is_empty() {
+                        profile.toolchains.remove(command);
+                    } else {
+                        profile
+                            .toolchains
+                            .insert(command.clone(), path_override.clone());
+                    }
+                }
+                _ => {
+                    return Err(CoreRuntimeError::Config(
+                        "sealed overlay toolchains values must be string or null".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn public_descriptor_digest_for_target_descriptor(descriptor: &McpTargetDescriptor) -> String {
+    let payload = json!({
+        "target_id": descriptor.target_id,
+        "enabled": descriptor.enabled,
+        "display_name": descriptor.display_name,
+        "kind": target_kind_label(&descriptor.kind),
+        "aliases": descriptor.aliases,
+        "notes": descriptor.notes,
+        "connection_summary": descriptor.connection_summary,
+        "storage_class": descriptor.storage_class.as_str(),
+        "access_class": descriptor.access_class.as_str(),
+        "sealed_profile_ref": descriptor.sealed_profile_ref,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(payload.to_string().as_bytes());
+    hex_encode_lower(&hasher.finalize())
+}
+
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for value in bytes {
+        out.push(HEX[(value >> 4) as usize] as char);
+        out.push(HEX[(value & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn parse_target_storage_class_or_default(raw: &str) -> TargetStorageClass {
+    TargetStorageClass::parse(raw).unwrap_or(TargetStorageClass::Plain)
+}
+
+fn parse_target_access_class_or_default(raw: &str) -> TargetAccessClass {
+    TargetAccessClass::parse(raw).unwrap_or(TargetAccessClass::AnonymousLocal)
+}
+
 fn mcp_target_descriptor_from_config(configured: &StandaloneTargetProfile) -> McpTargetDescriptor {
+    let storage_class = parse_target_storage_class_or_default(&configured.storage_class);
+    let access_class = parse_target_access_class_or_default(&configured.access_class);
     McpTargetDescriptor {
         target_id: configured.id.clone(),
         enabled: configured.enabled,
@@ -3760,6 +4597,13 @@ fn mcp_target_descriptor_from_config(configured: &StandaloneTargetProfile) -> Mc
         aliases: configured.aliases.clone(),
         notes: configured.notes.clone(),
         connection_summary: target_connection_summary(configured),
+        storage_class,
+        access_class,
+        sealed_profile_ref: configured
+            .sealed_profile_ref
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     }
 }
 
@@ -3836,6 +4680,15 @@ fn terminal_connector_for_target(
 
 fn toolchain_cache_key(target_id: &str, command: &str) -> String {
     format!("{target_id}:{command}")
+}
+
+fn vault_readiness_to_capability_status(status: &VaultReadinessState) -> CapabilityStatus {
+    match status {
+        VaultReadinessState::Ready => CapabilityStatus::Ready,
+        VaultReadinessState::Degraded => CapabilityStatus::Degraded,
+        VaultReadinessState::Fallback => CapabilityStatus::Fallback,
+        VaultReadinessState::Unsupported => CapabilityStatus::Unsupported,
+    }
 }
 
 fn aggregate_health_state(statuses: &[CapabilityStatus]) -> &'static str {
@@ -4169,6 +5022,27 @@ fn to_target_profile(
             policy.to_string(),
         );
     }
+    let storage_class = parse_target_storage_class_or_default(&configured.storage_class);
+    metadata.insert(
+        TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+        storage_class.as_str().to_string(),
+    );
+    let access_class = parse_target_access_class_or_default(&configured.access_class);
+    metadata.insert(
+        TARGET_ACCESS_CLASS_METADATA_KEY.to_string(),
+        access_class.as_str().to_string(),
+    );
+    if let Some(sealed_profile_ref) = configured
+        .sealed_profile_ref
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        metadata.insert(
+            TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(),
+            sealed_profile_ref.to_string(),
+        );
+    }
     let toolchains = configured
         .toolchains
         .iter()
@@ -4321,6 +5195,25 @@ fn to_standalone_target_profile(
             .get("alias")
             .map(|alias| vec![alias.clone()])
             .unwrap_or_default(),
+        storage_class: profile
+            .metadata
+            .get(TARGET_STORAGE_CLASS_METADATA_KEY)
+            .and_then(|value| TargetStorageClass::parse(value))
+            .unwrap_or(TargetStorageClass::Plain)
+            .as_str()
+            .to_string(),
+        access_class: profile
+            .metadata
+            .get(TARGET_ACCESS_CLASS_METADATA_KEY)
+            .and_then(|value| TargetAccessClass::parse(value))
+            .unwrap_or(TargetAccessClass::AnonymousLocal)
+            .as_str()
+            .to_string(),
+        sealed_profile_ref: profile
+            .metadata
+            .get(TARGET_SEALED_PROFILE_REF_METADATA_KEY)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         credential_ref: profile
             .credential_ref
             .as_ref()
@@ -4411,6 +5304,30 @@ fn target_profile_json_value(profile: &TargetProfile) -> Value {
         "name": profile.name,
         "kind": target_kind_label(&profile.kind),
         "alias": alias,
+        "storage_class": profile
+            .metadata
+            .get(TARGET_STORAGE_CLASS_METADATA_KEY)
+            .and_then(|value| TargetStorageClass::parse(value))
+            .unwrap_or(TargetStorageClass::Plain)
+            .as_str(),
+        "access_class": profile
+            .metadata
+            .get(TARGET_ACCESS_CLASS_METADATA_KEY)
+            .and_then(|value| TargetAccessClass::parse(value))
+            .unwrap_or(TargetAccessClass::AnonymousLocal)
+            .as_str(),
+        "sealed_profile_ref": profile
+            .metadata
+            .get(TARGET_SEALED_PROFILE_REF_METADATA_KEY)
+            .map(|value| value.to_string()),
+        "catalog_projection_state": profile
+            .metadata
+            .get(TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
+            .cloned(),
+        "sealed_descriptor_diagnostic": profile
+            .metadata
+            .get(TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY)
+            .cloned(),
         "notes": profile.notes,
         "credential_ref": profile.credential_ref.as_ref().map(|value| value.id.clone()),
         "toolchains": profile.toolchains.iter().map(|(command, path_override)| {
@@ -4730,6 +5647,26 @@ fn handle_http_connection(
                         }
                     } else {
                         auth_error = Some("invalid_or_expired_token");
+                    }
+                } else if let Some(descriptor) = runtime
+                    .resolve_target_descriptor_by_ref(target_ref)
+                    .cloned()
+                {
+                    if !runtime.anonymous_loopback_compat_enabled() {
+                        auth_error = Some("anonymous_compat_disabled");
+                    } else if !remote_addr
+                        .map(|value| value.ip().is_loopback())
+                        .unwrap_or(false)
+                    {
+                        auth_error = Some("anonymous_compat_non_loopback_rejected");
+                    } else if !descriptor.allows_anonymous_execution() {
+                        auth_error = Some("anonymous_compat_denied_for_target");
+                    } else {
+                        context.principal_id = Some("anonymous-local".to_string());
+                        context.timeline_source = Some(timeline_source_for_anonymous_loopback(
+                            remote_addr,
+                            user_agent_summary.clone(),
+                        ));
                     }
                 }
 
@@ -5468,19 +6405,10 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
             match runtime.resolve_target_for_mcp(target) {
                 TargetResolutionResult::Resolved(resolved) => {
                     let profile = runtime
-                        .profiles
-                        .get(&resolved.resolved_target_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            jsonrpc_error(
-                                Value::Null,
-                                -32603,
-                                &format!(
-                                    "resolved target profile missing: {}",
-                                    resolved.resolved_target_id
-                                ),
-                            )
-                        })?;
+                        .resolve_target_profile_for_execution_by_ref(
+                            resolved.resolved_target_id.as_str(),
+                        )
+                        .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
                     let outcome = runtime
                         .execute_target_command_on_profile(
                             resolved.requested_target_ref,
@@ -5731,19 +6659,10 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
             match runtime.resolve_target_for_mcp(target) {
                 TargetResolutionResult::Resolved(resolved) => {
                     let profile = runtime
-                        .profiles
-                        .get(&resolved.resolved_target_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            jsonrpc_error(
-                                Value::Null,
-                                -32603,
-                                &format!(
-                                    "resolved target profile missing: {}",
-                                    resolved.resolved_target_id
-                                ),
-                            )
-                        })?;
+                        .resolve_target_profile_for_execution_by_ref(
+                            resolved.resolved_target_id.as_str(),
+                        )
+                        .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
                     let handle = runtime
                         .open_interactive_shell_with_profile(
                             resolved.requested_target_ref,
@@ -5949,19 +6868,10 @@ fn handle_mcp_tools_call(runtime: &SharedRuntime, params: &Value) -> Result<Valu
             match runtime.resolve_target_for_mcp(target) {
                 TargetResolutionResult::Resolved(resolved) => {
                     let profile = runtime
-                        .profiles
-                        .get(&resolved.resolved_target_id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            jsonrpc_error(
-                                Value::Null,
-                                -32603,
-                                &format!(
-                                    "resolved target profile missing: {}",
-                                    resolved.resolved_target_id
-                                ),
-                            )
-                        })?;
+                        .resolve_target_profile_for_execution_by_ref(
+                            resolved.resolved_target_id.as_str(),
+                        )
+                        .map_err(|err| jsonrpc_error(Value::Null, -32603, &format!("{err:?}")))?;
                     let result = runtime
                         .inspect_target_basic_with_profile(
                             resolved.requested_target_ref,
@@ -6320,6 +7230,18 @@ fn timeline_source_from_http_fingerprint(
     }
 }
 
+fn timeline_source_for_anonymous_loopback(
+    remote_addr: Option<SocketAddr>,
+    user_agent_summary: Option<String>,
+) -> TimelineSourceGroupSummaryView {
+    let mut source = timeline_source_from_http_fingerprint(remote_addr, user_agent_summary);
+    source.group_key = format!("anonymous-loopback:{}", source.group_key);
+    source.group_kind = "anonymous_loopback".to_string();
+    source.group_label = "Anonymous Loopback".to_string();
+    source.principal_summary = "anonymous-local".to_string();
+    source
+}
+
 fn stable_fingerprint_id(seed: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in seed.as_bytes() {
@@ -6438,13 +7360,20 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use bridgingio_app_api::{
         AgentTokenScopeView, ApiRequest, ApiRequestContext, ApiResponse, AppCommand,
     };
     use bridgingio_connectors::{BuiltInBinarySpec, BuiltInDistributionKind, ExecutableResolver};
     use bridgingio_domain::{ConnectionConfig, PolicyProfile, TargetKind, TargetProfile};
+    use bridgingio_secrets::{
+        local_admin_create_token_target, local_admin_payload_digest_for_create_agent_token,
+        local_admin_payload_digest_for_unlock_vault,
+        local_admin_payload_digest_for_update_agent_token_scope, local_admin_unlock_vault_target,
+        CreateAgentTokenRequest, TokenScopeInput, UpdateAgentTokenScopeRequest, VaultUnlockPolicy,
+        VaultUnlockTriggerPolicy,
+    };
 
     use super::{
         CapabilityDiscovery, ControlPlaneIpcClient, ControlPlaneIpcServer, CoreRuntimeError,
@@ -6487,6 +7416,150 @@ mod tests {
         }
     }
 
+    fn create_token_attestation_id(
+        runtime: &mut StandaloneCoreRuntime,
+        label: &str,
+        expires_in_seconds: Option<u64>,
+        scope: AgentTokenScopeView,
+    ) -> String {
+        let request = CreateAgentTokenRequest {
+            label: label.to_string(),
+            created_by: "control-plane:ui-agent:ui-run:ui-client".into(),
+            expires_in: expires_in_seconds.map(Duration::from_secs),
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: scope.scope_profile.clone(),
+                target_ids: scope.target_ids.clone(),
+                tool_ids: scope.tool_ids.clone(),
+                max_risk_envelope: scope.max_risk_envelope.clone(),
+                allow_open_shell: scope.allow_open_shell,
+                allow_write_shell_input: scope.allow_write_shell_input,
+                allow_artifact_cross_principal: scope.allow_artifact_cross_principal,
+                allow_delegation: scope.allow_delegation,
+                allow_admin_actions: scope.allow_admin_actions,
+            },
+            attestation_id: None,
+        };
+        let payload_digest = local_admin_payload_digest_for_create_agent_token(&request);
+        let intent_response = runtime.handle_app_request(ApiRequest {
+            request_id: "intent-create-token".into(),
+            context: request_context(),
+            command: AppCommand::CreateLocalAdminIntent {
+                action_kind: "create-agent-token".into(),
+                target_object_ref: local_admin_create_token_target().into(),
+                requested_payload_digest: Some(payload_digest),
+                ttl_seconds: Some(300),
+            },
+        });
+        let intent_id = match intent_response {
+            ApiResponse::LocalAdminIntentCreated { intent, .. } => intent.intent_id,
+            other => panic!("expected local admin intent response, got {other:?}"),
+        };
+        let attestation_response = runtime.handle_app_request(ApiRequest {
+            request_id: "intent-complete-token".into(),
+            context: request_context(),
+            command: AppCommand::CompleteLocalAdminAttestation {
+                intent_id,
+                verification_method: "passkey".into(),
+                ttl_seconds: Some(120),
+            },
+        });
+        match attestation_response {
+            ApiResponse::LocalAdminAttestationCompleted { attestation, .. } => {
+                attestation.attestation_id
+            }
+            other => panic!("expected local admin attestation response, got {other:?}"),
+        }
+    }
+
+    fn unlock_attestation_id(runtime: &mut StandaloneCoreRuntime, method: &str) -> String {
+        let payload_digest = local_admin_payload_digest_for_unlock_vault(method);
+        let intent_response = runtime.handle_app_request(ApiRequest {
+            request_id: "intent-create-unlock".into(),
+            context: request_context(),
+            command: AppCommand::CreateLocalAdminIntent {
+                action_kind: "unlock-vault".into(),
+                target_object_ref: local_admin_unlock_vault_target().into(),
+                requested_payload_digest: Some(payload_digest),
+                ttl_seconds: Some(300),
+            },
+        });
+        let intent_id = match intent_response {
+            ApiResponse::LocalAdminIntentCreated { intent, .. } => intent.intent_id,
+            other => panic!("expected local admin intent response, got {other:?}"),
+        };
+        let attestation_response = runtime.handle_app_request(ApiRequest {
+            request_id: "intent-complete-unlock".into(),
+            context: request_context(),
+            command: AppCommand::CompleteLocalAdminAttestation {
+                intent_id,
+                verification_method: "passkey".into(),
+                ttl_seconds: Some(120),
+            },
+        });
+        match attestation_response {
+            ApiResponse::LocalAdminAttestationCompleted { attestation, .. } => {
+                attestation.attestation_id
+            }
+            other => panic!("expected local admin attestation response, got {other:?}"),
+        }
+    }
+
+    fn scope_update_attestation_id(
+        runtime: &mut StandaloneCoreRuntime,
+        token_id: &str,
+        scope: AgentTokenScopeView,
+        reason: Option<String>,
+    ) -> String {
+        let request = UpdateAgentTokenScopeRequest {
+            token_id: token_id.to_string(),
+            changed_by: "control-plane:ui-agent:ui-run:ui-client".into(),
+            scope: TokenScopeInput {
+                scope_profile: scope.scope_profile.clone(),
+                target_ids: scope.target_ids.clone(),
+                tool_ids: scope.tool_ids.clone(),
+                max_risk_envelope: scope.max_risk_envelope.clone(),
+                allow_open_shell: scope.allow_open_shell,
+                allow_write_shell_input: scope.allow_write_shell_input,
+                allow_artifact_cross_principal: scope.allow_artifact_cross_principal,
+                allow_delegation: scope.allow_delegation,
+                allow_admin_actions: scope.allow_admin_actions,
+            },
+            reason: reason.clone(),
+            attestation_id: None,
+        };
+        let payload_digest = local_admin_payload_digest_for_update_agent_token_scope(&request);
+        let intent_response = runtime.handle_app_request(ApiRequest {
+            request_id: "intent-create-scope".into(),
+            context: request_context(),
+            command: AppCommand::CreateLocalAdminIntent {
+                action_kind: "update-agent-token-scope".into(),
+                target_object_ref: token_id.into(),
+                requested_payload_digest: Some(payload_digest),
+                ttl_seconds: Some(300),
+            },
+        });
+        let intent_id = match intent_response {
+            ApiResponse::LocalAdminIntentCreated { intent, .. } => intent.intent_id,
+            other => panic!("expected local admin intent response, got {other:?}"),
+        };
+        let attestation_response = runtime.handle_app_request(ApiRequest {
+            request_id: "intent-complete-scope".into(),
+            context: request_context(),
+            command: AppCommand::CompleteLocalAdminAttestation {
+                intent_id,
+                verification_method: "passkey".into(),
+                ttl_seconds: Some(120),
+            },
+        });
+        match attestation_response {
+            ApiResponse::LocalAdminAttestationCompleted { attestation, .. } => {
+                attestation.attestation_id
+            }
+            other => panic!("expected local admin attestation response, got {other:?}"),
+        }
+    }
+
     fn settings_with_extra_targets(
         policy: &str,
         extra_targets: &str,
@@ -6498,6 +7571,72 @@ mod tests {
         let merged = format!("{base}\n{extra_targets}");
         bridgingio_engine::CoreSettings::from_toml_str(&merged)
             .expect("parse settings with extra targets")
+    }
+
+    fn sealed_overlay_runtime(prefix: &str) -> StandaloneCoreRuntime {
+        let root = temp_dir(prefix);
+        let settings = settings_with_extra_targets(
+            "confirm_if_family",
+            r#"
+[[targets]]
+id = "sealed-shell"
+display_name = "Sealed Shell"
+kind = "localshell"
+enabled = true
+aliases = ["sealed-shell"]
+storage_class = "sealed-overlay"
+access_class = "token-scoped"
+sealed_profile_ref = "vault://bridgingio/targets/sealed-shell"
+
+[targets.connection]
+
+[targets.providers.terminal]
+enabled = true
+"#,
+        );
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime")
+    }
+
+    fn install_sealed_overlay(
+        runtime: &mut StandaloneCoreRuntime,
+        target_ref: &str,
+        digest_override: Option<&str>,
+        notes: Option<&str>,
+    ) {
+        let descriptor = runtime
+            .resolve_target_descriptor_by_ref(target_ref)
+            .cloned()
+            .expect("sealed target descriptor");
+        let digest = digest_override
+            .map(ToString::to_string)
+            .unwrap_or_else(|| super::public_descriptor_digest_for_target_descriptor(&descriptor));
+        let overlay_ref = descriptor
+            .sealed_profile_ref
+            .clone()
+            .expect("sealed profile ref");
+
+        runtime
+            .vault_router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch vault backend");
+        let overlay_payload = serde_json::json!({
+            "public_descriptor_digest": digest,
+            "notes": notes,
+            "credential_ref": "vault:ssh-key:sealed_overlay",
+            "connection": {
+                "description": "sealed-overlay-connection"
+            }
+        })
+        .to_string();
+        runtime
+            .vault_router
+            .put(&overlay_ref, &overlay_payload, "sealed overlay")
+            .expect("store sealed overlay");
     }
 
     #[test]
@@ -6981,6 +8120,34 @@ enabled = true
     }
 
     #[test]
+    fn capability_health_uses_runtime_vault_readiness_projection() {
+        let root = temp_dir("capability-health-vault-readiness");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let vault_diag = runtime
+            .vault_router
+            .active_backend_diagnostics()
+            .expect("vault diagnostics");
+        let expected_status =
+            super::vault_readiness_to_capability_status(&vault_diag.status).as_str();
+
+        let health = runtime.capability_health_snapshot_json();
+        assert_eq!(health["vault"]["status"].as_str(), Some(expected_status));
+        assert!(health["vault"]["readiness_message"]
+            .as_str()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false));
+    }
+
+    #[test]
     fn control_plane_get_settings_includes_vault_status_projection() {
         let root = temp_dir("control-plane-settings-vault-status");
         let settings = bridgingio_engine::CoreSettings::from_toml_str(
@@ -7010,6 +8177,75 @@ enabled = true
                 );
             }
             other => panic!("expected settings response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_plane_vault_state_unlock_and_lock_contract() {
+        let root = temp_dir("control-plane-vault-state-unlock-lock");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        runtime
+            .vault_router
+            .put("vault:ssh-key:contract", "CONTRACT-KEY", "contract key")
+            .expect("put test secret");
+
+        let state = runtime.handle_app_request(ApiRequest {
+            request_id: "vault-state".into(),
+            context: request_context(),
+            command: AppCommand::GetVaultState,
+        });
+        match state {
+            ApiResponse::VaultState { state, .. } => {
+                assert!(!state.lock_state.is_empty());
+                assert!(!state.protector_summary.primary.is_empty());
+                assert!(!state.unlock_policy_summary.trigger_policy.is_empty());
+                assert!(state
+                    .secrets
+                    .iter()
+                    .any(|item| item.reference == "vault://bridgingio/ssh-private-key/contract"));
+            }
+            other => panic!("expected vault state response, got {other:?}"),
+        }
+
+        let locked = runtime.handle_app_request(ApiRequest {
+            request_id: "vault-lock".into(),
+            context: request_context(),
+            command: AppCommand::LockVault {
+                reason: Some("contract-test".into()),
+            },
+        });
+        match locked {
+            ApiResponse::VaultLocked { lock_state, .. } => {
+                assert_eq!(lock_state, "locked");
+            }
+            other => panic!("expected vault locked response, got {other:?}"),
+        }
+
+        let attestation_id = unlock_attestation_id(&mut runtime, "os-native");
+        let unlocked = runtime.handle_app_request(ApiRequest {
+            request_id: "vault-unlock".into(),
+            context: request_context(),
+            command: AppCommand::UnlockVault {
+                method: "os-native".into(),
+                passphrase: None,
+                attestation_id,
+            },
+        });
+        match unlocked {
+            ApiResponse::VaultUnlocked { lock_state, .. } => {
+                assert_eq!(lock_state, "unlocked");
+            }
+            other => panic!("expected vault unlocked response, got {other:?}"),
         }
     }
 
@@ -7136,24 +8372,31 @@ enabled = true
         let mut runtime =
             StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
 
+        let create_scope = AgentTokenScopeView {
+            scope_profile: Some("strict-default".into()),
+            target_ids: vec!["LOCAL-SSH".into(), "local-ssh".into()],
+            tool_ids: Vec::new(),
+            max_risk_envelope: Some("deny-all".into()),
+            allow_open_shell: Some(false),
+            allow_write_shell_input: Some(false),
+            allow_artifact_cross_principal: Some(false),
+            allow_delegation: Some(false),
+            allow_admin_actions: Some(false),
+        };
+        let attestation_id = create_token_attestation_id(
+            &mut runtime,
+            "nightly-runner",
+            Some(1800),
+            create_scope.clone(),
+        );
         let create_response = runtime.handle_app_request(ApiRequest {
             request_id: "token-create".into(),
             context: request_context(),
             command: AppCommand::CreateAgentToken {
                 label: "nightly-runner".into(),
                 expires_in_seconds: Some(1800),
-                scope: AgentTokenScopeView {
-                    scope_profile: Some("strict-default".into()),
-                    target_ids: vec!["LOCAL-SSH".into(), "local-ssh".into()],
-                    tool_ids: Vec::new(),
-                    max_risk_envelope: Some("deny-all".into()),
-                    allow_open_shell: Some(false),
-                    allow_write_shell_input: Some(false),
-                    allow_artifact_cross_principal: Some(false),
-                    allow_delegation: Some(false),
-                    allow_admin_actions: Some(false),
-                },
-                attestation_id: None,
+                scope: create_scope,
+                attestation_id: Some(attestation_id),
             },
         });
         let (token_id, plaintext_token) = match create_response {
@@ -7226,24 +8469,27 @@ enabled = true
         let mut runtime =
             StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
 
+        let create_scope = AgentTokenScopeView {
+            scope_profile: Some("strict-default".into()),
+            target_ids: vec!["target-a".into()],
+            tool_ids: Vec::new(),
+            max_risk_envelope: None,
+            allow_open_shell: None,
+            allow_write_shell_input: None,
+            allow_artifact_cross_principal: None,
+            allow_delegation: None,
+            allow_admin_actions: None,
+        };
+        let create_attestation_id =
+            create_token_attestation_id(&mut runtime, "scope-token", None, create_scope.clone());
         let created = runtime.handle_app_request(ApiRequest {
             request_id: "token-create".into(),
             context: request_context(),
             command: AppCommand::CreateAgentToken {
                 label: "scope-token".into(),
                 expires_in_seconds: None,
-                scope: AgentTokenScopeView {
-                    scope_profile: Some("strict-default".into()),
-                    target_ids: vec!["target-a".into()],
-                    tool_ids: Vec::new(),
-                    max_risk_envelope: None,
-                    allow_open_shell: None,
-                    allow_write_shell_input: None,
-                    allow_artifact_cross_principal: None,
-                    allow_delegation: None,
-                    allow_admin_actions: None,
-                },
-                attestation_id: None,
+                scope: create_scope,
+                attestation_id: Some(create_attestation_id),
             },
         });
         let token_id = match created {
@@ -7251,24 +8497,31 @@ enabled = true
             other => panic!("unexpected token create response: {other:?}"),
         };
 
+        let update_scope = AgentTokenScopeView {
+            scope_profile: Some("strict-default".into()),
+            target_ids: vec!["target-a".into(), "target-b".into()],
+            tool_ids: vec!["terminal.exec".into()],
+            max_risk_envelope: Some("deny-all".into()),
+            allow_open_shell: Some(false),
+            allow_write_shell_input: Some(false),
+            allow_artifact_cross_principal: Some(false),
+            allow_delegation: Some(false),
+            allow_admin_actions: Some(false),
+        };
+        let update_attestation_id = scope_update_attestation_id(
+            &mut runtime,
+            &token_id,
+            update_scope.clone(),
+            Some("expand target scope".into()),
+        );
         let update = runtime.handle_app_request(ApiRequest {
             request_id: "token-scope-update".into(),
             context: request_context(),
             command: AppCommand::UpdateAgentTokenScope {
                 token_id,
-                scope: AgentTokenScopeView {
-                    scope_profile: Some("strict-default".into()),
-                    target_ids: vec!["target-a".into(), "target-b".into()],
-                    tool_ids: vec!["terminal.exec".into()],
-                    max_risk_envelope: Some("deny-all".into()),
-                    allow_open_shell: Some(false),
-                    allow_write_shell_input: Some(false),
-                    allow_artifact_cross_principal: Some(false),
-                    allow_delegation: Some(false),
-                    allow_admin_actions: Some(false),
-                },
+                scope: update_scope,
                 reason: Some("expand target scope".into()),
-                attestation_id: Some("attest-001".into()),
+                attestation_id: Some(update_attestation_id),
             },
         });
         match update {
@@ -7311,6 +8564,376 @@ enabled = true
     }
 
     #[test]
+    fn model_plane_terminal_exec_allows_loopback_anonymous_for_plain_target_when_enabled() {
+        let root = temp_dir("model-plane-anon-plain-allow");
+        let settings = settings_with_extra_targets(
+            "confirm_if_family",
+            r#"
+[[targets]]
+id = "local-shell"
+display_name = "Local Shell"
+kind = "localshell"
+enabled = true
+aliases = ["local-shell"]
+storage_class = "plain"
+access_class = "anonymous-local"
+
+[targets.connection]
+
+[targets.providers.terminal]
+enabled = true
+"#,
+        );
+        let mut settings = settings;
+        settings.model_plane.http.port = 0;
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime =
+            StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let shared = runtime.shared();
+        let server = ModelPlaneHttpServer::bind(shared, &settings).expect("bind model-plane");
+        let addr = server.local_addr().expect("local addr");
+        let serve_thread = thread::spawn(move || server.serve_once().expect("serve once"));
+
+        let body = "agent_id=agent-mcp|run_id=run-mcp|client_session_id=client-mcp|reuse_policy=reuse_if_alive|target_id=local-shell|command=echo anonymous-ok";
+        let request = format!(
+            "POST /tool/terminal.exec HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).expect("connect model-plane");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        serve_thread.join().expect("join serve thread");
+
+        assert!(response.starts_with("HTTP/1.1 200"), "response={response}");
+        assert!(response.contains("result=execution"));
+    }
+
+    #[test]
+    fn model_plane_terminal_exec_rejects_missing_token_when_anonymous_compat_disabled() {
+        let root = temp_dir("model-plane-anon-disabled");
+        let settings = settings_with_extra_targets(
+            "confirm_if_family",
+            r#"
+[[targets]]
+id = "local-shell"
+display_name = "Local Shell"
+kind = "localshell"
+enabled = true
+aliases = ["local-shell"]
+storage_class = "plain"
+access_class = "anonymous-local"
+
+[targets.connection]
+
+[targets.providers.terminal]
+enabled = true
+"#,
+        );
+        let mut settings = settings;
+        settings.model_plane.http.port = 0;
+        settings
+            .model_plane
+            .http
+            .auth
+            .allow_loopback_anonymous_compat = false;
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime =
+            StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let shared = runtime.shared();
+        let server = ModelPlaneHttpServer::bind(shared, &settings).expect("bind model-plane");
+        let addr = server.local_addr().expect("local addr");
+        let serve_thread = thread::spawn(move || server.serve_once().expect("serve once"));
+
+        let body = "agent_id=agent-mcp|run_id=run-mcp|client_session_id=client-mcp|reuse_policy=reuse_if_alive|target_id=local-shell|command=echo anonymous-ok";
+        let request = format!(
+            "POST /tool/terminal.exec HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).expect("connect model-plane");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        serve_thread.join().expect("join serve thread");
+
+        assert!(response.starts_with("HTTP/1.1 403"), "response={response}");
+        assert!(response.contains("anonymous_compat_disabled"));
+    }
+
+    #[test]
+    fn model_plane_terminal_exec_rejects_missing_token_for_sealed_target() {
+        let root = temp_dir("model-plane-anon-sealed-deny");
+        let settings = settings_with_extra_targets(
+            "confirm_if_family",
+            r#"
+[[targets]]
+id = "sealed-shell"
+display_name = "Sealed Shell"
+kind = "localshell"
+enabled = true
+aliases = ["sealed-shell"]
+storage_class = "sealed-overlay"
+access_class = "token-scoped"
+sealed_profile_ref = "vault://bridgingio/targets/sealed-shell"
+
+[targets.connection]
+
+[targets.providers.terminal]
+enabled = true
+"#,
+        );
+        let mut settings = settings;
+        settings.model_plane.http.port = 0;
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime =
+            StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let shared = runtime.shared();
+        let server = ModelPlaneHttpServer::bind(shared, &settings).expect("bind model-plane");
+        let addr = server.local_addr().expect("local addr");
+        let serve_thread = thread::spawn(move || server.serve_once().expect("serve once"));
+
+        let body = "agent_id=agent-mcp|run_id=run-mcp|client_session_id=client-mcp|reuse_policy=reuse_if_alive|target_id=sealed-shell|command=echo should-not-run";
+        let request = format!(
+            "POST /tool/terminal.exec HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).expect("connect model-plane");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        serve_thread.join().expect("join serve thread");
+
+        assert!(response.starts_with("HTTP/1.1 403"), "response={response}");
+        assert!(response.contains("anonymous_compat_denied_for_target"));
+    }
+
+    #[test]
+    fn model_plane_terminal_exec_invalid_token_does_not_fallback_to_anonymous() {
+        let root = temp_dir("model-plane-invalid-token-no-fallback");
+        let settings = settings_with_extra_targets(
+            "confirm_if_family",
+            r#"
+[[targets]]
+id = "local-shell"
+display_name = "Local Shell"
+kind = "localshell"
+enabled = true
+aliases = ["local-shell"]
+storage_class = "plain"
+access_class = "anonymous-local"
+
+[targets.connection]
+
+[targets.providers.terminal]
+enabled = true
+"#,
+        );
+        let mut settings = settings;
+        settings.model_plane.http.port = 0;
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let runtime =
+            StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let shared = runtime.shared();
+        let server = ModelPlaneHttpServer::bind(shared, &settings).expect("bind model-plane");
+        let addr = server.local_addr().expect("local addr");
+        let serve_thread = thread::spawn(move || server.serve_once().expect("serve once"));
+
+        let body = "agent_id=agent-mcp|run_id=run-mcp|client_session_id=client-mcp|reuse_policy=reuse_if_alive|target_id=local-shell|command=echo no-fallback";
+        let request = format!(
+            "POST /tool/terminal.exec HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer invalid-token\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).expect("connect model-plane");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        serve_thread.join().expect("join serve thread");
+
+        assert!(response.starts_with("HTTP/1.1 403"), "response={response}");
+        assert!(response.contains("invalid_or_expired_token"));
+        assert!(!response.contains("anonymous_compat"));
+    }
+
+    #[test]
+    fn list_profiles_redacts_sealed_target_while_vault_locked() {
+        let mut runtime = sealed_overlay_runtime("sealed-catalog-redacted-locked");
+        install_sealed_overlay(
+            &mut runtime,
+            "sealed-shell",
+            None,
+            Some("sealed notes should not be visible while locked"),
+        );
+        runtime
+            .vault_router
+            .set_unlock_policy(VaultUnlockPolicy {
+                trigger_policy: VaultUnlockTriggerPolicy::ManualOnly,
+                allowed_methods: vec!["os-native".into(), "passphrase".into()],
+                preferred_method: "os-native".into(),
+                cache_ttl_sec: 600,
+                require_fresh_user_verification: true,
+            })
+            .expect("manual unlock policy");
+        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "list-profiles-locked".into(),
+            context: request_context(),
+            command: AppCommand::ListProfiles,
+        });
+        let items = match response {
+            ApiResponse::Profiles { items, .. } => items,
+            other => panic!("unexpected list profiles response: {other:?}"),
+        };
+        let sealed = items
+            .into_iter()
+            .find(|item| item.id == "sealed-shell")
+            .expect("sealed profile");
+
+        assert_eq!(
+            sealed
+                .metadata
+                .get(super::TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
+                .map(String::as_str),
+            Some("sealed-redacted-locked")
+        );
+        assert!(sealed.notes.is_none());
+        assert!(sealed.credential_ref.is_none());
+        assert_eq!(
+            sealed
+                .metadata
+                .get(super::TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY)
+                .map(String::as_str),
+            Some("sealed target descriptor is redacted while vault is locked")
+        );
+    }
+
+    #[test]
+    fn list_profiles_resolves_sealed_target_after_unlock_with_valid_digest() {
+        let mut runtime = sealed_overlay_runtime("sealed-catalog-resolved-unlocked");
+        install_sealed_overlay(
+            &mut runtime,
+            "sealed-shell",
+            None,
+            Some("sealed notes resolved"),
+        );
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "list-profiles-unlocked".into(),
+            context: request_context(),
+            command: AppCommand::ListProfiles,
+        });
+        let items = match response {
+            ApiResponse::Profiles { items, .. } => items,
+            other => panic!("unexpected list profiles response: {other:?}"),
+        };
+        let sealed = items
+            .into_iter()
+            .find(|item| item.id == "sealed-shell")
+            .expect("sealed profile");
+
+        assert_eq!(
+            sealed
+                .metadata
+                .get(super::TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
+                .map(String::as_str),
+            Some("sealed-resolved")
+        );
+        assert_eq!(sealed.notes.as_deref(), Some("sealed notes resolved"));
+        assert_eq!(
+            sealed.credential_ref.as_ref().map(|item| item.id.as_str()),
+            Some("vault://bridgingio/ssh-private-key/sealed-overlay")
+        );
+        assert!(sealed
+            .metadata
+            .get(super::TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY)
+            .is_none());
+    }
+
+    #[test]
+    fn list_profiles_reports_descriptor_tamper_diagnostic_for_sealed_overlay() {
+        let mut runtime = sealed_overlay_runtime("sealed-catalog-tamper");
+        install_sealed_overlay(
+            &mut runtime,
+            "sealed-shell",
+            Some("deadbeef"),
+            Some("sealed notes should not be visible after tamper"),
+        );
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "list-profiles-tamper".into(),
+            context: request_context(),
+            command: AppCommand::ListProfiles,
+        });
+        let items = match response {
+            ApiResponse::Profiles { items, .. } => items,
+            other => panic!("unexpected list profiles response: {other:?}"),
+        };
+        let sealed = items
+            .into_iter()
+            .find(|item| item.id == "sealed-shell")
+            .expect("sealed profile");
+
+        assert_eq!(
+            sealed
+                .metadata
+                .get(super::TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
+                .map(String::as_str),
+            Some("sealed-redacted-tamper")
+        );
+        assert!(sealed.notes.is_none());
+        assert!(sealed.credential_ref.is_none());
+        assert!(sealed
+            .metadata
+            .get(super::TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .contains("descriptor tamper detected"));
+    }
+
+    #[test]
+    fn execution_resolve_rejects_sealed_target_when_vault_locked() {
+        let mut runtime = sealed_overlay_runtime("sealed-execution-locked-reject");
+        install_sealed_overlay(&mut runtime, "sealed-shell", None, Some("sealed notes"));
+        runtime
+            .vault_router
+            .set_unlock_policy(VaultUnlockPolicy {
+                trigger_policy: VaultUnlockTriggerPolicy::ManualOnly,
+                allowed_methods: vec!["os-native".into(), "passphrase".into()],
+                preferred_method: "os-native".into(),
+                cache_ttl_sec: 600,
+                require_fresh_user_verification: true,
+            })
+            .expect("manual unlock policy");
+        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+
+        let err = runtime
+            .resolve_target_profile_for_execution_by_ref("sealed-shell")
+            .expect_err("locked sealed target should be rejected");
+        match err {
+            CoreRuntimeError::Config(message) => {
+                assert!(message.contains("requires unlocked vault before execution"));
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn model_plane_terminal_exec_rejects_bearer_token_outside_target_scope() {
         let root = temp_dir("model-plane-bearer-scope-deny");
         let settings = bridgingio_engine::CoreSettings::from_toml_str(
@@ -7324,24 +8947,27 @@ enabled = true
         );
         let mut runtime =
             StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let scope = AgentTokenScopeView {
+            scope_profile: Some("strict-default".into()),
+            target_ids: vec!["another-target".into()],
+            tool_ids: Vec::new(),
+            max_risk_envelope: Some("deny-all".into()),
+            allow_open_shell: Some(false),
+            allow_write_shell_input: Some(false),
+            allow_artifact_cross_principal: Some(false),
+            allow_delegation: Some(false),
+            allow_admin_actions: Some(false),
+        };
+        let attestation_id =
+            create_token_attestation_id(&mut runtime, "limited-token", None, scope.clone());
         let created = runtime.handle_app_request(ApiRequest {
             request_id: "token-create".into(),
             context: request_context(),
             command: AppCommand::CreateAgentToken {
                 label: "limited-token".into(),
                 expires_in_seconds: None,
-                scope: AgentTokenScopeView {
-                    scope_profile: Some("strict-default".into()),
-                    target_ids: vec!["another-target".into()],
-                    tool_ids: Vec::new(),
-                    max_risk_envelope: Some("deny-all".into()),
-                    allow_open_shell: Some(false),
-                    allow_write_shell_input: Some(false),
-                    allow_artifact_cross_principal: Some(false),
-                    allow_delegation: Some(false),
-                    allow_admin_actions: Some(false),
-                },
-                attestation_id: None,
+                scope,
+                attestation_id: Some(attestation_id),
             },
         });
         let token = match created {
@@ -7383,24 +9009,27 @@ enabled = true
         );
         let mut runtime =
             StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let scope = AgentTokenScopeView {
+            scope_profile: Some("strict-default".into()),
+            target_ids: vec!["local-ssh".into()],
+            tool_ids: Vec::new(),
+            max_risk_envelope: Some("allow-low".into()),
+            allow_open_shell: Some(true),
+            allow_write_shell_input: Some(true),
+            allow_artifact_cross_principal: Some(false),
+            allow_delegation: Some(false),
+            allow_admin_actions: Some(false),
+        };
+        let attestation_id =
+            create_token_attestation_id(&mut runtime, "limited-token-tool", None, scope.clone());
         let created = runtime.handle_app_request(ApiRequest {
             request_id: "token-create".into(),
             context: request_context(),
             command: AppCommand::CreateAgentToken {
                 label: "limited-token-tool".into(),
                 expires_in_seconds: None,
-                scope: AgentTokenScopeView {
-                    scope_profile: Some("strict-default".into()),
-                    target_ids: vec!["local-ssh".into()],
-                    tool_ids: Vec::new(),
-                    max_risk_envelope: Some("allow-low".into()),
-                    allow_open_shell: Some(true),
-                    allow_write_shell_input: Some(true),
-                    allow_artifact_cross_principal: Some(false),
-                    allow_delegation: Some(false),
-                    allow_admin_actions: Some(false),
-                },
-                attestation_id: None,
+                scope,
+                attestation_id: Some(attestation_id),
             },
         });
         let token = match created {
@@ -7562,6 +9191,113 @@ enabled = true
     }
 
     #[test]
+    fn secret_backed_ssh_delivery_rejects_when_vault_not_unlocked() {
+        let root = temp_dir("secret-backed-ssh-locked-gate");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        runtime
+            .vault_router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch vault backend");
+        runtime
+            .vault_router
+            .put("vault:ssh-key:ops", "OPS-KEY", "ops key")
+            .expect("store key");
+
+        let mut target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        target.metadata.insert(
+            "ssh.delivery_mode".to_string(),
+            "ssh-agent-broker".to_string(),
+        );
+        target.credential_ref = Some(bridgingio_domain::CredentialRef {
+            id: "vault:ssh-key:ops".into(),
+            provider: "vault".into(),
+        });
+
+        runtime
+            .vault_router
+            .set_unlock_policy(VaultUnlockPolicy {
+                trigger_policy: VaultUnlockTriggerPolicy::ManualOnly,
+                allowed_methods: vec!["os-native".into(), "passphrase".into()],
+                preferred_method: "os-native".into(),
+                cache_ttl_sec: 600,
+                require_fresh_user_verification: true,
+            })
+            .expect("manual policy");
+        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+
+        let mut locked_invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        let locked_err = runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-ssh-locked",
+                    "run-ssh-locked",
+                    "client-ssh-locked",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut locked_invocation,
+                Some("channel-ssh-locked"),
+            )
+            .expect_err("locked vault must block secret-backed ssh delivery");
+        match locked_err {
+            CoreRuntimeError::Config(message) => {
+                assert!(message.contains("VaultLocked"));
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
+
+        runtime
+            .vault_router
+            .set_unlock_policy(VaultUnlockPolicy {
+                trigger_policy: VaultUnlockTriggerPolicy::OnCoreStart,
+                allowed_methods: vec!["passphrase".into()],
+                preferred_method: "passphrase".into(),
+                cache_ttl_sec: 600,
+                require_fresh_user_verification: true,
+            })
+            .expect("on-core-start policy");
+
+        let mut unavailable_invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        let unavailable_err = runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-ssh-unavailable",
+                    "run-ssh-unavailable",
+                    "client-ssh-unavailable",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut unavailable_invocation,
+                Some("channel-ssh-unavailable"),
+            )
+            .expect_err("unavailable vault must block secret-backed ssh delivery");
+        match unavailable_err {
+            CoreRuntimeError::Config(message) => {
+                assert!(message.contains("VaultUnavailable"));
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn invocation_json_separates_host_runtime_and_target_terminal_dimensions() {
         let root = temp_dir("invocation-dimension-separation");
         let settings = bridgingio_engine::CoreSettings::from_toml_str(
@@ -7694,9 +9430,20 @@ exec /bin/sh -s
                 ),
             )
             .expect("open interactive shell");
-        assert_eq!(handle.launch_strategy, "structured_interactive_invocation");
-        assert!(!handle.launch_fallback_applied);
-        assert!(handle.launch_diagnostics.is_empty());
+        assert!(matches!(
+            handle.launch_strategy.as_str(),
+            "structured_interactive_invocation"
+                | "structured_interactive_invocation_with_host_baseline_fallback"
+        ));
+        if handle.launch_fallback_applied {
+            assert_eq!(
+                handle.launch_strategy,
+                "structured_interactive_invocation_with_host_baseline_fallback"
+            );
+        } else {
+            assert_eq!(handle.launch_strategy, "structured_interactive_invocation");
+            assert!(handle.launch_diagnostics.is_empty());
+        }
         let invocation = handle.invocation.expect("invocation");
         assert_eq!(invocation.invocation_kind.as_str(), "interactive");
         assert_eq!(invocation.target_shell_dialect.as_str(), "ssh-posix");

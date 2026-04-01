@@ -369,6 +369,37 @@ pub struct ArtifactStorageSection {
 pub struct VaultSection {
     pub backend: String,
     pub namespace: String,
+    pub unlock: VaultUnlockSection,
+    pub protectors: VaultProtectorsSection,
+    pub ssh: VaultSshSection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultUnlockSection {
+    pub trigger_policy: String,
+    pub allowed_methods: Vec<String>,
+    pub preferred_method: String,
+    pub cache_ttl_sec: u64,
+    pub require_fresh_user_verification: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultProtectorsSection {
+    pub primary: VaultProtectorConfig,
+    pub recovery: Vec<VaultProtectorConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultProtectorConfig {
+    pub kind: String,
+    pub kdf: Option<String>,
+    pub profile: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultSshSection {
+    pub delivery_mode: String,
+    pub fallback_delivery_mode: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,6 +427,7 @@ pub struct ModelPlaneHttpSection {
 pub struct ModelPlaneHttpAuthSection {
     pub mode: String,
     pub required_when_non_loopback: bool,
+    pub allow_loopback_anonymous_compat: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,6 +451,9 @@ pub struct StandaloneTargetProfile {
     pub kind: TargetKind,
     pub enabled: bool,
     pub aliases: Vec<String>,
+    pub storage_class: String,
+    pub access_class: String,
+    pub sealed_profile_ref: Option<String>,
     pub credential_ref: Option<String>,
     pub notes: Option<String>,
     pub connection: StandaloneConnectionSection,
@@ -470,6 +505,48 @@ pub struct GitReviewSection {
 pub struct RuntimeMetadata {
     pub started_at: SystemTime,
     pub config_path: Option<String>,
+}
+
+fn default_vault_unlock_section() -> VaultUnlockSection {
+    VaultUnlockSection {
+        trigger_policy: "on-first-secret-access".into(),
+        allowed_methods: vec!["os-native".into(), "passphrase".into()],
+        preferred_method: "os-native".into(),
+        cache_ttl_sec: 600,
+        require_fresh_user_verification: true,
+    }
+}
+
+fn default_vault_protectors_section() -> VaultProtectorsSection {
+    VaultProtectorsSection {
+        primary: VaultProtectorConfig {
+            kind: "os-native".into(),
+            kdf: None,
+            profile: None,
+        },
+        recovery: vec![VaultProtectorConfig {
+            kind: "passphrase".into(),
+            kdf: Some("argon2id".into()),
+            profile: Some("interactive-default".into()),
+        }],
+    }
+}
+
+fn default_vault_ssh_section() -> VaultSshSection {
+    VaultSshSection {
+        delivery_mode: "ssh-agent-broker".into(),
+        fallback_delivery_mode: "ephemeral-identity-file".into(),
+    }
+}
+
+fn default_vault_section() -> VaultSection {
+    VaultSection {
+        backend: "builtin-encrypted".into(),
+        namespace: "io.bridgingio".into(),
+        unlock: default_vault_unlock_section(),
+        protectors: default_vault_protectors_section(),
+        ssh: default_vault_ssh_section(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -525,6 +602,10 @@ impl CoreSettings {
             Storage,
             StorageArtifacts,
             Vault,
+            VaultUnlock,
+            VaultProtectorsPrimary,
+            VaultProtectorsRecovery(usize),
+            VaultSsh,
             ControlPlane,
             ModelPlaneHttp,
             ModelPlaneHttpAuth,
@@ -556,10 +637,7 @@ impl CoreSettings {
                 eviction_policy: "lru".into(),
             },
         };
-        let mut vault = VaultSection {
-            backend: String::new(),
-            namespace: String::new(),
-        };
+        let mut vault = default_vault_section();
         let mut control_plane = ControlPlaneSection {
             enabled: true,
             transport: "platform-ipc".into(),
@@ -574,6 +652,7 @@ impl CoreSettings {
                 auth: ModelPlaneHttpAuthSection {
                     mode: "none".into(),
                     required_when_non_loopback: true,
+                    allow_loopback_anonymous_compat: false,
                 },
             },
         };
@@ -585,6 +664,7 @@ impl CoreSettings {
             mcp_target_resolution_policy: "confirm_if_family".into(),
         };
         let mut targets = Vec::<StandaloneTargetProfile>::new();
+        let mut seen_vault_recovery_array = false;
 
         for raw_line in input.lines() {
             let line = strip_comment(raw_line).trim();
@@ -595,6 +675,20 @@ impl CoreSettings {
             if line.starts_with("[[") && line.ends_with("]]") {
                 let section_name = &line[2..line.len() - 2];
                 match section_name {
+                    "vault.protectors.recovery" => {
+                        if !seen_vault_recovery_array {
+                            vault.protectors.recovery.clear();
+                            seen_vault_recovery_array = true;
+                        }
+                        vault.protectors.recovery.push(VaultProtectorConfig {
+                            kind: String::new(),
+                            kdf: None,
+                            profile: None,
+                        });
+                        section = Section::VaultProtectorsRecovery(
+                            vault.protectors.recovery.len().saturating_sub(1),
+                        );
+                    }
                     "targets" => {
                         targets.push(StandaloneTargetProfile {
                             id: String::new(),
@@ -602,6 +696,9 @@ impl CoreSettings {
                             kind: TargetKind::Other("unknown".into()),
                             enabled: true,
                             aliases: Vec::new(),
+                            storage_class: "plain".into(),
+                            access_class: "anonymous-local".into(),
+                            sealed_profile_ref: None,
                             credential_ref: None,
                             notes: None,
                             connection: StandaloneConnectionSection::default(),
@@ -645,6 +742,9 @@ impl CoreSettings {
                     "storage" => Section::Storage,
                     "storage.artifacts" => Section::StorageArtifacts,
                     "vault" => Section::Vault,
+                    "vault.unlock" => Section::VaultUnlock,
+                    "vault.protectors.primary" => Section::VaultProtectorsPrimary,
+                    "vault.ssh" => Section::VaultSsh,
                     "control_plane" => Section::ControlPlane,
                     "model_plane.http" => Section::ModelPlaneHttp,
                     "model_plane.http.auth" => Section::ModelPlaneHttpAuth,
@@ -717,6 +817,40 @@ impl CoreSettings {
                     "namespace" => vault.namespace = parse_string(key, value)?,
                     _ => return Err(invalid_field(key, "vault")),
                 },
+                Section::VaultUnlock => match key {
+                    "trigger_policy" => vault.unlock.trigger_policy = parse_string(key, value)?,
+                    "allowed_methods" => vault.unlock.allowed_methods = parse_string_array(key, value)?,
+                    "preferred_method" => vault.unlock.preferred_method = parse_string(key, value)?,
+                    "cache_ttl_sec" => vault.unlock.cache_ttl_sec = parse_u64(key, value)?,
+                    "require_fresh_user_verification" => {
+                        vault.unlock.require_fresh_user_verification = parse_bool(key, value)?
+                    }
+                    _ => return Err(invalid_field(key, "vault.unlock")),
+                },
+                Section::VaultProtectorsPrimary => match key {
+                    "kind" => vault.protectors.primary.kind = parse_string(key, value)?,
+                    "kdf" => vault.protectors.primary.kdf = Some(parse_string(key, value)?),
+                    "profile" => vault.protectors.primary.profile = Some(parse_string(key, value)?),
+                    _ => return Err(invalid_field(key, "vault.protectors.primary")),
+                },
+                Section::VaultProtectorsRecovery(index) => {
+                    let Some(recovery) = vault.protectors.recovery.get_mut(*index) else {
+                        return Err(ConfigError::MissingSection("vault.protectors.recovery"));
+                    };
+                    match key {
+                        "kind" => recovery.kind = parse_string(key, value)?,
+                        "kdf" => recovery.kdf = Some(parse_string(key, value)?),
+                        "profile" => recovery.profile = Some(parse_string(key, value)?),
+                        _ => return Err(invalid_field(key, "vault.protectors.recovery")),
+                    }
+                }
+                Section::VaultSsh => match key {
+                    "delivery_mode" => vault.ssh.delivery_mode = parse_string(key, value)?,
+                    "fallback_delivery_mode" => {
+                        vault.ssh.fallback_delivery_mode = parse_string(key, value)?
+                    }
+                    _ => return Err(invalid_field(key, "vault.ssh")),
+                },
                 Section::ControlPlane => match key {
                     "enabled" => control_plane.enabled = parse_bool(key, value)?,
                     "transport" => control_plane.transport = parse_string(key, value)?,
@@ -736,6 +870,10 @@ impl CoreSettings {
                     "mode" => model_plane.http.auth.mode = parse_string(key, value)?,
                     "required_when_non_loopback" => {
                         model_plane.http.auth.required_when_non_loopback = parse_bool(key, value)?
+                    }
+                    "allow_loopback_anonymous_compat" => {
+                        model_plane.http.auth.allow_loopback_anonymous_compat =
+                            parse_bool(key, value)?
                     }
                     _ => return Err(invalid_field(key, "model_plane.http.auth")),
                 },
@@ -778,8 +916,19 @@ impl CoreSettings {
                         }
                         "enabled" => target.enabled = parse_bool(key, value)?,
                         "aliases" => target.aliases = parse_string_array(key, value)?,
+                        "storage_class" => {
+                            target.storage_class = parse_target_storage_class(value)?;
+                        }
+                        "access_class" => {
+                            target.access_class = parse_target_access_class(value)?;
+                        }
+                        "sealed_profile_ref" => {
+                            target.sealed_profile_ref = Some(parse_string(key, value)?);
+                        }
                         "credential_ref" => {
-                            target.credential_ref = Some(parse_string(key, value)?);
+                            let raw_ref = parse_string(key, value)?;
+                            target.credential_ref =
+                                Some(canonicalize_credential_ref_input(&raw_ref)?);
                         }
                         "notes" => target.notes = Some(parse_string(key, value)?),
                         _ => return Err(invalid_field(key, "targets")),
@@ -898,6 +1047,8 @@ impl CoreSettings {
             }
         }
 
+        canonicalize_vault_section(&mut vault)?;
+
         let config = Self {
             schema_version: schema_version.ok_or(ConfigError::MissingField("schema_version"))?,
             core,
@@ -956,6 +1107,51 @@ impl CoreSettings {
         if self.vault.backend.trim().is_empty() {
             return Err(ConfigError::MissingField("vault.backend"));
         }
+        if self.vault.namespace.trim().is_empty() {
+            return Err(ConfigError::MissingField("vault.namespace"));
+        }
+        match self.vault.backend.as_str() {
+            "builtin-encrypted" | "file-vault" | "in-memory" => {}
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "vault.backend".into(),
+                    reason: format!("unsupported vault backend: {other}"),
+                })
+            }
+        }
+        match self.vault.unlock.trigger_policy.as_str() {
+            "on-core-start" | "on-first-secret-access" | "on-every-secret-access" | "manual-only" => {}
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "vault.unlock.trigger_policy".into(),
+                    reason: format!("unsupported vault unlock trigger policy: {other}"),
+                })
+            }
+        }
+        if self.vault.unlock.allowed_methods.is_empty() {
+            return Err(ConfigError::MissingField("vault.unlock.allowed_methods"));
+        }
+        if !self
+            .vault
+            .unlock
+            .allowed_methods
+            .iter()
+            .any(|method| method == &self.vault.unlock.preferred_method)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "vault.unlock.preferred_method".into(),
+                reason: "preferred method must exist in allowed_methods".into(),
+            });
+        }
+        if self.vault.protectors.primary.kind.trim().is_empty() {
+            return Err(ConfigError::MissingField("vault.protectors.primary.kind"));
+        }
+        if self.vault.ssh.delivery_mode.trim().is_empty() {
+            return Err(ConfigError::MissingField("vault.ssh.delivery_mode"));
+        }
+        if self.vault.ssh.fallback_delivery_mode.trim().is_empty() {
+            return Err(ConfigError::MissingField("vault.ssh.fallback_delivery_mode"));
+        }
 
         let host = self.model_plane.http.host.trim();
         let parsed_host = host
@@ -983,6 +1179,60 @@ impl CoreSettings {
             }
             if target.display_name.trim().is_empty() {
                 return Err(ConfigError::MissingField("targets[].display_name"));
+            }
+            if !matches!(
+                target.storage_class.trim(),
+                "plain" | "sealed-overlay" | "sealed-full"
+            ) {
+                return Err(ConfigError::InvalidValue {
+                    field: "targets[].storage_class".into(),
+                    reason: format!(
+                        "unsupported target storage class: {}",
+                        target.storage_class.trim()
+                    ),
+                });
+            }
+            if !matches!(
+                target.access_class.trim(),
+                "anonymous-local" | "token-scoped"
+            ) {
+                return Err(ConfigError::InvalidValue {
+                    field: "targets[].access_class".into(),
+                    reason: format!(
+                        "unsupported target access class: {}",
+                        target.access_class.trim()
+                    ),
+                });
+            }
+            if target.storage_class == "plain" {
+                if target
+                    .sealed_profile_ref
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "targets[].sealed_profile_ref".into(),
+                        reason: "sealed_profile_ref is only valid for sealed target storage_class"
+                            .into(),
+                    });
+                }
+            } else {
+                let Some(sealed_profile_ref) = target.sealed_profile_ref.as_deref() else {
+                    return Err(ConfigError::MissingField("targets[].sealed_profile_ref"));
+                };
+                if sealed_profile_ref.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "targets[].sealed_profile_ref".into(),
+                        reason: "sealed_profile_ref must be non-empty for sealed target"
+                            .into(),
+                    });
+                }
+                if target.access_class == "anonymous-local" {
+                    return Err(ConfigError::InvalidValue {
+                        field: "targets[].access_class".into(),
+                        reason: "sealed target cannot use anonymous-local access_class".into(),
+                    });
+                }
             }
             if let Some(family) = target.terminal.family.as_deref() {
                 if TerminalTargetFamily::parse(family).is_none() {
@@ -1057,6 +1307,22 @@ impl CoreSettings {
                 description: "保险库后端类型，使用可替换语义。",
             },
             ConfigFieldDescription {
+                path: "vault.unlock.trigger_policy",
+                description: "vault 解锁触发策略。",
+            },
+            ConfigFieldDescription {
+                path: "vault.unlock.allowed_methods",
+                description: "vault 允许的解锁方法集合。",
+            },
+            ConfigFieldDescription {
+                path: "vault.protectors.primary.kind",
+                description: "主 protector 类型。",
+            },
+            ConfigFieldDescription {
+                path: "vault.ssh.delivery_mode",
+                description: "secret-backed SSH 默认交付模式。",
+            },
+            ConfigFieldDescription {
                 path: "control_plane.transport",
                 description: "受信任 control plane 传输，MVP 默认为 platform-ipc。",
             },
@@ -1075,6 +1341,11 @@ impl CoreSettings {
             ConfigFieldDescription {
                 path: "model_plane.http.auth.mode",
                 description: "模型平面的认证模式。",
+            },
+            ConfigFieldDescription {
+                path: "model_plane.http.auth.allow_loopback_anonymous_compat",
+                description:
+                    "显式 loopback 匿名兼容开关，仅允许 plain + anonymous-local target 在无 token 时访问。",
             },
             ConfigFieldDescription {
                 path: "toolchains.<name>.path_override",
@@ -1096,6 +1367,20 @@ impl CoreSettings {
             ConfigFieldDescription {
                 path: "targets[].credential_ref",
                 description: "凭据引用，只允许引用，不允许明文敏感字段。",
+            },
+            ConfigFieldDescription {
+                path: "targets[].storage_class",
+                description:
+                    "target 存储分层：plain / sealed-overlay / sealed-full（legacy 默认 plain）。",
+            },
+            ConfigFieldDescription {
+                path: "targets[].access_class",
+                description:
+                    "target 访问分层：anonymous-local / token-scoped（legacy 默认 anonymous-local）。",
+            },
+            ConfigFieldDescription {
+                path: "targets[].sealed_profile_ref",
+                description: "sealed target 对应的 vault profile 引用，仅 sealed-* 生效。",
             },
             ConfigFieldDescription {
                 path: "targets.terminal.family",
@@ -1148,6 +1433,38 @@ impl CoreSettings {
             format!("backend = {}", toml_quote(&self.vault.backend)),
             format!("namespace = {}", toml_quote(&self.vault.namespace)),
             String::new(),
+            "[vault.unlock]".to_string(),
+            format!(
+                "trigger_policy = {}",
+                toml_quote(&self.vault.unlock.trigger_policy)
+            ),
+            format!(
+                "allowed_methods = {}",
+                toml_string_array(&self.vault.unlock.allowed_methods)
+            ),
+            format!(
+                "preferred_method = {}",
+                toml_quote(&self.vault.unlock.preferred_method)
+            ),
+            format!("cache_ttl_sec = {}", self.vault.unlock.cache_ttl_sec),
+            format!(
+                "require_fresh_user_verification = {}",
+                self.vault.unlock.require_fresh_user_verification
+            ),
+            String::new(),
+            "[vault.protectors.primary]".to_string(),
+            format!(
+                "kind = {}",
+                toml_quote(&self.vault.protectors.primary.kind)
+            ),
+            String::new(),
+            "[vault.ssh]".to_string(),
+            format!("delivery_mode = {}", toml_quote(&self.vault.ssh.delivery_mode)),
+            format!(
+                "fallback_delivery_mode = {}",
+                toml_quote(&self.vault.ssh.fallback_delivery_mode)
+            ),
+            String::new(),
             "[control_plane]".to_string(),
             format!("enabled = {}", self.control_plane.enabled),
             format!("transport = {}", toml_quote(&self.control_plane.transport)),
@@ -1167,6 +1484,10 @@ impl CoreSettings {
             format!(
                 "required_when_non_loopback = {}",
                 self.model_plane.http.auth.required_when_non_loopback
+            ),
+            format!(
+                "allow_loopback_anonymous_compat = {}",
+                self.model_plane.http.auth.allow_loopback_anonymous_compat
             ),
             String::new(),
             "[policies.defaults]".to_string(),
@@ -1188,6 +1509,36 @@ impl CoreSettings {
             ),
             String::new(),
         ];
+
+        if let Some(kdf) = self.vault.protectors.primary.kdf.as_ref() {
+            lines.insert(
+                lines
+                    .iter()
+                    .position(|line| line == "[vault.ssh]")
+                    .unwrap_or(lines.len()),
+                format!("kdf = {}", toml_quote(kdf)),
+            );
+        }
+        if let Some(profile) = self.vault.protectors.primary.profile.as_ref() {
+            lines.insert(
+                lines
+                    .iter()
+                    .position(|line| line == "[vault.ssh]")
+                    .unwrap_or(lines.len()),
+                format!("profile = {}", toml_quote(profile)),
+            );
+        }
+        for recovery in &self.vault.protectors.recovery {
+            lines.push("[[vault.protectors.recovery]]".to_string());
+            lines.push(format!("kind = {}", toml_quote(&recovery.kind)));
+            if let Some(kdf) = recovery.kdf.as_ref() {
+                lines.push(format!("kdf = {}", toml_quote(kdf)));
+            }
+            if let Some(profile) = recovery.profile.as_ref() {
+                lines.push(format!("profile = {}", toml_quote(profile)));
+            }
+            lines.push(String::new());
+        }
 
         let mut toolchain_keys = self.toolchains.keys().cloned().collect::<Vec<_>>();
         toolchain_keys.sort();
@@ -1221,6 +1572,20 @@ impl CoreSettings {
             ));
             lines.push(format!("enabled = {}", target.enabled));
             lines.push(format!("aliases = {}", toml_string_array(&target.aliases)));
+            lines.push(format!(
+                "storage_class = {}",
+                toml_quote(target.storage_class.trim())
+            ));
+            lines.push(format!(
+                "access_class = {}",
+                toml_quote(target.access_class.trim())
+            ));
+            if let Some(sealed_profile_ref) = target.sealed_profile_ref.as_ref() {
+                lines.push(format!(
+                    "sealed_profile_ref = {}",
+                    toml_quote(sealed_profile_ref)
+                ));
+            }
             if let Some(credential_ref) = target.credential_ref.as_ref() {
                 lines.push(format!("credential_ref = {}", toml_quote(credential_ref)));
             }
@@ -1435,6 +1800,32 @@ fn parse_target_kind(value: &str) -> Result<TargetKind, ConfigError> {
     })
 }
 
+fn parse_target_storage_class(value: &str) -> Result<String, ConfigError> {
+    let raw = parse_string("targets[].storage_class", value)?
+        .trim()
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "plain" | "sealed-overlay" | "sealed-full" => Ok(raw),
+        _ => Err(ConfigError::InvalidValue {
+            field: "targets[].storage_class".into(),
+            reason: format!("unsupported target storage class: {raw}"),
+        }),
+    }
+}
+
+fn parse_target_access_class(value: &str) -> Result<String, ConfigError> {
+    let raw = parse_string("targets[].access_class", value)?
+        .trim()
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "anonymous-local" | "token-scoped" => Ok(raw),
+        _ => Err(ConfigError::InvalidValue {
+            field: "targets[].access_class".into(),
+            reason: format!("unsupported target access class: {raw}"),
+        }),
+    }
+}
+
 fn parse_reuse_policy(value: &str) -> Result<SessionReusePolicy, ConfigError> {
     let raw = parse_string("policies.defaults.reuse_policy", value)?;
     match raw.as_str() {
@@ -1457,6 +1848,157 @@ fn parse_mcp_target_resolution_policy(value: &str) -> Result<String, ConfigError
             reason: format!("unsupported mcp target resolution policy: {raw}"),
         }),
     }
+}
+
+fn canonicalize_credential_ref_input(raw: &str) -> Result<String, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("vault:") || trimmed.starts_with("vault://") {
+        return bridgingio_secrets::normalize_credential_ref(trimmed).map_err(|err| {
+            ConfigError::InvalidValue {
+                field: "targets[].credential_ref".into(),
+                reason: format!("invalid vault credential ref: {err:?}"),
+            }
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_vault_method(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn push_unique_string(list: &mut Vec<String>, value: String) {
+    if value.is_empty() {
+        return;
+    }
+    if !list.iter().any(|existing| existing == &value) {
+        list.push(value);
+    }
+}
+
+fn canonicalize_vault_section(vault: &mut VaultSection) -> Result<(), ConfigError> {
+    let mut backend = vault.backend.trim().to_ascii_lowercase();
+    let legacy_os_native = backend == "os-native";
+    if legacy_os_native {
+        backend = "builtin-encrypted".into();
+    }
+    vault.backend = backend;
+
+    if vault.namespace.trim().is_empty() {
+        vault.namespace = "io.bridgingio".into();
+    } else {
+        vault.namespace = vault.namespace.trim().to_string();
+    }
+
+    let primary_kind = normalize_vault_method(&vault.protectors.primary.kind);
+    vault.protectors.primary.kind = if primary_kind.is_empty() {
+        if legacy_os_native {
+            "os-native".into()
+        } else {
+            "passphrase".into()
+        }
+    } else {
+        primary_kind
+    };
+    vault.protectors.primary.kdf = vault
+        .protectors
+        .primary
+        .kdf
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    vault.protectors.primary.profile = vault
+        .protectors
+        .primary
+        .profile
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let mut canonical_recovery = Vec::new();
+    for mut recovery in vault.protectors.recovery.clone() {
+        recovery.kind = normalize_vault_method(&recovery.kind);
+        recovery.kdf = recovery
+            .kdf
+            .as_ref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        recovery.profile = recovery
+            .profile
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if recovery.kind.is_empty() {
+            continue;
+        }
+        if !canonical_recovery
+            .iter()
+            .any(|existing: &VaultProtectorConfig| existing.kind == recovery.kind)
+        {
+            canonical_recovery.push(recovery);
+        }
+    }
+    if canonical_recovery.is_empty() {
+        canonical_recovery.push(VaultProtectorConfig {
+            kind: "passphrase".into(),
+            kdf: Some("argon2id".into()),
+            profile: Some("interactive-default".into()),
+        });
+    }
+    vault.protectors.recovery = canonical_recovery;
+
+    vault.unlock.trigger_policy = normalize_vault_method(&vault.unlock.trigger_policy);
+    if vault.unlock.trigger_policy.is_empty() {
+        vault.unlock.trigger_policy = "on-first-secret-access".into();
+    }
+    let mut allowed_methods = Vec::new();
+    for method in &vault.unlock.allowed_methods {
+        push_unique_string(&mut allowed_methods, normalize_vault_method(method));
+    }
+    push_unique_string(&mut allowed_methods, vault.protectors.primary.kind.clone());
+    for method in &vault.protectors.recovery {
+        push_unique_string(&mut allowed_methods, method.kind.clone());
+    }
+    if legacy_os_native {
+        push_unique_string(&mut allowed_methods, "os-native".into());
+    }
+    if allowed_methods.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "vault.unlock.allowed_methods".into(),
+            reason: "at least one unlock method is required".into(),
+        });
+    }
+    vault.unlock.allowed_methods = allowed_methods;
+    let preferred = normalize_vault_method(&vault.unlock.preferred_method);
+    vault.unlock.preferred_method = if preferred.is_empty() {
+        vault.protectors.primary.kind.clone()
+    } else {
+        preferred
+    };
+    if !vault
+        .unlock
+        .allowed_methods
+        .iter()
+        .any(|method| method == &vault.unlock.preferred_method)
+    {
+        vault
+            .unlock
+            .allowed_methods
+            .insert(0, vault.unlock.preferred_method.clone());
+    }
+    if vault.unlock.cache_ttl_sec == 0 {
+        vault.unlock.cache_ttl_sec = 600;
+    }
+
+    vault.ssh.delivery_mode = normalize_vault_method(&vault.ssh.delivery_mode);
+    if vault.ssh.delivery_mode.is_empty() {
+        vault.ssh.delivery_mode = "ssh-agent-broker".into();
+    }
+    vault.ssh.fallback_delivery_mode = normalize_vault_method(&vault.ssh.fallback_delivery_mode);
+    if vault.ssh.fallback_delivery_mode.is_empty() {
+        vault.ssh.fallback_delivery_mode = "ephemeral-identity-file".into();
+    }
+    Ok(())
 }
 
 fn is_sensitive_key(key: &str) -> bool {
@@ -1786,6 +2328,14 @@ mod config_tests {
         assert_eq!(config.model_plane.http.host, "127.0.0.1");
         assert_eq!(config.model_plane.http.port, 19718);
         assert_eq!(config.storage.artifacts.backend, "memory");
+        assert_eq!(config.vault.backend, "builtin-encrypted");
+        assert_eq!(config.vault.protectors.primary.kind, "os-native");
+        assert!(config
+            .vault
+            .unlock
+            .allowed_methods
+            .iter()
+            .any(|method| method == "os-native"));
         assert_eq!(config.targets.len(), 1);
         assert_eq!(
             config.policies.mcp_target_resolution_policy,
@@ -1811,12 +2361,43 @@ mod config_tests {
                 .map(|section| section.path_override.as_str()),
             Some("__TARGET_ADB_OVERRIDE__")
         );
+        assert_eq!(
+            adb_target.credential_ref.as_deref(),
+            Some("vault://bridgingio/adb/default")
+        );
         assert_eq!(config.model_plane.http.host, "127.0.0.1");
         assert_eq!(config.storage.artifacts.backend, "filesystem");
         assert_eq!(
             config.policies.mcp_target_resolution_policy,
             "confirm_if_family"
         );
+    }
+
+    #[test]
+    fn legacy_target_defaults_to_plain_and_anonymous_local() {
+        let config =
+            CoreSettings::from_toml_str(CoreSettings::minimal_example()).expect("parse minimal");
+        let target = config
+            .targets
+            .iter()
+            .find(|entry| entry.id == "local-ssh")
+            .expect("local-ssh target");
+        assert_eq!(target.storage_class, "plain");
+        assert_eq!(target.access_class, "anonymous-local");
+        assert!(target.sealed_profile_ref.is_none());
+    }
+
+    #[test]
+    fn rejects_sealed_target_with_anonymous_local_access_class() {
+        let invalid = format!(
+            "{}\n\n[[targets]]\nid = \"sealed-bad\"\ndisplay_name = \"Sealed Bad\"\nkind = \"localshell\"\nenabled = true\naliases = []\nstorage_class = \"sealed-overlay\"\naccess_class = \"anonymous-local\"\nsealed_profile_ref = \"vault://bridgingio/targets/sealed-bad\"\n\n[targets.connection]\n\n[targets.providers.terminal]\nenabled = true\n",
+            CoreSettings::minimal_example()
+        );
+        let err = CoreSettings::from_toml_str(&invalid).expect_err("must reject");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { field, .. } if field == "targets[].access_class"
+        ));
     }
 
     #[test]
@@ -1870,6 +2451,29 @@ mod config_tests {
                 .map(|section| section.path_override.as_str()),
             Some("__TARGET_ADB_OVERRIDE__")
         );
+    }
+
+    #[test]
+    fn canonicalizes_legacy_vault_backend_and_reference_on_parse_and_rewrite() {
+        let legacy = CoreSettings::minimal_example().replace(
+            "credential_ref = \"vault://bridgingio/ssh-private-key/local\"",
+            "credential_ref = \"vault:ssh-key:local\"",
+        );
+        let parsed = CoreSettings::from_toml_str(&legacy).expect("parse legacy vault config");
+        assert_eq!(parsed.vault.backend, "builtin-encrypted");
+        assert_eq!(parsed.vault.protectors.primary.kind, "os-native");
+        assert_eq!(
+            parsed.targets[0].credential_ref.as_deref(),
+            Some("vault://bridgingio/ssh-private-key/local")
+        );
+
+        let rewritten = parsed.to_toml_string();
+        assert!(rewritten.contains("[vault.unlock]"));
+        assert!(rewritten.contains("[vault.protectors.primary]"));
+        assert!(rewritten.contains("[vault.ssh]"));
+        assert!(rewritten.contains("backend = \"builtin-encrypted\""));
+        assert!(!rewritten.contains("backend = \"os-native\""));
+        assert!(rewritten.contains("credential_ref = \"vault://bridgingio/ssh-private-key/local\""));
     }
 
     #[test]

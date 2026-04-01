@@ -65,6 +65,11 @@ release, even if test frameworks differ.
 - Unlock path requires trusted local verification trigger before host bridge
   unlock call.
 
+11. Token issue + one-time reveal flow
+- Settings can issue long-lived token only after trusted verification.
+- Create response exposes one-time plaintext token result.
+- Follow-up list/query views remain summary-only and do not re-expose plaintext.
+
 ## Test Case Matrix
 
 | ID | Flow | Minimum assertion |
@@ -79,6 +84,7 @@ release, even if test frameworks differ.
 | UI-08 | Timeline grouping | Both `token_label` and `http_fingerprint` actor grouping paths are covered |
 | UI-09 | Token revoke | Token summary list exposes revoke and reflects revoked status |
 | UI-10 | Vault unlock | Vault unlock entrypoint enforces trusted local verification trigger |
+| UI-11 | Token one-time reveal | Trusted issue flow shows one-time plaintext result and dismiss lifecycle |
 
 ## Platform Mapping
 
@@ -88,14 +94,15 @@ release, even if test frameworks differ.
   (`bundled_assets_match_tauri_console_web_sources`,
   `workspace_navigation_and_timeline_grouping_ui_contract`,
   `settings_security_ui_contract_covers_token_revoke_and_vault_unlock`,
+  `settings_security_ui_contract_covers_locked_state_unlock_and_issue_revoke_flow`,
   plus onboarding/workspace markup contract tests)
-- Linux: framework to be selected by platform team, must keep UI-01..UI-10
-- Windows: framework to be selected by platform team, must keep UI-01..UI-10
+- Linux: framework to be selected by platform team, must keep UI-01..UI-11
+- Windows: framework to be selected by platform team, must keep UI-01..UI-11
 - OpenHarmony PC: framework to be selected by platform team, must keep
-  UI-01..UI-10
+  UI-01..UI-11
 
 ## Exit Criteria
 
 - A platform UI change is not complete without automated tests covering UI-01
-  through UI-10.
+  through UI-11.
 - Archive handoff should report which platform suites ran and their outcomes.

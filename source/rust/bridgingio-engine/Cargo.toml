@@ -6,4 +6,4 @@ license = "MIT"
 
 [dependencies]
 bridgingio-domain = { path = "../bridgingio-domain" }
-
+bridgingio-secrets = { path = "../bridgingio-secrets" }

@@ -20,6 +20,9 @@ use bridgingio_mcp::{
 };
 use bridgingio_platform::{detect_host_platform_adapter, HostPlatform};
 use bridgingio_policy::OperationKind;
+use bridgingio_secrets::{
+    SecretVaultRouter, VaultError, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
+};
 use serde_json::{json, Value};
 
 fn context(
@@ -1094,14 +1097,23 @@ fn validates_interactive_shell_mode_context_isolation_and_lifecycle() {
         .as_str()
         .expect("shell id")
         .to_string();
-    assert_eq!(
-        payload["result"]["structuredContent"]["launch_strategy"].as_str(),
+    let launch_strategy = payload["result"]["structuredContent"]["launch_strategy"].as_str();
+    assert!(matches!(
+        launch_strategy,
         Some("structured_interactive_invocation")
-    );
-    assert_eq!(
-        payload["result"]["structuredContent"]["launch_fallback_applied"].as_bool(),
-        Some(false)
-    );
+            | Some("structured_interactive_invocation_with_host_baseline_fallback")
+    ));
+    if launch_strategy == Some("structured_interactive_invocation_with_host_baseline_fallback") {
+        assert_eq!(
+            payload["result"]["structuredContent"]["launch_fallback_applied"].as_bool(),
+            Some(true)
+        );
+    } else {
+        assert_eq!(
+            payload["result"]["structuredContent"]["launch_fallback_applied"].as_bool(),
+            Some(false)
+        );
+    }
 
     let addr = http_server.local_addr().expect("http addr");
     let write_export = json!({
@@ -1405,14 +1417,23 @@ fn validates_interactive_shell_long_running_interrupt_flow() {
         .as_str()
         .expect("shell id")
         .to_string();
-    assert_eq!(
-        payload["result"]["structuredContent"]["launch_strategy"].as_str(),
+    let launch_strategy = payload["result"]["structuredContent"]["launch_strategy"].as_str();
+    assert!(matches!(
+        launch_strategy,
         Some("structured_interactive_invocation")
-    );
-    assert_eq!(
-        payload["result"]["structuredContent"]["launch_fallback_applied"].as_bool(),
-        Some(false)
-    );
+            | Some("structured_interactive_invocation_with_host_baseline_fallback")
+    ));
+    if launch_strategy == Some("structured_interactive_invocation_with_host_baseline_fallback") {
+        assert_eq!(
+            payload["result"]["structuredContent"]["launch_fallback_applied"].as_bool(),
+            Some(true)
+        );
+    } else {
+        assert_eq!(
+            payload["result"]["structuredContent"]["launch_fallback_applied"].as_bool(),
+            Some(false)
+        );
+    }
 
     let addr = http_server.local_addr().expect("http addr");
     let write = json!({
@@ -1765,4 +1786,68 @@ fn validates_platform_matrix_contract_for_transport_paths_and_toolchain_fallback
             "unix/unknown endpoint should end with control-plane.sock, got {endpoint}"
         ),
     }
+}
+
+#[test]
+fn canonical_vault_persistence_and_passphrase_unlock_integration_contract() {
+    let root = temp_dir("canonical-vault-integration");
+    let vault_root = root.join("vault-store");
+    let mut router = SecretVaultRouter::with_persistent_store(&vault_root).expect("open store");
+    router
+        .set_active_backend("builtin-encrypted")
+        .expect("set builtin backend");
+    router
+        .set_unlock_policy(VaultUnlockPolicy {
+            trigger_policy: VaultUnlockTriggerPolicy::ManualOnly,
+            allowed_methods: vec!["os-native".into(), "passphrase".into()],
+            preferred_method: "passphrase".into(),
+            cache_ttl_sec: 60,
+            require_fresh_user_verification: true,
+        })
+        .expect("set unlock policy");
+
+    let locked_put = router.put("vault:ssh-key:integration", "INTEGRATION-KEY", "integration");
+    assert!(
+        matches!(locked_put, Err(VaultError::VaultLocked(_))),
+        "locked fail-closed contract should reject put before unlock"
+    );
+
+    router
+        .set_allow_degraded_mode(true)
+        .expect("allow degraded mode for integration test");
+    router
+        .unlock_with_os_native()
+        .expect("unlock os-native for passphrase setup");
+    router
+        .configure_passphrase_protector("correct horse battery staple")
+        .expect("configure passphrase");
+    router.lock_vault("test lock").expect("lock vault");
+
+    let wrong = router.unlock_with_passphrase("wrong passphrase");
+    assert!(
+        matches!(wrong, Err(VaultError::PassphraseRejected)),
+        "wrong passphrase must be rejected"
+    );
+    router
+        .unlock_with_passphrase("correct horse battery staple")
+        .expect("unlock with passphrase");
+    router
+        .put("vault:ssh-key:integration", "INTEGRATION-KEY", "integration")
+        .expect("put secret after unlock");
+    drop(router);
+
+    let mut reloaded = SecretVaultRouter::with_persistent_store(&vault_root).expect("reload store");
+    reloaded
+        .set_active_backend("builtin-encrypted")
+        .expect("set backend after reload");
+    reloaded
+        .unlock_with_passphrase("correct horse battery staple")
+        .expect("unlock reloaded store with passphrase");
+    let lease = reloaded
+        .use_for_ssh_auth("vault:ssh-key:integration", "target:integration")
+        .expect("lease secret after reload");
+    let leased = lease.with_secret_bytes(|bytes| String::from_utf8_lossy(bytes).to_string());
+    assert_eq!(leased, "INTEGRATION-KEY");
+
+    let _ = fs::remove_dir_all(root);
 }

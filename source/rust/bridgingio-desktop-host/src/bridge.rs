@@ -257,6 +257,13 @@ fn response_kind(response: &ApiResponse) -> String {
         ApiResponse::AgentTokenCreated { .. } => "agent_token_created",
         ApiResponse::AgentTokens { .. } => "agent_tokens",
         ApiResponse::AgentTokenRevoked { .. } => "agent_token_revoked",
+        ApiResponse::LocalAdminIntentCreated { .. } => "local_admin_intent_created",
+        ApiResponse::LocalAdminAttestationCompleted { .. } => {
+            "local_admin_attestation_completed"
+        }
+        ApiResponse::VaultState { .. } => "vault_state",
+        ApiResponse::VaultUnlocked { .. } => "vault_unlocked",
+        ApiResponse::VaultLocked { .. } => "vault_locked",
         ApiResponse::Session { .. } => "session",
         ApiResponse::Execution { .. } => "execution",
         ApiResponse::Artifact { .. } => "artifact",
