@@ -125,6 +125,15 @@ impl FooterButton {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionHighlightMode {
+    Reverse,
+    Fallback,
+}
+
+const MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT_ENV: &str =
+    "BRIDGINGIO_MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT";
+
 pub struct MenuConfigApp {
     config_path: PathBuf,
     settings: CoreSettings,
@@ -148,6 +157,7 @@ pub struct MenuConfigApp {
     show_help: bool,
     exit_confirm_mode: bool,
     exit_confirm_selected: usize,
+    selection_highlight_mode: SelectionHighlightMode,
     last_status: String,
     last_apply_strategy: Option<String>,
 }
@@ -189,6 +199,7 @@ impl MenuConfigApp {
             show_help: false,
             exit_confirm_mode: false,
             exit_confirm_selected: 0,
+            selection_highlight_mode: detect_selection_highlight_mode(),
             last_status: initial_status,
             last_apply_strategy: None,
         })
@@ -779,6 +790,85 @@ pub fn run_menuconfig(config_path: impl Into<PathBuf>) -> Result<MenuConfigOutco
     app.run()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuEntryVisualState {
+    Normal,
+    Selected,
+    Disabled,
+}
+
+fn detect_selection_highlight_mode() -> SelectionHighlightMode {
+    let term = std::env::var("TERM").ok();
+    detect_selection_highlight_mode_from_values(
+        env_var_truthy(MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT_ENV),
+        std::env::var_os("NO_COLOR").is_some(),
+        term.as_deref(),
+    )
+}
+
+fn detect_selection_highlight_mode_from_values(
+    force_fallback: bool,
+    no_color: bool,
+    term: Option<&str>,
+) -> SelectionHighlightMode {
+    if force_fallback || no_color || term.map(|value| value.trim().eq_ignore_ascii_case("dumb")).unwrap_or(false) {
+        SelectionHighlightMode::Fallback
+    } else {
+        SelectionHighlightMode::Reverse
+    }
+}
+
+fn env_var_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn selected_highlight_style(mode: SelectionHighlightMode) -> Style {
+    match mode {
+        SelectionHighlightMode::Reverse => Style::default()
+            .add_modifier(Modifier::REVERSED)
+            .add_modifier(Modifier::BOLD),
+        SelectionHighlightMode::Fallback => Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED),
+    }
+}
+
+fn menu_entry_style(state: MenuEntryVisualState, mode: SelectionHighlightMode) -> Style {
+    match state {
+        MenuEntryVisualState::Normal => Style::default(),
+        MenuEntryVisualState::Selected => selected_highlight_style(mode),
+        MenuEntryVisualState::Disabled => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    }
+}
+
+fn menu_entry_is_disabled(entry: &MenuEntry) -> bool {
+    matches!(entry.kind, MenuEntryKind::Info)
+}
+
+fn menu_entry_visual_state(
+    selected: usize,
+    index: usize,
+    entry: &MenuEntry,
+) -> MenuEntryVisualState {
+    if menu_entry_is_disabled(entry) {
+        MenuEntryVisualState::Disabled
+    } else if index == selected {
+        MenuEntryVisualState::Selected
+    } else {
+        MenuEntryVisualState::Normal
+    }
+}
+
 fn render(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -800,11 +890,16 @@ fn render(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
 }
 
 fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
-    let raw_lines = app
+    let rendered_rows = app
         .entries()
         .iter()
         .enumerate()
-        .map(|(index, entry)| format_menu_entry_line(app, index, entry))
+        .map(|(index, entry)| {
+            let visual_state = menu_entry_visual_state(app.selected, index, entry);
+            let line = format_menu_entry_line(app, index, entry);
+            let style = menu_entry_style(visual_state, app.selection_highlight_mode);
+            (line, style)
+        })
         .collect::<Vec<_>>();
 
     let dirty_suffix = if app.is_dirty() {
@@ -827,9 +922,9 @@ fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp)
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
-    let content_width = raw_lines
+    let content_width = rendered_rows
         .iter()
-        .map(|line| line.chars().count())
+        .map(|(line, _)| line.chars().count())
         .max()
         .unwrap_or(0);
     let list_width = chunks[0].width as usize;
@@ -839,15 +934,19 @@ fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp)
         0
     };
     let left_pad = " ".repeat(left_padding);
-    let items = raw_lines
+    let items = rendered_rows
         .into_iter()
-        .map(|line| ListItem::new(Line::from(format!("{left_pad}{line}"))))
+        .map(|(line, style)| ListItem::new(Line::from(format!("{left_pad}{line}"))).style(style))
         .collect::<Vec<_>>();
     let list = List::new(items);
     frame.render_widget(list, chunks[0]);
     if chunks.len() > 1 {
-        let buttons = Paragraph::new(render_footer_buttons_line(app.footer_selected, &app.catalog))
-            .alignment(Alignment::Center);
+        let buttons = Paragraph::new(render_footer_buttons_line(
+            app.footer_selected,
+            &app.catalog,
+            app.selection_highlight_mode,
+        ))
+        .alignment(Alignment::Center);
         frame.render_widget(buttons, chunks[1]);
     }
 }
@@ -974,7 +1073,11 @@ fn render_exit_confirm(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     frame.render_widget(popup, area);
 }
 
-fn render_footer_buttons_line(selected: usize, catalog: &Catalog) -> Line<'static> {
+fn render_footer_buttons_line(
+    selected: usize,
+    catalog: &Catalog,
+    mode: SelectionHighlightMode,
+) -> Line<'static> {
     let mut spans = Vec::new();
     for index in 0..3 {
         if index > 0 {
@@ -982,13 +1085,12 @@ fn render_footer_buttons_line(selected: usize, catalog: &Catalog) -> Line<'stati
         }
         let base = FooterButton::from_index(index).label(&catalog);
         if selected == index {
-            spans.push(Span::styled(
-                base,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            let selected_label = if mode == SelectionHighlightMode::Fallback {
+                format!(">>{base}<<")
+            } else {
+                base
+            };
+            spans.push(Span::styled(selected_label, selected_highlight_style(mode)));
         } else {
             spans.push(Span::raw(base));
         }
@@ -997,7 +1099,16 @@ fn render_footer_buttons_line(selected: usize, catalog: &Catalog) -> Line<'stati
 }
 
 fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) -> String {
-    let selector = if index == app.selected { ">" } else { " " };
+    let visual_state = menu_entry_visual_state(app.selected, index, entry);
+    let selector = if index != app.selected {
+        " "
+    } else if app.selection_highlight_mode == SelectionHighlightMode::Fallback
+        && visual_state == MenuEntryVisualState::Selected
+    {
+        ">>"
+    } else {
+        ">"
+    };
     match &entry.kind {
         MenuEntryKind::Navigate(screen) => {
             if let Screen::TargetEditor(target_index) = screen {
@@ -1896,6 +2007,7 @@ mod tests {
     use bridgingio_engine::CoreSettings;
     use bridgingio_secrets::VaultUnlockTriggerPolicy;
     use crossterm::event::KeyCode;
+    use ratatui::style::Modifier;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2072,5 +2184,109 @@ mod tests {
         assert!(instance_line.ends_with("--->"));
         assert!(log_level_line.contains("Log Level ("));
         assert!(log_level_line.ends_with("--->"));
+    }
+
+    #[test]
+    fn keyboard_navigation_moves_selected_visual_state() {
+        let config_path = temp_config_path("selected-visual-navigation");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Root;
+
+        let entries = app.entries();
+        assert_eq!(
+            super::menu_entry_visual_state(app.selected, 0, &entries[0]),
+            super::MenuEntryVisualState::Selected
+        );
+        assert_eq!(
+            super::menu_entry_visual_state(app.selected, 1, &entries[1]),
+            super::MenuEntryVisualState::Normal
+        );
+
+        app.move_selection(1);
+        let entries = app.entries();
+        assert_eq!(
+            super::menu_entry_visual_state(app.selected, 0, &entries[0]),
+            super::MenuEntryVisualState::Normal
+        );
+        assert_eq!(
+            super::menu_entry_visual_state(app.selected, 1, &entries[1]),
+            super::MenuEntryVisualState::Selected
+        );
+    }
+
+    #[test]
+    fn selected_style_is_shared_between_menu_and_footer() {
+        let config_path = temp_config_path("shared-selected-style");
+        let app = MenuConfigApp::load(&config_path).expect("load app");
+        let menu_selected = super::menu_entry_style(
+            super::MenuEntryVisualState::Selected,
+            super::SelectionHighlightMode::Reverse,
+        );
+        let footer_line =
+            super::render_footer_buttons_line(0, &app.catalog, super::SelectionHighlightMode::Reverse);
+        let footer_selected = &footer_line.spans[0];
+        assert_eq!(footer_selected.style, menu_selected);
+        assert!(footer_selected.style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn fallback_detection_uses_force_no_color_and_term_dumb() {
+        assert_eq!(
+            super::detect_selection_highlight_mode_from_values(true, false, Some("xterm-256color")),
+            super::SelectionHighlightMode::Fallback
+        );
+        assert_eq!(
+            super::detect_selection_highlight_mode_from_values(false, true, Some("xterm-256color")),
+            super::SelectionHighlightMode::Fallback
+        );
+        assert_eq!(
+            super::detect_selection_highlight_mode_from_values(false, false, Some("dumb")),
+            super::SelectionHighlightMode::Fallback
+        );
+        assert_eq!(
+            super::detect_selection_highlight_mode_from_values(false, false, Some("xterm-256color")),
+            super::SelectionHighlightMode::Reverse
+        );
+    }
+
+    #[test]
+    fn fallback_mode_uses_visible_markers_for_selected_items() {
+        let config_path = temp_config_path("fallback-selected-markers");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Root;
+        app.selection_highlight_mode = super::SelectionHighlightMode::Fallback;
+
+        let entries = app.entries();
+        let selected_line = super::format_menu_entry_line(&app, 0, &entries[0]);
+        let not_selected_line = super::format_menu_entry_line(&app, 1, &entries[1]);
+        assert!(selected_line.starts_with(">>"));
+        assert!(not_selected_line.starts_with(" "));
+
+        let footer_line = super::render_footer_buttons_line(
+            0,
+            &app.catalog,
+            super::SelectionHighlightMode::Fallback,
+        );
+        assert!(footer_line.spans[0].content.contains(">>"));
+    }
+
+    #[test]
+    fn disabled_state_takes_priority_over_selected_highlight() {
+        let config_path = temp_config_path("disabled-priority");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Core;
+        app.selected = 1;
+        app.selection_highlight_mode = super::SelectionHighlightMode::Fallback;
+
+        let entries = app.entries();
+        assert!(matches!(entries[1].kind, MenuEntryKind::Info));
+        let state = super::menu_entry_visual_state(app.selected, 1, &entries[1]);
+        assert_eq!(state, super::MenuEntryVisualState::Disabled);
+        let style = super::menu_entry_style(state, app.selection_highlight_mode);
+        assert!(!style.add_modifier.contains(Modifier::REVERSED));
+
+        let line = super::format_menu_entry_line(&app, 1, &entries[1]);
+        assert!(line.starts_with(">"));
+        assert!(!line.starts_with(">>"));
     }
 }
