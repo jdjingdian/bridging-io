@@ -12,6 +12,8 @@ use bridgingio_domain::{
     TerminalConcurrencyPolicy, TerminalTargetFamily, TransportSessionRecord, TransportSessionStatus,
 };
 
+pub mod i18n;
+
 #[derive(Default)]
 pub struct InMemoryMetadataStore {
     pub profiles: HashMap<String, TargetProfile>,
@@ -348,6 +350,7 @@ pub struct CoreSection {
     pub instance_name: String,
     pub data_dir: String,
     pub log_level: String,
+    pub operator_locale: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -692,6 +695,7 @@ impl CoreSettings {
             instance_name: String::new(),
             data_dir: String::new(),
             log_level: "info".into(),
+            operator_locale: i18n::OPERATOR_LOCALE_EN_US.to_string(),
         };
         let mut storage = StorageSection {
             metadata_backend: "sqlite".into(),
@@ -862,6 +866,7 @@ impl CoreSettings {
                     "instance_name" => core.instance_name = parse_string(key, value)?,
                     "data_dir" => core.data_dir = parse_string(key, value)?,
                     "log_level" => core.log_level = parse_string(key, value)?,
+                    "operator_locale" => core.operator_locale = parse_string(key, value)?,
                     _ => return Err(invalid_field(key, "core")),
                 },
                 Section::Storage => match key {
@@ -1143,6 +1148,16 @@ impl CoreSettings {
         if self.storage.metadata_path.trim().is_empty() {
             return Err(ConfigError::MissingField("storage.metadata_path"));
         }
+        if !i18n::is_supported_operator_locale(&self.core.operator_locale) {
+            return Err(ConfigError::InvalidValue {
+                field: "core.operator_locale".into(),
+                reason: format!(
+                    "unsupported operator locale: {} (supported: {})",
+                    self.core.operator_locale,
+                    i18n::supported_operator_locales().join(", ")
+                ),
+            });
+        }
         if self.storage.artifacts.root.trim().is_empty() {
             return Err(ConfigError::MissingField("storage.artifacts.root"));
         }
@@ -1349,6 +1364,10 @@ impl CoreSettings {
                 description: "core 本地数据目录。",
             },
             ConfigFieldDescription {
+                path: "core.operator_locale",
+                description: "core CLI/TUI 文案语言，支持 zh-CN 和 en-US。",
+            },
+            ConfigFieldDescription {
                 path: "storage.metadata_path",
                 description: "metadata 存储文件路径（例如 sqlite 文件）。",
             },
@@ -1475,6 +1494,10 @@ impl CoreSettings {
             format!("instance_name = {}", toml_quote(&self.core.instance_name)),
             format!("data_dir = {}", toml_quote(&self.core.data_dir)),
             format!("log_level = {}", toml_quote(&self.core.log_level)),
+            format!(
+                "operator_locale = {}",
+                toml_quote(i18n::normalize_operator_locale(&self.core.operator_locale))
+            ),
             String::new(),
             "[storage]".to_string(),
             format!(
@@ -2391,6 +2414,7 @@ mod config_tests {
         let config =
             CoreSettings::from_toml_str(CoreSettings::minimal_example()).expect("parse minimal");
         assert_eq!(config.schema_version, 1);
+        assert_eq!(config.core.operator_locale, "en-US");
         assert_eq!(config.model_plane.http.host, "127.0.0.1");
         assert_eq!(config.model_plane.http.port, 19718);
         assert_eq!(config.storage.artifacts.backend, "memory");
@@ -2583,6 +2607,14 @@ mod config_tests {
         );
         let err = CoreSettings::from_toml_str(&invalid).expect_err("must reject unknown policy");
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn rejects_unsupported_core_operator_locale() {
+        let invalid =
+            CoreSettings::minimal_example().replace("operator_locale = \"en-US\"", "operator_locale = \"ja-JP\"");
+        let err = CoreSettings::from_toml_str(&invalid).expect_err("must reject unsupported locale");
+        assert!(matches!(err, ConfigError::InvalidValue { field, .. } if field == "core.operator_locale"));
     }
 
     #[test]

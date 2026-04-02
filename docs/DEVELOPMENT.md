@@ -91,6 +91,19 @@ Out of current MVP:
 - Session reuse behavior is controlled by `SessionReusePolicy`:
   `always_new`, `reuse_if_alive`, `resume_or_create`.
 
+## Core Locale And Version Truth
+
+- `core.operator_locale` is the locale contract for core-owned operator
+  surfaces (`bridgingio-core --help`/`--version`/about and `menuconfig`).
+- Supported values are only `en-US` and `zh-CN`; unsupported values are
+  rejected during config validation.
+- Future UI hosts must not consume `core.operator_locale` as UI locale truth.
+  UI locale policy is intentionally independent from this core-owned field.
+- Core version truth is only `source/rust/Cargo.toml`
+  `[workspace.package].version`; all member crates inherit workspace version.
+- The expected version shape is `YYMM.DD.BuildNumber`, but it must stay Cargo
+  semver-compatible. Example: `2604.2.1` (not `2604.02.1`).
+
 ## Testing Requirements
 
 - Core Rust changes require unit tests in the touched crate.
@@ -114,6 +127,12 @@ Cross-platform contract baseline:
 
 ```bash
 scripts/testing/run-core-platform-contract.sh
+```
+
+Operator-facing hardcoded display literal guard:
+
+```bash
+scripts/testing/check-core-operator-i18n-literals.sh
 ```
 
 Tauri shell startup smoke:

@@ -49,6 +49,8 @@ run_suite() {
   fi
 }
 
+run_suite "CP-OPERATOR-I18N-LITERALS" "${REPO_ROOT}/scripts/testing/check-core-operator-i18n-literals.sh"
+
 cd "${REPO_ROOT}/source/rust"
 
 run_suite "CP-TOOLCHAIN-FALLBACK" cargo test -p bridgingio-connectors

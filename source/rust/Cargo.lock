@@ -287,14 +287,14 @@ dependencies = [
 
 [[package]]
 name = "bridgingio-app-api"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
 ]
 
 [[package]]
 name = "bridgingio-artifacts"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
  "regex",
@@ -305,14 +305,14 @@ dependencies = [
 
 [[package]]
 name = "bridgingio-connectors"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
 ]
 
 [[package]]
 name = "bridgingio-desktop-host"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-app-api",
  "bridgingio-domain",
@@ -321,14 +321,14 @@ dependencies = [
 
 [[package]]
 name = "bridgingio-domain"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "bridgingio-engine"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
  "bridgingio-secrets",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "bridgingio-mcp"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-app-api",
  "bridgingio-artifacts",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "bridgingio-operator-console"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
  "bridgingio-engine",
@@ -367,21 +367,21 @@ dependencies = [
 
 [[package]]
 name = "bridgingio-platform"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
 ]
 
 [[package]]
 name = "bridgingio-policy"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
 ]
 
 [[package]]
 name = "bridgingio-providers"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "bridgingio-artifacts",
  "bridgingio-connectors",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "bridgingio-secrets"
-version = "0.1.0"
+version = "2604.2.1"
 dependencies = [
  "argon2",
  "bridgingio-domain",

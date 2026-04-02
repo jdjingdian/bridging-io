@@ -51,7 +51,7 @@
       "wrapped_key_locator": "blob://vault/wrap/wrap-000001.vrk.bin",
       "wrapped_key_digest": "7037017c6bcbcd6c",
       "created_at_unix_sec": 1775129077,
-      "last_verified_at_unix_sec": 1775136724,
+      "last_verified_at_unix_sec": 1775140754,
       "status": "Degraded"
     }
   ],

@@ -2,7 +2,7 @@
 name = "bridgingio-desktop-host"
 edition = "2021"
 license = "MIT"
-version = "0.1.0"
+version = { workspace = true }
 
 [dependencies]
 bridgingio-app-api = { path = "../bridgingio-app-api" }

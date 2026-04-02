@@ -4,6 +4,7 @@ schema_version = 1
 instance_name = "bridgingio-local"
 data_dir = "auto"
 log_level = "info"
+operator_locale = "en-US"
 
 [storage]
 metadata_backend = "sqlite"

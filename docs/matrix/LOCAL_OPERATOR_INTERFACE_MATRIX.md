@@ -12,7 +12,10 @@ surfaces:
 
 | Surface | Command / Interface | Callers | Input | Output | Status / Error Highlights | Apply Strategy |
 | --- | --- | --- | --- | --- | --- | --- |
+| Config | `core.operator_locale` (`managed-core.toml` / standalone config) | local operator, `bridgingio-core` | `en-US` or `zh-CN` | core-owned CLI/TUI locale selection | strict enum validation; unsupported locale is rejected | persisted by `menuconfig` save; runtime applies on restart |
 | CLI | `bridgingio-core menuconfig [--config <path>]` | local operator, future UI tooling | optional config path | interactive TUI session, saved config path | display-safe diagnostics only, no secret plaintext display | save returns equivalent restart hint when config changed |
+| CLI | `bridgingio-core --help` / `bridgingio-core help` | local operator, docs tooling | optional `--config <path>` for locale source | localized help with grouped sections (`Usage` / `Commands` / `Options` / `Notes`) | locale falls back to `en-US`; non-TTY output remains plain text without ANSI escapes | none |
+| CLI | `bridgingio-core --version` / `-V` | local operator, automation | none | core version string from workspace Cargo truth | format validated as `YYMM.DD.BuildNumber` with Cargo semver constraints | none |
 | CLI | `bridgingio-core run [--config <path>]` | local operator | optional config path | foreground runtime process | startup lifecycle errors use shared error/status contract | N/A |
 | CLI | `bridgingio-core -d [--config <path>]` | local operator, launcher | optional config path, one-shot startup carrier if needed | detached runtime process | detached mode overrides vault trigger to `on-core-start`; startup remains fail-closed | N/A |
 | CLI | `bridgingio-core vault init` | local operator | config path | display-safe initialization summary | validation/dependency errors are structured and display-safe | live action |
@@ -33,6 +36,11 @@ surfaces:
 
 - Every new trusted local command, event, or settings mutation path must update
   this matrix.
+- `core.operator_locale` is a core-owned operator surface setting only. Future
+  UI implementations must not treat it as UI locale source of truth.
+- Core version truth is `source/rust/Cargo.toml` `[workspace.package].version`.
+  CLI/version metadata must stay aligned with it; do not add duplicate version
+  constants in code.
 - `method_not_implemented`, `not_ready`, `restart_required`, and equivalent
   formal states must be captured here instead of only in prose docs.
 - This matrix must stay aligned with the shared error/status contract and the

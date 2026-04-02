@@ -55,6 +55,12 @@ cd source/rust
 cargo test -p bridgingio-mcp --bin bridgingio-core
 ```
 
+Operator-facing hardcoded display literal guard:
+
+```bash
+scripts/testing/check-core-operator-i18n-literals.sh
+```
+
 Tauri shell host smoke verification:
 
 ```bash
@@ -80,6 +86,7 @@ The script emits a JSONL execution record under `tmp/` and includes:
 - retries/jitter observation fields for flaky tracking
 - command-level trace for manual/CI parity
 - architecture and build-profile fields for matrix reporting
+- operator-facing i18n literal guard suite status
 
 Additional matrix truth sources:
 

@@ -17,6 +17,7 @@ use bridgingio_domain::{
     RuntimeRecoveryAction, SessionReusePolicy, SharedError, StartupUnlockCarrierKind, TargetKind,
 };
 use bridgingio_engine::{
+    i18n::{Catalog, OPERATOR_LOCALE_EN_US},
     ConfigError, CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile,
     StandaloneTerminalSection, TerminalProviderSection,
 };
@@ -151,7 +152,23 @@ struct RuntimeBootstrapOutcome {
 }
 
 fn main() {
-    let args = match parse_args() {
+    let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    let catalog = catalog_for_cli_args(&raw_args);
+    if let Err(reason) = validate_core_version_format(core_version()) {
+        emit_cli_shared_error(
+            SharedError::new(
+                ContractStatus::Failed,
+                ErrorDomain::RuntimeLifecycle,
+                CommonErrorCode::ValidationFailed,
+                format!("invalid core version format `{}`: {reason}", core_version()),
+            )
+            .with_module_code("standalone_cli.invalid_core_version")
+            .with_recovery_hint("set source/rust/Cargo.toml version to YYMM.DD.BuildNumber"),
+        );
+        std::process::exit(2);
+    }
+
+    let args = match parse_args_from(raw_args.clone()) {
         Ok(args) => args,
         Err(message) => {
             emit_cli_shared_error(
@@ -164,7 +181,7 @@ fn main() {
                 .with_module_code("standalone_cli.argument_error")
                 .with_recovery_hint("review command usage and retry"),
             );
-            print_usage();
+            print_usage(&catalog);
             std::process::exit(2);
         }
     };
@@ -1664,17 +1681,14 @@ fn default_toolchain_resolver(settings: &CoreSettings, config_path: &Path) -> To
     ToolchainResolver::new(ExecutableResolver::from_system_path(), bundled_root, specs)
 }
 
-fn parse_args() -> Result<CliArgs, String> {
-    parse_args_from(env::args().skip(1))
-}
-
 fn parse_args_from<I>(args: I) -> Result<CliArgs, String>
 where
     I: IntoIterator<Item = String>,
 {
     let args = args.into_iter().collect::<Vec<_>>();
+    let catalog = catalog_for_cli_args(&args);
     reject_plaintext_secret_argv(&args)?;
-    if let Some(management) = parse_management_cli_args(&args)? {
+    if let Some(management) = parse_management_cli_args(&args, &catalog)? {
         return Ok(management);
     }
 
@@ -1711,7 +1725,11 @@ where
                 control_plane_socket_override = Some(PathBuf::from(path));
             }
             "--help" | "-h" => {
-                print_usage();
+                print_usage(&catalog);
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                print_version();
                 std::process::exit(0);
             }
             _ => {
@@ -1769,18 +1787,18 @@ where
     })
 }
 
-fn parse_management_cli_args(args: &[String]) -> Result<Option<CliArgs>, String> {
+fn parse_management_cli_args(args: &[String], catalog: &Catalog) -> Result<Option<CliArgs>, String> {
     let Some(route) = args.first().map(String::as_str) else {
         return Ok(None);
     };
     match route {
-        "vault" => parse_vault_management_cli(args).map(Some),
-        "auth" => parse_auth_management_cli(args).map(Some),
+        "vault" => parse_vault_management_cli(args, catalog).map(Some),
+        "auth" => parse_auth_management_cli(args, catalog).map(Some),
         _ => Ok(None),
     }
 }
 
-fn parse_vault_management_cli(args: &[String]) -> Result<CliArgs, String> {
+fn parse_vault_management_cli(args: &[String], catalog: &Catalog) -> Result<CliArgs, String> {
     let subcommand = args
         .get(1)
         .map(String::as_str)
@@ -1838,7 +1856,11 @@ fn parse_vault_management_cli(args: &[String]) -> Result<CliArgs, String> {
             }
             "--from-tty-prompt" => input.from_tty_prompt = true,
             "--help" | "-h" => {
-                print_usage();
+                print_usage(catalog);
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                print_version();
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown argument for vault {subcommand}: {arg}")),
@@ -1894,7 +1916,7 @@ fn parse_vault_management_cli(args: &[String]) -> Result<CliArgs, String> {
     })
 }
 
-fn parse_auth_management_cli(args: &[String]) -> Result<CliArgs, String> {
+fn parse_auth_management_cli(args: &[String], catalog: &Catalog) -> Result<CliArgs, String> {
     let route = args
         .get(1)
         .map(String::as_str)
@@ -1951,7 +1973,11 @@ fn parse_auth_management_cli(args: &[String]) -> Result<CliArgs, String> {
                 reason = Some(value.to_string());
             }
             "--help" | "-h" => {
-                print_usage();
+                print_usage(catalog);
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                print_version();
                 std::process::exit(0);
             }
             _ => {
@@ -2247,20 +2273,146 @@ fn reject_plaintext_secret_argv(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn print_usage() {
-    eprintln!("usage:");
-    eprintln!("  bridgingio-core --self-test");
-    eprintln!("  bridgingio-core menuconfig [--config <path-to-config.toml>]");
-    eprintln!("  bridgingio-core run [--config <path-to-standalone.toml>]");
-    eprintln!("  bridgingio-core -d [--config <path-to-standalone.toml>]");
-    eprintln!("  bridgingio-core ui-managed-ephemeral --runtime-root <runtime-root-dir>");
-    eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-managed-core.toml>");
-    eprintln!("  bridgingio-core vault init --config <path-to-standalone.toml>");
-    eprintln!("  bridgingio-core vault import --config <path> --reference <vault://...> [--label <label>] [--from-fd N|--from-stdin|--from-file <path>|--from-tty-prompt]");
-    eprintln!("  bridgingio-core vault unlock --config <path> [--method os-native|passphrase] [--from-fd N|--from-stdin|--from-file <path>|--from-tty-prompt]");
-    eprintln!("  bridgingio-core auth token create --config <path> --label <name> [--expires-in-seconds <u64>]");
-    eprintln!("  bridgingio-core auth token revoke --config <path> --token-id <token-id> [--reason <reason>]");
-    eprintln!("  debug/testing escape hatch: --control-plane-socket-override <path-or-endpoint>");
+fn print_usage(catalog: &Catalog) {
+    eprintln!("{}", build_usage_text(catalog, io::stderr().is_terminal()));
+}
+
+fn build_usage_text(catalog: &Catalog, use_style: bool) -> String {
+    let heading = |key: &str| -> String {
+        let label = format!("{}:", catalog.t(key));
+        if use_style {
+            format!("\u{1b}[1m{label}\u{1b}[0m")
+        } else {
+            label
+        }
+    };
+
+    let mut lines = Vec::<String>::new();
+    lines.push(format!("bridgingio-core {}", catalog.t("app.about")));
+    lines.push(String::new());
+    lines.push(heading("cli.help.title.usage"));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.self_test")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.menuconfig")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.run")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.detached")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.ui_managed")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.ui_managed_config")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.vault_init")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.vault_import")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.vault_unlock")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.auth_create")));
+    lines.push(format!("  {}", catalog.t("cli.help.usage.auth_revoke")));
+    lines.push(String::new());
+    lines.push(heading("cli.help.title.commands"));
+    let commands = [
+        ("--self-test", "cli.help.command.self_test"),
+        ("menuconfig", "cli.help.command.menuconfig"),
+        ("run", "cli.help.command.run"),
+        ("-d", "cli.help.command.detached"),
+        ("ui-managed-ephemeral", "cli.help.command.ui_managed"),
+        ("vault ...", "cli.help.command.vault"),
+        ("auth ...", "cli.help.command.auth"),
+    ];
+    for (name, desc_key) in commands {
+        lines.push(format!("  {:<20} {}", name, catalog.t(desc_key)));
+    }
+    lines.push(String::new());
+    lines.push(heading("cli.help.title.options"));
+    let options = [
+        ("-h, --help", "cli.help.option.help"),
+        ("-V, --version", "cli.help.option.version"),
+        ("--config <path>", "cli.help.option.config"),
+        ("--runtime-root <dir>", "cli.help.option.runtime_root"),
+        (
+            "--control-plane-socket-override <path-or-endpoint>",
+            "cli.help.option.control_plane_override",
+        ),
+    ];
+    for (name, desc_key) in options {
+        lines.push(format!("  {:<48} {}", name, catalog.t(desc_key)));
+    }
+    lines.push(String::new());
+    lines.push(heading("cli.help.title.notes"));
+    lines.push(format!("  {}", catalog.t("cli.help.note.locale")));
+    lines.join("\n")
+}
+
+fn print_version() {
+    println!("{}", core_version());
+}
+
+fn core_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn validate_core_version_format(version: &str) -> Result<(), String> {
+    let Some((ym, rest)) = version.split_once('.') else {
+        return Err("must contain two dots".to_string());
+    };
+    let Some((dd, build)) = rest.split_once('.') else {
+        return Err("must contain two dots".to_string());
+    };
+    if ym.len() != 4 || !ym.chars().all(|c| c.is_ascii_digit()) {
+        return Err("YYMM segment must be 4 digits".to_string());
+    }
+    if ym.starts_with('0') {
+        return Err("YYMM segment cannot start with 0 in Cargo semver".to_string());
+    }
+    if dd.is_empty() || dd.len() > 2 || !dd.chars().all(|c| c.is_ascii_digit()) {
+        return Err("DD segment must be 1-2 digits (Cargo semver disallows leading zero)".to_string());
+    }
+    if dd.len() > 1 && dd.starts_with('0') {
+        return Err("DD segment cannot have a leading zero in Cargo semver".to_string());
+    }
+    if build.is_empty() || !build.chars().all(|c| c.is_ascii_digit()) {
+        return Err("BuildNumber segment must be numeric".to_string());
+    }
+    if build.len() > 1 && build.starts_with('0') {
+        return Err("BuildNumber segment cannot have a leading zero in Cargo semver".to_string());
+    }
+    Ok(())
+}
+
+fn catalog_for_cli_args(args: &[String]) -> Catalog {
+    if let Some(config_path) = extract_config_path(args) {
+        if config_path.exists() {
+            if let Ok(settings) = CoreSettings::load_from_file(&config_path) {
+                if let Ok(catalog) = Catalog::load(&settings.core.operator_locale) {
+                    return catalog;
+                }
+            }
+        }
+    }
+
+    if let Some(default_path) = default_standalone_config_path_if_exists() {
+        if let Ok(settings) = CoreSettings::load_from_file(&default_path) {
+            if let Ok(catalog) = Catalog::load(&settings.core.operator_locale) {
+                return catalog;
+            }
+        }
+    }
+
+    Catalog::load(OPERATOR_LOCALE_EN_US).expect("load default en-US catalog")
+}
+
+fn extract_config_path(args: &[String]) -> Option<PathBuf> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--config" {
+            return iter.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+fn default_standalone_config_path_if_exists() -> Option<PathBuf> {
+    let runtime_root = default_standalone_runtime_root().ok()?;
+    let path = runtime_root.join("config").join("managed-core.toml");
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn resolve_config_path(args: &CliArgs) -> Result<PathBuf, String> {
@@ -2464,6 +2616,7 @@ fn default_managed_core_config(
 instance_name = "bridgingio-ui-managed"
 data_dir = "{data_dir}"
 log_level = "info"
+operator_locale = "en-US"
 
 [storage]
 metadata_backend = "sqlite"
@@ -2518,6 +2671,7 @@ fn default_standalone_core_config(
 instance_name = "bridgingio-standalone"
 data_dir = "{data_dir}"
 log_level = "info"
+operator_locale = "en-US"
 
 [storage]
 metadata_backend = "sqlite"
@@ -2610,7 +2764,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use bridgingio_engine::CoreSettings;
+    use bridgingio_engine::{
+        i18n::{Catalog, OPERATOR_LOCALE_EN_US, OPERATOR_LOCALE_ZH_CN},
+        CoreSettings,
+    };
 
     use super::{parse_args_from, CliArgs, LaunchMode, ManagementCommand, SecretInputRoute};
     use bridgingio_mcp::CoreHostMode;
@@ -2902,5 +3059,27 @@ mod tests {
         assert!(err.contains("bind"));
         drop(occupied);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validates_core_version_format_contract() {
+        assert!(super::validate_core_version_format("2604.2.1").is_ok());
+        assert!(super::validate_core_version_format("26.02.1").is_err());
+        assert!(super::validate_core_version_format("2604.02.1").is_err());
+        assert!(super::validate_core_version_format("2604.123.1").is_err());
+        assert!(super::validate_core_version_format("2604.02.a").is_err());
+        assert!(super::validate_core_version_format(super::core_version()).is_ok());
+    }
+
+    #[test]
+    fn help_text_uses_catalog_locale() {
+        let zh = Catalog::load(OPERATOR_LOCALE_ZH_CN).expect("zh catalog");
+        let en = Catalog::load(OPERATOR_LOCALE_EN_US).expect("en catalog");
+        let zh_help = super::build_usage_text(&zh, false);
+        let en_help = super::build_usage_text(&en, false);
+        assert!(zh_help.contains("用法:"));
+        assert!(en_help.contains("Usage:"));
+        assert!(zh_help.contains("打印 core 版本"));
+        assert!(en_help.contains("Print core version"));
     }
 }

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use bridgingio_domain::TargetKind;
 use bridgingio_engine::{
+    i18n::Catalog,
     CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile, StandaloneTerminalSection,
     TerminalProviderSection,
 };
@@ -53,17 +54,17 @@ enum Screen {
 }
 
 impl Screen {
-    fn title(self) -> &'static str {
+    fn title(self, catalog: &Catalog) -> String {
         match self {
-            Screen::Root => "Main Menu",
-            Screen::Core => "Core",
-            Screen::Storage => "Storage",
-            Screen::ModelPlane => "Model Plane",
-            Screen::Vault => "Vault",
-            Screen::Targets => "Targets",
-            Screen::Security => "Security",
-            Screen::TargetEditor(_) => "Target",
-            Screen::SearchResults => "Search Results",
+            Screen::Root => catalog.t("menu.root.title"),
+            Screen::Core => catalog.t("menu.core.title"),
+            Screen::Storage => catalog.t("menu.storage.title"),
+            Screen::ModelPlane => catalog.t("menu.model_plane.title"),
+            Screen::Vault => catalog.t("menu.vault.title"),
+            Screen::Targets => catalog.t("menu.targets.title"),
+            Screen::Security => catalog.t("menu.security.title"),
+            Screen::TargetEditor(_) => catalog.t("menu.target.title"),
+            Screen::SearchResults => catalog.t("menu.search_results.title"),
         }
     }
 }
@@ -115,11 +116,11 @@ impl FooterButton {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(self, catalog: &Catalog) -> String {
         match self {
-            FooterButton::Select => "<Select>",
-            FooterButton::Exit => "< Exit >",
-            FooterButton::Help => "< Help >",
+            FooterButton::Select => catalog.t("menu.footer.select"),
+            FooterButton::Exit => catalog.t("menu.footer.exit"),
+            FooterButton::Help => catalog.t("menu.footer.help"),
         }
     }
 }
@@ -127,6 +128,7 @@ impl FooterButton {
 pub struct MenuConfigApp {
     config_path: PathBuf,
     settings: CoreSettings,
+    catalog: Catalog,
     vault_router: SecretVaultRouter,
     security_summary: SecuritySummary,
     screen: Screen,
@@ -155,11 +157,19 @@ impl MenuConfigApp {
         let config_path = config_path.into();
         let settings = CoreSettings::load_from_file(&config_path)
             .map_err(|err| format!("load menuconfig settings failed: {err:?}"))?;
+        let catalog = Catalog::load(&settings.core.operator_locale).map_err(|err| {
+            format!(
+                "load menuconfig catalog failed (locale={}): {err}",
+                settings.core.operator_locale
+            )
+        })?;
+        let initial_status = catalog.t("menu.status.initial");
         let mut vault_router = load_vault_router(&settings);
         let security_summary = build_security_summary(&settings, &mut vault_router);
         Ok(Self {
             config_path,
             settings,
+            catalog,
             vault_router,
             security_summary,
             screen: Screen::Root,
@@ -179,10 +189,17 @@ impl MenuConfigApp {
             show_help: false,
             exit_confirm_mode: false,
             exit_confirm_selected: 0,
-            last_status: "Use Up/Down to pick item, Left/Right to pick <Select>/<Exit>/<Help>, Enter confirms."
-                .into(),
+            last_status: initial_status,
             last_apply_strategy: None,
         })
+    }
+
+    fn t(&self, key: &str) -> String {
+        self.catalog.t(key)
+    }
+
+    fn tf(&self, key: &str, vars: &[(&str, &str)]) -> String {
+        self.catalog.tf(key, vars)
     }
 
     pub fn run(&mut self) -> Result<MenuConfigOutcome, String> {
@@ -231,7 +248,7 @@ impl MenuConfigApp {
                 KeyCode::Esc => {
                     if self.show_help {
                         self.show_help = false;
-                        self.last_status = "Help closed.".into();
+                        self.last_status = self.t("menu.status.help_closed");
                     } else if let Some(outcome) = self.request_exit_or_back()? {
                         return Ok(outcome);
                     }
@@ -243,8 +260,7 @@ impl MenuConfigApp {
                 KeyCode::Char('/') => {
                     self.search_mode = true;
                     self.search_input.clear();
-                    self.last_status =
-                        "Search: type a field, target, or menu label and press Enter.".into();
+                    self.last_status = self.t("menu.status.search_prompt");
                 }
                 KeyCode::Char('?') | KeyCode::F(1) => self.show_help = !self.show_help,
                 KeyCode::Char('u') => self.unlock_vault_shortcut()?,
@@ -267,7 +283,7 @@ impl MenuConfigApp {
     fn handle_edit_key(&mut self, code: KeyCode) -> Result<(), String> {
         match self.edit_mode_kind {
             EditModeKind::Text => match code {
-                KeyCode::Esc => self.cancel_edit("Edit cancelled."),
+                KeyCode::Esc => self.cancel_edit("menu.status.edit_cancelled"),
                 KeyCode::Enter => self.commit_edit()?,
                 KeyCode::Left => self.move_text_cursor(-1),
                 KeyCode::Right => self.move_text_cursor(1),
@@ -276,7 +292,7 @@ impl MenuConfigApp {
                 _ => {}
             },
             EditModeKind::Choice => match code {
-                KeyCode::Esc => self.cancel_edit("Selection cancelled."),
+                KeyCode::Esc => self.cancel_edit("menu.status.select_cancelled"),
                 KeyCode::Down | KeyCode::Char('j') => self.move_edit_option(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_edit_option(-1),
                 KeyCode::Enter | KeyCode::Char(' ') => self.commit_edit()?,
@@ -291,7 +307,7 @@ impl MenuConfigApp {
             KeyCode::Esc => {
                 self.search_mode = false;
                 self.search_input.clear();
-                self.last_status = "Search cancelled.".into();
+                self.last_status = self.t("menu.status.search_cancelled");
             }
             KeyCode::Enter => {
                 self.search_mode = false;
@@ -299,9 +315,9 @@ impl MenuConfigApp {
                 self.screen = Screen::SearchResults;
                 self.selected = 0;
                 self.last_status = if self.search_input.trim().is_empty() {
-                    "Search query is empty.".into()
+                    self.t("menu.status.search_empty")
                 } else {
-                    format!("Search results for `{}`", self.search_input)
+                    self.tf("menu.status.search_results", &[("query", self.search_input.as_str())])
                 };
             }
             KeyCode::Backspace => {
@@ -321,7 +337,8 @@ impl MenuConfigApp {
                 self.push_navigation_state();
                 self.screen = screen;
                 self.selected = 0;
-                self.last_status = format!("Opened {}.", screen.title());
+                let screen_title = screen.title(&self.catalog);
+                self.last_status = self.tf("menu.status.opened_screen", &[("screen", &screen_title)]);
             }
             MenuEntryKind::EditField(field) => {
                 self.begin_edit(field)?;
@@ -330,7 +347,7 @@ impl MenuConfigApp {
                 self.push_navigation_state();
                 self.screen = screen;
                 self.select_field(&field);
-                self.last_status = format!("Focused `{field}`.");
+                self.last_status = self.tf("menu.status.focused_field", &[("field", &field)]);
             }
             MenuEntryKind::Action(action) => self.run_action(action)?,
             MenuEntryKind::Info => {
@@ -342,7 +359,7 @@ impl MenuConfigApp {
 
     fn begin_edit(&mut self, field: String) -> Result<(), String> {
         let Some(value) = field_value(&self.settings, &field) else {
-            self.last_status = format!("`{field}` is read-only in menuconfig.");
+            self.last_status = self.tf("menu.status.read_only", &[("field", &field)]);
             return Ok(());
         };
         self.edit_mode = true;
@@ -367,15 +384,14 @@ impl MenuConfigApp {
                 .cloned()
                 .unwrap_or_else(|| value.clone());
             self.edit_cursor = 0;
-            self.last_status =
-                format!("Selecting `{field}`. Up/Down move, Space or Enter selects, Esc cancels.");
+            self.last_status = self.tf("menu.status.selecting", &[("field", &field)]);
         } else {
             self.edit_mode_kind = EditModeKind::Text;
             self.edit_input = value;
             self.edit_cursor = self.edit_input.chars().count();
             self.edit_options.clear();
             self.edit_option_selected = 0;
-            self.last_status = format!("Editing `{field}`. Enter saves, Esc cancels.");
+            self.last_status = self.tf("menu.status.editing", &[("field", &field)]);
         }
         Ok(())
     }
@@ -390,11 +406,11 @@ impl MenuConfigApp {
                 .edit_options
                 .get(self.edit_option_selected)
                 .cloned()
-                .ok_or_else(|| "no available option for selected field".to_string())?,
+                .ok_or_else(|| self.t("menu.error.no_available_option"))?,
         };
         self.apply_edit_value(&field, &value)?;
         self.reset_edit_state();
-        self.last_status = format!("Updated `{field}`.");
+        self.last_status = self.tf("menu.status.updated", &[("field", &field)]);
         Ok(())
     }
 
@@ -402,8 +418,14 @@ impl MenuConfigApp {
         let mut next = self.settings.clone();
         apply_field_edit(&mut next, field, value)?;
         next.validate()
-            .map_err(|err| format!("validate edited settings failed: {err:?}"))?;
+            .map_err(|err| self.tf("menu.error.validate_edited", &[("error", &format!("{err:?}"))]))?;
         self.settings = next;
+        self.catalog = Catalog::load(&self.settings.core.operator_locale).map_err(|err| {
+            format!(
+                "reload menuconfig catalog failed (locale={}): {err}",
+                self.settings.core.operator_locale
+            )
+        })?;
         if !self.dirty_paths.contains(&field.to_string()) {
             self.dirty_paths.push(field.to_string());
         }
@@ -421,9 +443,9 @@ impl MenuConfigApp {
         self.edit_option_selected = 0;
     }
 
-    fn cancel_edit(&mut self, status: &str) {
+    fn cancel_edit(&mut self, status_key: &str) {
         self.reset_edit_state();
-        self.last_status = status.into();
+        self.last_status = self.t(status_key);
     }
 
     fn move_edit_option(&mut self, delta: isize) {
@@ -469,10 +491,11 @@ impl MenuConfigApp {
                 let parsed = current
                     .trim()
                     .parse::<bool>()
-                    .map_err(|_| format!("`{field}` cannot be toggled as bool"))?;
+                    .map_err(|_| self.tf("menu.error.bool_toggle", &[("field", &field)]))?;
                 let toggled = (!parsed).to_string();
                 self.apply_edit_value(&field, &toggled)?;
-                self.last_status = format!("Toggled `{field}` to {toggled}.");
+                self.last_status =
+                    self.tf("menu.status.toggle", &[("field", &field), ("value", &toggled)]);
             } else if field_options(&field).is_some() {
                 self.begin_edit(field)?;
             }
@@ -483,33 +506,36 @@ impl MenuConfigApp {
     fn save(&mut self) -> Result<(), String> {
         self.settings
             .validate()
-            .map_err(|err| format!("validate settings failed: {err:?}"))?;
+            .map_err(|err| self.tf("menu.error.validate_settings", &[("error", &format!("{err:?}"))]))?;
         if let Some(parent) = self.config_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
-                format!(
-                    "create config parent dir failed ({}): {err}",
-                    parent.display()
+                self.tf(
+                    "menu.error.create_config_parent",
+                    &[("path", &parent.display().to_string()), ("error", &err.to_string())],
                 )
             })?;
         }
         fs::write(&self.config_path, self.settings.to_toml_string()).map_err(|err| {
-            format!(
-                "persist menuconfig failed ({}): {err}",
-                self.config_path.display()
+            self.tf(
+                "menu.error.persist_menuconfig",
+                &[
+                    ("path", &self.config_path.display().to_string()),
+                    ("error", &err.to_string()),
+                ],
             )
         })?;
         self.last_apply_strategy = Some("restart_required".into());
         self.dirty_paths.clear();
-        self.last_status = format!(
-            "Saved {}. Apply strategy: restart_required.",
-            self.config_path.display()
+        self.last_status = self.tf(
+            "menu.status.saved",
+            &[("path", &self.config_path.display().to_string())],
         );
         Ok(())
     }
 
     fn unlock_vault_shortcut(&mut self) -> Result<(), String> {
         if self.security_summary.lock_state == "unlocked" {
-            self.last_status = "Vault is already unlocked.".into();
+            self.last_status = self.t("menu.status.vault_already_unlocked");
             return Ok(());
         }
 
@@ -521,32 +547,38 @@ impl MenuConfigApp {
                     Ok(()) => {
                         self.security_summary =
                             build_security_summary(&self.settings, &mut self.vault_router);
-                        self.last_status = "Vault unlocked with os-native.".into();
+                        self.last_status = self.t("menu.status.vault_unlocked_os_native");
                         return Ok(());
                     }
                     Err(err) => last_error = Some(format!("{err:?}")),
                 },
                 "passphrase" => {
-                    let passphrase = rpassword::prompt_password("Enter vault passphrase: ")
-                        .map_err(|err| format!("read vault passphrase failed: {err}"))?;
+                    let passphrase = rpassword::prompt_password(&self.t("menu.prompt.passphrase")).map_err(
+                        |err| self.tf("menu.error.read_passphrase", &[("error", &err.to_string())]),
+                    )?;
                     match self.vault_router.unlock_with_passphrase(&passphrase) {
                         Ok(()) => {
                             self.security_summary =
                                 build_security_summary(&self.settings, &mut self.vault_router);
-                            self.last_status = "Vault unlocked with passphrase.".into();
+                            self.last_status = self.t("menu.status.vault_unlocked_passphrase");
                             return Ok(());
                         }
                         Err(err) => last_error = Some(format!("{err:?}")),
                     }
                 }
                 other => {
-                    last_error = Some(format!("unsupported unlock method `{other}`"));
+                    last_error = Some(
+                        self.tf("menu.error.unsupported_unlock_method", &[("method", other)]),
+                    );
                 }
             }
         }
-        self.last_status = format!(
-            "Vault unlock failed. {}",
-            last_error.unwrap_or_else(|| "No allowed unlock method succeeded.".into())
+        self.last_status = self.tf(
+            "menu.status.vault_unlock_failed",
+            &[(
+                "reason",
+                &last_error.unwrap_or_else(|| self.t("menu.error.no_unlock_method_succeeded")),
+            )],
         );
         Ok(())
     }
@@ -559,7 +591,7 @@ impl MenuConfigApp {
                 self.push_navigation_state();
                 self.screen = Screen::TargetEditor(index);
                 self.selected = 0;
-                self.last_status = "Added SSH target. Edit fields before saving.".into();
+                self.last_status = self.t("menu.status.added_ssh_target");
             }
             ActionKind::AddAdbTarget => {
                 let index = self.settings.targets.len();
@@ -567,7 +599,7 @@ impl MenuConfigApp {
                 self.push_navigation_state();
                 self.screen = Screen::TargetEditor(index);
                 self.selected = 0;
-                self.last_status = "Added ADB target. Edit fields before saving.".into();
+                self.last_status = self.t("menu.status.added_adb_target");
             }
             ActionKind::UnlockVault => {
                 self.unlock_vault_shortcut()?;
@@ -580,9 +612,10 @@ impl MenuConfigApp {
         if let Some((screen, selected)) = self.navigation_stack.pop() {
             self.screen = screen;
             self.selected = selected;
-            self.last_status = format!("Returned to {}.", self.screen.title());
+            let screen_title = self.screen.title(&self.catalog);
+            self.last_status = self.tf("menu.status.returned", &[("screen", &screen_title)]);
         } else {
-            self.last_status = "Already at top menu.".into();
+            self.last_status = self.t("menu.status.already_top");
         }
     }
 
@@ -593,10 +626,8 @@ impl MenuConfigApp {
     fn move_footer_selection(&mut self, delta: isize) {
         let next = self.footer_selected as isize + delta;
         self.footer_selected = next.clamp(0, 2) as usize;
-        self.last_status = format!(
-            "Button selected: {}",
-            FooterButton::from_index(self.footer_selected).label()
-        );
+        let button_label = FooterButton::from_index(self.footer_selected).label(&self.catalog);
+        self.last_status = self.tf("menu.status.button_selected", &[("button", &button_label)]);
     }
 
     fn activate_footer_button(&mut self) -> Result<Option<MenuConfigOutcome>, String> {
@@ -609,9 +640,9 @@ impl MenuConfigApp {
             FooterButton::Help => {
                 self.show_help = !self.show_help;
                 self.last_status = if self.show_help {
-                    "Help opened.".into()
+                    self.t("menu.status.help_opened")
                 } else {
-                    "Help closed.".into()
+                    self.t("menu.status.help_closed")
                 };
                 Ok(None)
             }
@@ -637,7 +668,7 @@ impl MenuConfigApp {
     fn begin_exit_confirm(&mut self) {
         self.exit_confirm_mode = true;
         self.exit_confirm_selected = 0;
-        self.last_status = "Unsaved changes detected. Choose whether to save before exit.".into();
+        self.last_status = self.t("menu.status.unsaved_confirm");
     }
 
     fn handle_exit_confirm_key(
@@ -655,7 +686,7 @@ impl MenuConfigApp {
             }
             KeyCode::Esc => {
                 self.exit_confirm_mode = false;
-                self.last_status = "Exit cancelled.".into();
+                self.last_status = self.t("menu.status.exit_cancelled");
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.exit_confirm_mode = false;
@@ -676,7 +707,7 @@ impl MenuConfigApp {
                         }));
                     }
                     _ => {
-                        self.last_status = "Exit cancelled.".into();
+                        self.last_status = self.t("menu.status.exit_cancelled");
                     }
                 }
             }
@@ -707,15 +738,15 @@ impl MenuConfigApp {
 
     fn entries(&self) -> Vec<MenuEntry> {
         match self.screen {
-            Screen::Root => root_entries(),
-            Screen::Core => core_entries(&self.settings),
-            Screen::Storage => storage_entries(&self.settings),
-            Screen::ModelPlane => model_plane_entries(&self.settings),
-            Screen::Vault => vault_entries(&self.settings),
-            Screen::Targets => targets_entries(&self.settings),
-            Screen::Security => security_entries(&self.security_summary),
-            Screen::TargetEditor(index) => target_editor_entries(&self.settings, index),
-            Screen::SearchResults => search_entries(&self.settings, &self.search_input),
+            Screen::Root => root_entries(&self.catalog),
+            Screen::Core => core_entries(&self.settings, &self.catalog),
+            Screen::Storage => storage_entries(&self.settings, &self.catalog),
+            Screen::ModelPlane => model_plane_entries(&self.settings, &self.catalog),
+            Screen::Vault => vault_entries(&self.settings, &self.catalog),
+            Screen::Targets => targets_entries(&self.settings, &self.catalog),
+            Screen::Security => security_entries(&self.security_summary, &self.catalog),
+            Screen::TargetEditor(index) => target_editor_entries(&self.settings, index, &self.catalog),
+            Screen::SearchResults => search_entries(&self.settings, &self.search_input, &self.catalog),
         }
     }
 }
@@ -758,7 +789,7 @@ fn render(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     render_footer(frame, layout[1], app);
 
     if app.show_help {
-        render_help(frame);
+        render_help(frame, app);
     }
     if app.edit_mode {
         render_edit_popup(frame, app);
@@ -776,10 +807,15 @@ fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp)
         .map(|(index, entry)| format_menu_entry_line(app, index, entry))
         .collect::<Vec<_>>();
 
-    let title = format!(
-        "BridgingIO Menuconfig / {}{}",
-        app.screen.title(),
-        if app.is_dirty() { " [*]" } else { "" }
+    let dirty_suffix = if app.is_dirty() {
+        app.t("menu.render.dirty_suffix")
+    } else {
+        String::new()
+    };
+    let screen_title = app.screen.title(&app.catalog);
+    let title = app.tf(
+        "menu.render.title",
+        &[("screen", &screen_title), ("dirty", &dirty_suffix)],
     );
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area);
@@ -810,7 +846,7 @@ fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp)
     let list = List::new(items);
     frame.render_widget(list, chunks[0]);
     if chunks.len() > 1 {
-        let buttons = Paragraph::new(render_footer_buttons_line(app.footer_selected))
+        let buttons = Paragraph::new(render_footer_buttons_line(app.footer_selected, &app.catalog))
             .alignment(Alignment::Center);
         frame.render_widget(buttons, chunks[1]);
     }
@@ -822,68 +858,88 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
         .get(app.selected)
         .map(|entry| entry.description.clone())
         .unwrap_or_else(|| app.last_status.clone());
+    let screen_title = app.screen.title(&app.catalog);
+    let search_value = if app.search_input.is_empty() {
+        app.t("menu.render.no_search")
+    } else {
+        app.search_input.clone()
+    };
     let footer = Paragraph::new(vec![
-        Line::from(format!(
-            "path={} dirty={} lock_state={} search={}",
-            app.screen.title(),
-            app.is_dirty(),
-            app.security_summary.lock_state,
-            if app.search_input.is_empty() {
-                "<none>".to_string()
-            } else {
-                app.search_input.clone()
-            }
+        Line::from(app.tf(
+            "menu.render.path",
+            &[
+                ("path", &screen_title),
+                ("dirty", &app.is_dirty().to_string()),
+                ("lock_state", &app.security_summary.lock_state),
+                ("search", &search_value),
+            ],
         )),
-        Line::from(format!("*** {} ****", selected_description)),
+        Line::from(app.tf("menu.render.description", &[("description", &selected_description)])),
         Line::from(if app.edit_mode {
             match app.edit_mode_kind {
-                EditModeKind::Text => format!("edit> {}", app.edit_input),
-                EditModeKind::Choice => format!(
-                    "select> {}",
-                    app.edit_options
-                        .get(app.edit_option_selected)
-                        .cloned()
-                        .unwrap_or_default()
+                EditModeKind::Text => app.tf("menu.render.edit", &[("value", &app.edit_input)]),
+                EditModeKind::Choice => app.tf(
+                    "menu.render.select",
+                    &[(
+                        "value",
+                        &app.edit_options
+                            .get(app.edit_option_selected)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )],
                 ),
             }
         } else if app.exit_confirm_mode {
-            "exit> choose with Left/Right, Enter confirms, Esc cancels".to_string()
+            app.t("menu.render.exit_hint")
         } else if app.search_mode {
-            format!("search> {}", app.search_input)
+            app.tf("menu.render.search", &[("query", &app.search_input)])
         } else {
-            format!(
-                "keys: Up/Down item, Left/Right buttons, Enter confirm, Esc back/exit, Space toggle, / search{}",
-                app.last_apply_strategy
-                    .as_deref()
-                    .map(|value| format!(", apply_strategy={value}"))
-                    .unwrap_or_default()
+            app.tf(
+                "menu.render.keys",
+                &[(
+                    "apply",
+                    &app
+                        .last_apply_strategy
+                        .as_deref()
+                        .map(|value| format!(", apply_strategy={value}"))
+                        .unwrap_or_default(),
+                )],
             )
         }),
     ])
-    .block(Block::default().title("Status").borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(app.t("menu.render.status_block"))
+            .borders(Borders::ALL),
+    )
     .wrap(Wrap { trim: false });
     frame.render_widget(footer, area);
 }
 
-fn render_help(frame: &mut ratatui::Frame) {
+fn render_help(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     let area = centered_rect(70, 45, frame.area());
     frame.render_widget(Clear, area);
+    let catalog = &app.catalog;
     let help = Paragraph::new(vec![
-        Line::from("menuconfig keys"),
+        Line::from(catalog.t("menu.help.h1")),
         Line::from(""),
-        Line::from("Enter: run highlighted footer button"),
-        Line::from("Left/Right: switch <Select> < Exit > < Help >"),
-        Line::from("Esc: back one level, or exit from Main Menu"),
-        Line::from("Space: toggle boolean field or open chooser"),
-        Line::from("Text edit: Left/Right move cursor, Backspace deletes"),
-        Line::from("/: global search"),
-        Line::from("u: unlock vault on demand"),
-        Line::from("s: save config"),
-        Line::from("q: quit"),
+        Line::from(catalog.t("menu.help.l1")),
+        Line::from(catalog.t("menu.help.l2")),
+        Line::from(catalog.t("menu.help.l3")),
+        Line::from(catalog.t("menu.help.l4")),
+        Line::from(catalog.t("menu.help.l5")),
+        Line::from(catalog.t("menu.help.l6")),
+        Line::from(catalog.t("menu.help.l7")),
+        Line::from(catalog.t("menu.help.l8")),
+        Line::from(catalog.t("menu.help.l9")),
         Line::from(""),
-        Line::from("Targets can be added from the Targets menu."),
+        Line::from(catalog.t("menu.help.l10")),
     ])
-    .block(Block::default().title("Help").borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(catalog.t("menu.help.title"))
+            .borders(Borders::ALL),
+    )
     .wrap(Wrap { trim: false });
     frame.render_widget(help, area);
 }
@@ -899,42 +955,42 @@ fn render_exit_confirm(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
         }
     };
     let popup = Paragraph::new(vec![
-        Line::from("Do you wish to save your new configuration?"),
-        Line::from("Press Enter to confirm, Esc to continue menuconfig."),
+        Line::from(app.t("menu.exit.q1")),
+        Line::from(app.t("menu.exit.q2")),
         Line::from(""),
         Line::from(format!(
             "{}   {}   {}",
-            option(0, "Yes"),
-            option(1, "No"),
-            option(2, "Cancel")
+            option(0, &app.t("menu.exit.yes")),
+            option(1, &app.t("menu.exit.no")),
+            option(2, &app.t("menu.exit.cancel"))
         )),
     ])
     .block(
         Block::default()
-            .title("Unsaved Changes")
+            .title(app.t("menu.exit.title"))
             .borders(Borders::ALL),
     )
     .wrap(Wrap { trim: false });
     frame.render_widget(popup, area);
 }
 
-fn render_footer_buttons_line(selected: usize) -> Line<'static> {
+fn render_footer_buttons_line(selected: usize, catalog: &Catalog) -> Line<'static> {
     let mut spans = Vec::new();
     for index in 0..3 {
         if index > 0 {
             spans.push(Span::raw("    "));
         }
-        let base = FooterButton::from_index(index).label();
+        let base = FooterButton::from_index(index).label(&catalog);
         if selected == index {
             spans.push(Span::styled(
-                base.to_string(),
+                base,
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
             ));
         } else {
-            spans.push(Span::raw(base.to_string()));
+            spans.push(Span::raw(base));
         }
     }
     Line::from(spans)
@@ -1004,14 +1060,18 @@ fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
         EditModeKind::Text => {
             let area = centered_rect(70, 28, frame.area());
             frame.render_widget(Clear, area);
-            let input_prefix = "value> ";
+            let input_prefix = app.t("menu.edit.input_prefix");
             let popup = Paragraph::new(vec![
-                Line::from(format!("Field: {field}")),
-                Line::from("Enter saves, Esc cancels."),
+                Line::from(app.tf("menu.edit.field", &[("field", field)])),
+                Line::from(app.t("menu.edit.hint")),
                 Line::from(""),
                 Line::from(format!("{input_prefix}{}", app.edit_input)),
             ])
-            .block(Block::default().title("Edit Value").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(app.t("menu.edit.title"))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false });
             frame.render_widget(popup, area);
 
@@ -1031,10 +1091,14 @@ fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
                 .constraints([Constraint::Length(3), Constraint::Min(4)])
                 .split(area);
             let header = Paragraph::new(vec![
-                Line::from(format!("Select value for: {field}")),
-                Line::from("Use Up/Down and press Space or Enter to confirm."),
+                Line::from(app.tf("menu.choice.field", &[("field", field)])),
+                Line::from(app.t("menu.choice.hint")),
             ])
-            .block(Block::default().title("Select Value").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(app.t("menu.choice.title"))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false });
             frame.render_widget(header, chunks[0]);
 
@@ -1081,161 +1145,171 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn root_entries() -> Vec<MenuEntry> {
+fn root_entries(catalog: &Catalog) -> Vec<MenuEntry> {
     vec![
         nav_entry(
-            "Core",
-            "Core runtime identity and logging settings.",
+            &catalog.t("menu.core.title"),
+            &catalog.t("menu.nav.core.desc"),
             Screen::Core,
         ),
         nav_entry(
-            "Storage",
-            "Artifact backend and storage sizing.",
+            &catalog.t("menu.storage.title"),
+            &catalog.t("menu.nav.storage.desc"),
             Screen::Storage,
         ),
         nav_entry(
-            "Model Plane",
-            "HTTP listener and exposure settings.",
+            &catalog.t("menu.model_plane.title"),
+            &catalog.t("menu.nav.model_plane.desc"),
             Screen::ModelPlane,
         ),
-        nav_entry("Vault", "Vault policy and unlock behavior.", Screen::Vault),
         nav_entry(
-            "Targets",
-            "Configure SSH/ADB targets and add new entries.",
+            &catalog.t("menu.vault.title"),
+            &catalog.t("menu.nav.vault.desc"),
+            Screen::Vault,
+        ),
+        nav_entry(
+            &catalog.t("menu.targets.title"),
+            &catalog.t("menu.nav.targets.desc"),
             Screen::Targets,
         ),
         nav_entry(
-            "Security",
-            "Display-safe vault and token summary.",
+            &catalog.t("menu.security.title"),
+            &catalog.t("menu.nav.security.desc"),
             Screen::Security,
         ),
     ]
 }
 
-fn core_entries(settings: &CoreSettings) -> Vec<MenuEntry> {
+fn core_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
     vec![
         edit_entry(
-            "Instance Name",
+            &catalog.t("menu.core.instance_name"),
             "core.instance_name",
             &settings.core.instance_name,
-            "Core instance identifier used in diagnostics and runtime labels.",
+            &catalog.t("menu.core.instance_name.desc"),
         ),
         info_entry(
-            "Data Dir",
+            &catalog.t("menu.core.data_dir"),
             Some(settings.core.data_dir.clone()),
-            "Canonical runtime root currently used by the config.",
+            &catalog.t("menu.core.data_dir.desc"),
         ),
         edit_entry(
-            "Log Level",
+            &catalog.t("menu.core.log_level"),
             "core.log_level",
             &settings.core.log_level,
-            "Core log level for runtime diagnostics.",
+            &catalog.t("menu.core.log_level.desc"),
+        ),
+        edit_entry(
+            &catalog.t("menu.core.operator_locale"),
+            "core.operator_locale",
+            &settings.core.operator_locale,
+            &catalog.t("menu.core.operator_locale.desc"),
         ),
     ]
 }
 
-fn storage_entries(settings: &CoreSettings) -> Vec<MenuEntry> {
+fn storage_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
     vec![
         edit_entry(
-            "Artifact Backend",
+            &catalog.t("menu.storage.backend"),
             "storage.artifacts.backend",
             &settings.storage.artifacts.backend,
-            "Artifact cache backend. Use memory or filesystem.",
+            &catalog.t("menu.storage.backend.desc"),
         ),
         edit_entry(
-            "Artifact Max Bytes",
+            &catalog.t("menu.storage.max_bytes"),
             "storage.artifacts.max_bytes",
             &settings.storage.artifacts.max_bytes.to_string(),
-            "Maximum artifact cache size in bytes.",
+            &catalog.t("menu.storage.max_bytes.desc"),
         ),
     ]
 }
 
-fn model_plane_entries(settings: &CoreSettings) -> Vec<MenuEntry> {
+fn model_plane_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
     vec![
         edit_entry(
-            "HTTP Host",
+            &catalog.t("menu.model.http_host"),
             "model_plane.http.host",
             &settings.model_plane.http.host,
-            "Model-plane HTTP bind host.",
+            &catalog.t("menu.model.http_host.desc"),
         ),
         edit_entry(
-            "HTTP Port",
+            &catalog.t("menu.model.http_port"),
             "model_plane.http.port",
             &settings.model_plane.http.port.to_string(),
-            "Model-plane HTTP bind port.",
+            &catalog.t("menu.model.http_port.desc"),
         ),
         edit_entry(
-            "Allow Non Loopback",
+            &catalog.t("menu.model.allow_non_loopback"),
             "model_plane.http.allow_non_loopback",
             &settings.model_plane.http.allow_non_loopback.to_string(),
-            "Whether non-loopback exposure is allowed.",
+            &catalog.t("menu.model.allow_non_loopback.desc"),
         ),
     ]
 }
 
-fn vault_entries(settings: &CoreSettings) -> Vec<MenuEntry> {
+fn vault_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
     vec![
         info_entry(
-            "Vault Backend",
+            &catalog.t("menu.vault.backend"),
             Some(settings.vault.backend.clone()),
-            "Canonical vault backend in use.",
+            &catalog.t("menu.vault.backend.desc"),
         ),
         edit_entry(
-            "Unlock Trigger",
+            &catalog.t("menu.vault.trigger"),
             "vault.unlock.trigger_policy",
             &settings.vault.unlock.trigger_policy,
-            "Vault unlock trigger policy. This changes when unlock is required.",
+            &catalog.t("menu.vault.trigger.desc"),
         ),
         info_entry(
-            "Preferred Unlock",
+            &catalog.t("menu.vault.preferred"),
             Some(settings.vault.unlock.preferred_method.clone()),
-            "Preferred local unlock method. Press 'u' to unlock on demand.",
+            &catalog.t("menu.vault.preferred.desc"),
         ),
         info_entry(
-            "Allowed Methods",
+            &catalog.t("menu.vault.allowed"),
             Some(settings.vault.unlock.allowed_methods.join(",")),
-            "Configured local unlock methods.",
+            &catalog.t("menu.vault.allowed.desc"),
         ),
     ]
 }
 
-fn security_entries(summary: &SecuritySummary) -> Vec<MenuEntry> {
+fn security_entries(summary: &SecuritySummary, catalog: &Catalog) -> Vec<MenuEntry> {
     vec![
         info_entry(
-            "Vault Lock State",
+            &catalog.t("menu.security.lock_state"),
             Some(summary.lock_state.clone()),
-            "Current display-safe vault lock state.",
+            &catalog.t("menu.security.lock_state.desc"),
         ),
         info_entry(
-            "Vault Backend",
+            &catalog.t("menu.security.backend"),
             Some(summary.backend.clone()),
-            "Configured vault backend.",
+            &catalog.t("menu.security.backend.desc"),
         ),
         info_entry(
-            "Preferred Unlock",
+            &catalog.t("menu.security.preferred"),
             Some(summary.preferred_method.clone()),
-            "Preferred unlock method from config.",
+            &catalog.t("menu.security.preferred.desc"),
         ),
         info_entry(
-            "Secret Count",
+            &catalog.t("menu.security.secret_count"),
             Some(summary.secret_count.to_string()),
-            "Display-safe number of persisted vault secrets.",
+            &catalog.t("menu.security.secret_count.desc"),
         ),
         info_entry(
-            "Token Count",
+            &catalog.t("menu.security.token_count"),
             Some(summary.token_count.to_string()),
-            "Display-safe number of agent tokens.",
+            &catalog.t("menu.security.token_count.desc"),
         ),
         action_entry(
-            "Unlock Vault",
-            "Unlock the vault on demand without forcing unlock on menuconfig startup.",
+            &catalog.t("menu.security.unlock_action"),
+            &catalog.t("menu.security.unlock_action.desc"),
             ActionKind::UnlockVault,
         ),
     ]
 }
 
-fn targets_entries(settings: &CoreSettings) -> Vec<MenuEntry> {
+fn targets_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
     let mut entries = settings
         .targets
         .iter()
@@ -1244,110 +1318,110 @@ fn targets_entries(settings: &CoreSettings) -> Vec<MenuEntry> {
             label: format!(
                 "{} ({})",
                 target.display_name,
-                target_kind_label(&target.kind)
+                target_kind_label(&target.kind, catalog)
             ),
             value: Some(target.id.clone()),
-            description: "Open target editor.".into(),
+            description: catalog.t("menu.targets.editor_open"),
             dirty_key: None,
             kind: MenuEntryKind::Navigate(Screen::TargetEditor(index)),
         })
         .collect::<Vec<_>>();
     entries.push(action_entry(
-        "Add SSH Target",
-        "Create a new SSH target with editable defaults.",
+        &catalog.t("menu.targets.add_ssh"),
+        &catalog.t("menu.targets.add_ssh.desc"),
         ActionKind::AddSshTarget,
     ));
     entries.push(action_entry(
-        "Add ADB Target",
-        "Create a new ADB target with editable defaults.",
+        &catalog.t("menu.targets.add_adb"),
+        &catalog.t("menu.targets.add_adb.desc"),
         ActionKind::AddAdbTarget,
     ));
     entries
 }
 
-fn target_editor_entries(settings: &CoreSettings, index: usize) -> Vec<MenuEntry> {
+fn target_editor_entries(settings: &CoreSettings, index: usize, catalog: &Catalog) -> Vec<MenuEntry> {
     let Some(target) = settings.targets.get(index) else {
         return vec![info_entry(
-            "Missing Target",
+            &catalog.t("menu.target.missing"),
             None,
-            "Target index is out of range.",
+            &catalog.t("menu.target.missing.desc"),
         )];
     };
     let mut entries = vec![
         edit_entry(
-            "Target Id",
+            &catalog.t("menu.target.id"),
             &format!("targets[{index}].id"),
             &target.id,
-            "Stable target identifier used by CLI, MCP, and future UI.",
+            &catalog.t("menu.target.id.desc"),
         ),
         edit_entry(
-            "Display Name",
+            &catalog.t("menu.target.display_name"),
             &format!("targets[{index}].display_name"),
             &target.display_name,
-            "Display-safe name shown in menus and diagnostics.",
+            &catalog.t("menu.target.display_name.desc"),
         ),
         edit_entry(
-            "Enabled",
+            &catalog.t("menu.target.enabled"),
             &format!("targets[{index}].enabled"),
             &target.enabled.to_string(),
-            "Whether this target can be resolved and used.",
+            &catalog.t("menu.target.enabled.desc"),
         ),
         edit_entry(
-            "Aliases",
+            &catalog.t("menu.target.aliases"),
             &format!("targets[{index}].aliases"),
             &target.aliases.join(","),
-            "Comma-separated aliases for this target.",
+            &catalog.t("menu.target.aliases.desc"),
         ),
         edit_entry(
-            "Credential Ref",
+            &catalog.t("menu.target.credential_ref"),
             &format!("targets[{index}].credential_ref"),
             target.credential_ref.as_deref().unwrap_or(""),
-            "Vault credential reference for this target.",
+            &catalog.t("menu.target.credential_ref.desc"),
         ),
         edit_entry(
-            "Notes",
+            &catalog.t("menu.target.notes"),
             &format!("targets[{index}].notes"),
             target.notes.as_deref().unwrap_or(""),
-            "Optional display-safe notes for the target.",
+            &catalog.t("menu.target.notes.desc"),
         ),
     ];
     match &target.kind {
         TargetKind::Ssh => {
             entries.push(edit_entry(
-                "SSH Host",
+                &catalog.t("menu.target.ssh_host"),
                 &format!("targets[{index}].connection.host"),
                 target.connection.host.as_deref().unwrap_or(""),
-                "SSH host or IP address.",
+                &catalog.t("menu.target.ssh_host.desc"),
             ));
             entries.push(edit_entry(
-                "SSH Port",
+                &catalog.t("menu.target.ssh_port"),
                 &format!("targets[{index}].connection.port"),
                 &target
                     .connection
                     .port
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
-                "SSH port.",
+                &catalog.t("menu.target.ssh_port.desc"),
             ));
             entries.push(edit_entry(
-                "SSH Username",
+                &catalog.t("menu.target.ssh_username"),
                 &format!("targets[{index}].connection.username"),
                 target.connection.username.as_deref().unwrap_or(""),
-                "SSH username.",
+                &catalog.t("menu.target.ssh_username.desc"),
             ));
         }
         TargetKind::Adb => {
             entries.push(edit_entry(
-                "Selector Kind",
+                &catalog.t("menu.target.selector_kind"),
                 &format!("targets[{index}].connection.selector_kind"),
                 target.connection.selector_kind.as_deref().unwrap_or(""),
-                "ADB selector kind such as serial.",
+                &catalog.t("menu.target.selector_kind.desc"),
             ));
             entries.push(edit_entry(
-                "Selector Value",
+                &catalog.t("menu.target.selector_value"),
                 &format!("targets[{index}].connection.selector_value"),
                 target.connection.selector_value.as_deref().unwrap_or(""),
-                "ADB selector value such as emulator-5554.",
+                &catalog.t("menu.target.selector_value.desc"),
             ));
         }
         _ => {}
@@ -1355,24 +1429,24 @@ fn target_editor_entries(settings: &CoreSettings, index: usize) -> Vec<MenuEntry
     entries
 }
 
-fn search_entries(settings: &CoreSettings, query: &str) -> Vec<MenuEntry> {
+fn search_entries(settings: &CoreSettings, query: &str, catalog: &Catalog) -> Vec<MenuEntry> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
         return vec![info_entry(
-            "No Query",
+            &catalog.t("menu.search.no_query"),
             None,
-            "Type a field, menu, or target name and press Enter to search.",
+            &catalog.t("menu.search.no_query.desc"),
         )];
     }
 
     let mut entries = Vec::new();
-    for entry in core_entries(settings)
+    for entry in core_entries(settings, catalog)
         .into_iter()
-        .chain(storage_entries(settings))
-        .chain(model_plane_entries(settings))
-        .chain(vault_entries(settings))
-        .chain(targets_entries(settings))
-        .chain(flatten_target_fields(settings))
+        .chain(storage_entries(settings, catalog))
+        .chain(model_plane_entries(settings, catalog))
+        .chain(vault_entries(settings, catalog))
+        .chain(targets_entries(settings, catalog))
+        .chain(flatten_target_fields(settings, catalog))
     {
         let text = format!(
             "{} {} {} {}",
@@ -1411,18 +1485,18 @@ fn search_entries(settings: &CoreSettings, query: &str) -> Vec<MenuEntry> {
 
     if entries.is_empty() {
         entries.push(info_entry(
-            "No Matches",
+            &catalog.t("menu.search.no_matches"),
             None,
-            "Search returned no matching menus or fields.",
+            &catalog.t("menu.search.no_matches.desc"),
         ));
     }
     entries
 }
 
-fn flatten_target_fields(settings: &CoreSettings) -> Vec<MenuEntry> {
+fn flatten_target_fields(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
     let mut entries = Vec::new();
     for index in 0..settings.targets.len() {
-        entries.extend(target_editor_entries(settings, index));
+        entries.extend(target_editor_entries(settings, index, catalog));
     }
     entries
 }
@@ -1471,6 +1545,7 @@ fn field_value(settings: &CoreSettings, field: &str) -> Option<String> {
     match field {
         "core.instance_name" => Some(settings.core.instance_name.clone()),
         "core.log_level" => Some(settings.core.log_level.clone()),
+        "core.operator_locale" => Some(settings.core.operator_locale.clone()),
         "storage.artifacts.backend" => Some(settings.storage.artifacts.backend.clone()),
         "storage.artifacts.max_bytes" => Some(settings.storage.artifacts.max_bytes.to_string()),
         "model_plane.http.host" => Some(settings.model_plane.http.host.clone()),
@@ -1486,6 +1561,7 @@ fn field_value(settings: &CoreSettings, field: &str) -> Option<String> {
 fn field_options(field: &str) -> Option<Vec<String>> {
     let options = match field {
         "core.log_level" => vec!["trace", "debug", "info", "warn", "error"],
+        "core.operator_locale" => vec!["en-US", "zh-CN"],
         "storage.artifacts.backend" => vec!["memory", "filesystem"],
         "vault.unlock.trigger_policy" => vec![
             "on-first-secret-access",
@@ -1560,6 +1636,7 @@ fn apply_field_edit(settings: &mut CoreSettings, field: &str, value: &str) -> Re
     match field {
         "core.instance_name" => settings.core.instance_name = value.to_string(),
         "core.log_level" => settings.core.log_level = value.to_string(),
+        "core.operator_locale" => settings.core.operator_locale = value.to_string(),
         "storage.artifacts.backend" => settings.storage.artifacts.backend = value.to_string(),
         "storage.artifacts.max_bytes" => {
             settings.storage.artifacts.max_bytes = value
@@ -1678,6 +1755,7 @@ fn parse_target_field(field: &str) -> Option<(usize, &str)> {
 fn screen_for_field(field: &str) -> Screen {
     match field {
         "core.instance_name" | "core.log_level" => Screen::Core,
+        "core.operator_locale" => Screen::Core,
         "storage.artifacts.backend" | "storage.artifacts.max_bytes" => Screen::Storage,
         "model_plane.http.host"
         | "model_plane.http.port"
@@ -1791,13 +1869,13 @@ fn default_adb_target(index: usize) -> StandaloneTargetProfile {
     }
 }
 
-fn target_kind_label(kind: &TargetKind) -> &'static str {
+fn target_kind_label(kind: &TargetKind, catalog: &Catalog) -> String {
     match kind {
-        TargetKind::Ssh => "ssh",
-        TargetKind::Adb => "adb",
-        TargetKind::Serial => "serial",
-        TargetKind::Docker => "docker",
-        TargetKind::Other(_) => "custom",
+        TargetKind::Ssh => catalog.t("menu.value.target_kind.ssh"),
+        TargetKind::Adb => catalog.t("menu.value.target_kind.adb"),
+        TargetKind::Serial => catalog.t("menu.value.target_kind.serial"),
+        TargetKind::Docker => catalog.t("menu.value.target_kind.docker"),
+        TargetKind::Other(_) => catalog.t("menu.value.target_kind.custom"),
     }
 }
 
