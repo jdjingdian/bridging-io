@@ -1,8 +1,9 @@
 use std::time::SystemTime;
 
 use bridgingio_domain::{
-    ApprovalRequestRecord, ArtifactRecord, ConnectionConfig, CredentialRef, PolicyProfile,
-    SessionRecord, SessionReusePolicy, TargetKind, TargetProfile,
+    ApprovalRequestRecord, ArtifactRecord, CommonErrorCode, ConnectionConfig, ContractStatus,
+    CredentialRef, ErrorDomain, PolicyProfile, SessionRecord, SessionReusePolicy, SharedError,
+    TargetKind, TargetProfile,
     TARGET_TERMINAL_CONCURRENCY_METADATA_KEY, TARGET_TERMINAL_FAMILY_METADATA_KEY,
     TARGET_TERMINAL_SHELL_METADATA_KEY,
 };
@@ -339,20 +340,31 @@ pub enum ApiEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ApiErrorCode {
-    NotFound,
-    PermissionDenied,
-    ValidationFailed,
-    DependencyUnavailable,
-    Internal,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiError {
-    pub code: ApiErrorCode,
+    pub status: ContractStatus,
+    pub domain: ErrorDomain,
+    pub common_code: CommonErrorCode,
+    pub module_code: Option<String>,
     pub message: String,
     pub retriable: bool,
+    pub recovery_hint: Option<String>,
 }
+
+impl ApiError {
+    pub fn from_shared(shared: SharedError) -> Self {
+        Self {
+            status: shared.status,
+            domain: shared.domain,
+            common_code: shared.common_code,
+            module_code: shared.module_code,
+            message: shared.message,
+            retriable: shared.retriable,
+            recovery_hint: shared.recovery_hint,
+        }
+    }
+}
+
+pub type ApiErrorCode = CommonErrorCode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiResponse {
@@ -1229,10 +1241,14 @@ impl AppApiLineCodec {
                 request.id
             ),
             ApiResponse::Error { request_id, error } => format!(
-                "kind=error|request_id={request_id}|code={:?}|message={}|retriable={}",
-                error.code,
+                "kind=error|request_id={request_id}|status={}|domain={}|common_code={}|module_code={}|message={}|retriable={}|recovery_hint={}",
+                error.status.as_str(),
+                error.domain.as_str(),
+                error.common_code.as_str(),
+                escape(error.module_code.as_deref().unwrap_or("")),
                 escape(&error.message),
-                error.retriable
+                error.retriable,
+                escape(error.recovery_hint.as_deref().unwrap_or(""))
             ),
         }
     }
@@ -1485,17 +1501,26 @@ impl AppApiLineCodec {
             "error" => Ok(ApiResponse::Error {
                 request_id,
                 error: ApiError {
-                    code: match required(&map, "code")? {
-                        "NotFound" => ApiErrorCode::NotFound,
-                        "PermissionDenied" => ApiErrorCode::PermissionDenied,
-                        "ValidationFailed" => ApiErrorCode::ValidationFailed,
-                        "DependencyUnavailable" => ApiErrorCode::DependencyUnavailable,
-                        _ => ApiErrorCode::Internal,
-                    },
+                    status: optional(&map, "status")
+                        .and_then(ContractStatus::parse)
+                        .unwrap_or(ContractStatus::Failed),
+                    domain: optional(&map, "domain")
+                        .and_then(ErrorDomain::parse)
+                        .unwrap_or(ErrorDomain::AppApi),
+                    common_code: optional(&map, "common_code")
+                        .or_else(|| optional(&map, "code"))
+                        .and_then(CommonErrorCode::parse)
+                        .unwrap_or(CommonErrorCode::Internal),
+                    module_code: optional(&map, "module_code")
+                        .map(unescape)
+                        .filter(|value| !value.is_empty()),
                     message: unescape(required(&map, "message")?),
                     retriable: required(&map, "retriable")?
                         .parse()
                         .map_err(|_| invalid_request("retriable must be bool"))?,
+                    recovery_hint: optional(&map, "recovery_hint")
+                        .map(unescape)
+                        .filter(|value| !value.is_empty()),
                 },
             }),
             _ => Err(invalid_request("unsupported response kind")),
@@ -2123,11 +2148,16 @@ fn target_kind_label(kind: &TargetKind) -> &'static str {
 }
 
 fn invalid_request(message: &str) -> ApiError {
-    ApiError {
-        code: ApiErrorCode::ValidationFailed,
-        message: message.to_string(),
-        retriable: false,
-    }
+    ApiError::from_shared(
+        SharedError::new(
+            ContractStatus::Failed,
+            ErrorDomain::AppApi,
+            CommonErrorCode::ValidationFailed,
+            message,
+        )
+        .with_module_code("app_api.invalid_request")
+        .with_recovery_hint("verify the request payload and retry"),
+    )
 }
 
 fn escape(value: &str) -> String {
@@ -2149,13 +2179,16 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::SystemTime;
 
-    use bridgingio_domain::{ConnectionConfig, SessionReusePolicy, TargetKind, TargetProfile};
+    use bridgingio_domain::{
+        CommonErrorCode, ConnectionConfig, ContractStatus, ErrorDomain, SessionReusePolicy,
+        TargetKind, TargetProfile,
+    };
 
     use super::{
-        AgentTokenScopeView, AgentTokenSummaryView, ApiRequest, ApiRequestContext, ApiResponse,
-        AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ControlPlaneView, CoreSettingsView,
-        CreateAgentTokenResult, LocalAdminActionIntentView, LocalAdminAttestationView,
-        ModelPlaneHttpView, RuntimeLogSettingsView, VaultStatusView,
+        AgentTokenScopeView, AgentTokenSummaryView, ApiError, ApiRequest, ApiRequestContext,
+        ApiResponse, AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ControlPlaneView,
+        CoreSettingsView, CreateAgentTokenResult, LocalAdminActionIntentView,
+        LocalAdminAttestationView, ModelPlaneHttpView, RuntimeLogSettingsView, VaultStatusView,
         TARGET_ACCESS_CLASS_METADATA_KEY, TARGET_SEALED_PROFILE_REF_METADATA_KEY,
         TARGET_STORAGE_CLASS_METADATA_KEY, VaultProtectorSummaryView, VaultSecretSummaryView,
         VaultStateProjectionView, VaultUnlockPolicySummaryView,
@@ -2181,6 +2214,39 @@ mod tests {
         let line = AppApiLineCodec::encode_request_line(&request);
         let parsed = AppApiLineCodec::decode_request_line(&line).expect("decode");
         assert!(matches!(parsed.command, AppCommand::Execute { .. }));
+    }
+
+    #[test]
+    fn encodes_and_decodes_structured_error_response() {
+        let line = AppApiLineCodec::encode_response_line(&ApiResponse::Error {
+            request_id: "err-1".into(),
+            error: ApiError {
+                status: ContractStatus::Locked,
+                domain: ErrorDomain::Vault,
+                common_code: CommonErrorCode::VerificationRequired,
+                module_code: Some("vault.local_admin_verification_required".into()),
+                message: "fresh local admin verification is required".into(),
+                retriable: false,
+                recovery_hint: Some("complete trusted local verification and retry".into()),
+            },
+        });
+        let parsed = AppApiLineCodec::decode_response_line(&line).expect("decode error");
+        match parsed {
+            ApiResponse::Error { error, .. } => {
+                assert_eq!(error.status, ContractStatus::Locked);
+                assert_eq!(error.domain, ErrorDomain::Vault);
+                assert_eq!(error.common_code, CommonErrorCode::VerificationRequired);
+                assert_eq!(
+                    error.module_code.as_deref(),
+                    Some("vault.local_admin_verification_required")
+                );
+                assert_eq!(
+                    error.recovery_hint.as_deref(),
+                    Some("complete trusted local verification and retry")
+                );
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
     }
 
     #[test]

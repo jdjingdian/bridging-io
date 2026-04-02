@@ -2,6 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use bridgingio_domain::{RuntimeBootstrapStatus, RuntimeRecoveryAction};
+
 const RUNTIME_ROOT_KEY: &str = "runtime_root=";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,6 +14,28 @@ pub enum RuntimeRootValidationError {
 }
 
 impl RuntimeRootValidationError {
+    pub fn bootstrap_status(&self) -> RuntimeBootstrapStatus {
+        match self {
+            RuntimeRootValidationError::MissingPath | RuntimeRootValidationError::NotDirectory => {
+                RuntimeBootstrapStatus::NeedsRelocate
+            }
+            RuntimeRootValidationError::NotWritable => RuntimeBootstrapStatus::NeedsPermissionFix,
+        }
+    }
+
+    pub fn recovery_actions(&self) -> Vec<RuntimeRecoveryAction> {
+        match self {
+            RuntimeRootValidationError::MissingPath | RuntimeRootValidationError::NotDirectory => {
+                vec![RuntimeRecoveryAction::ChooseRuntimeRoot, RuntimeRecoveryAction::Retry]
+            }
+            RuntimeRootValidationError::NotWritable => vec![
+                RuntimeRecoveryAction::FixPermissions,
+                RuntimeRecoveryAction::ChooseRuntimeRoot,
+                RuntimeRecoveryAction::Retry,
+            ],
+        }
+    }
+
     pub fn recovery_hint(&self) -> &'static str {
         match self {
             RuntimeRootValidationError::MissingPath => {

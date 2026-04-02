@@ -79,3 +79,9 @@ The script emits a JSONL execution record under `tmp/` and includes:
 - per-suite status
 - retries/jitter observation fields for flaky tracking
 - command-level trace for manual/CI parity
+- architecture and build-profile fields for matrix reporting
+
+Additional matrix truth sources:
+
+- `docs/matrix/SELF_TEST_CASE_MATRIX.md`
+- `docs/matrix/LOCAL_OPERATOR_INTERFACE_MATRIX.md`

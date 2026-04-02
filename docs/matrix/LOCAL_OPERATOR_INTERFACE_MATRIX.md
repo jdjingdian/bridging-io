@@ -1,0 +1,39 @@
+# Local Operator Interface Matrix
+
+This document is the canonical interface matrix for trusted local operator
+surfaces:
+
+- `bridgingio-core menuconfig`
+- standalone CLI management routes
+- trusted local control-plane / app API
+- future local UI/TUI hosts
+
+## Interface Matrix
+
+| Surface | Command / Interface | Callers | Input | Output | Status / Error Highlights | Apply Strategy |
+| --- | --- | --- | --- | --- | --- | --- |
+| CLI | `bridgingio-core menuconfig [--config <path>]` | local operator, future UI tooling | optional config path | interactive TUI session, saved config path | display-safe diagnostics only, no secret plaintext display | save returns equivalent restart hint when config changed |
+| CLI | `bridgingio-core run [--config <path>]` | local operator | optional config path | foreground runtime process | startup lifecycle errors use shared error/status contract | N/A |
+| CLI | `bridgingio-core -d [--config <path>]` | local operator, launcher | optional config path, one-shot startup carrier if needed | detached runtime process | detached mode overrides vault trigger to `on-core-start`; startup remains fail-closed | N/A |
+| CLI | `bridgingio-core vault init` | local operator | config path | display-safe initialization summary | validation/dependency errors are structured and display-safe | live action |
+| CLI | `bridgingio-core vault import` | local operator | config path, secret input route | display-safe import summary | secret input conflicts fail closed; no plaintext argv | live action |
+| CLI | `bridgingio-core vault unlock` | local operator | config path, allowed local carrier | display-safe unlock summary | locked / verification / unavailable paths remain structured | live action |
+| CLI | `bridgingio-core auth token create` | local operator | config path, label, optional expiry | one-time reveal result | attestation/verification errors remain structured | live action |
+| CLI | `bridgingio-core auth token revoke` | local operator | config path, token id | display-safe revoke summary | not-found / validation / dependency errors remain structured | live action |
+| Control Plane | `attach_ui` | trusted local UI host | host id, ui session id, ui kind | attached response, readiness state | ownership conflict and not-ready are structured | `live_applied` |
+| Control Plane | `probe_host_instance` | trusted local UI/TUI host | none | ownership/runtime summary | startup / recovery state is structured | none |
+| Control Plane | `get_settings` | trusted local UI/TUI host | none | `CoreSettingsView` | display-safe settings snapshot | none |
+| Control Plane | `update_settings` | trusted local UI/TUI host | validated settings delta | accepted + `apply_strategy` | validation/not-ready/method-not-implemented are structured | `live_applied` or `restart_required` |
+| Control Plane | `get_vault_state` | trusted local UI/TUI host | none | `VaultStateProjectionView` | display-safe lock/protector summary | none |
+| Control Plane | `unlock_vault` | trusted local UI/TUI host | attestation + allowed method | `vault_unlocked` response | locked/verification/mismatch remain structured | live action |
+| Control Plane | `create_local_admin_intent` / `complete_local_admin_attestation` | trusted local UI/TUI host | action context | intent / attestation records | verification and mismatch errors remain structured | live action |
+| Control Plane | `create_agent_token` / `list_agent_tokens` / `revoke_agent_token` | trusted local UI/TUI host | display-safe token management input | one-time reveal or summary list | summary-only after create, structured error contract | live action |
+
+## Maintenance Rules
+
+- Every new trusted local command, event, or settings mutation path must update
+  this matrix.
+- `method_not_implemented`, `not_ready`, `restart_required`, and equivalent
+  formal states must be captured here instead of only in prose docs.
+- This matrix must stay aligned with the shared error/status contract and the
+  self-test / contract matrix.

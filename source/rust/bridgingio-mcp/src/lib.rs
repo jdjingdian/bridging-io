@@ -26,8 +26,9 @@ use bridgingio_connectors::{
     TARGET_TERMINAL_FAMILY_METADATA_KEY, TARGET_TERMINAL_SHELL_METADATA_KEY,
 };
 use bridgingio_domain::{
-    AccessScope, ArtifactRecord, CapabilitySummary, ChannelKind, ChannelStatus, ConnectionConfig,
-    CredentialRef, SessionRecord, SessionReusePolicy, SessionState, TargetKind, TargetProfile,
+    AccessScope, ArtifactRecord, CapabilitySummary, ChannelKind, ChannelStatus, CommonErrorCode,
+    ConnectionConfig, ContractStatus, CredentialRef, ErrorDomain, SessionRecord,
+    SessionReusePolicy, SessionState, SharedError, TargetKind, TargetProfile,
 };
 use bridgingio_engine::{
     CoreSettings, CoreSettingsStore, StandaloneConnectionSection, StandaloneTargetProfile,
@@ -44,7 +45,7 @@ use bridgingio_secrets::{
     LocalAdminActionKind, LocalAdminAttestationRecord, SecretVaultRouter,
     SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
     UnlockVaultRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
-    VaultReadinessState, VaultUnlockTriggerPolicy,
+    VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
 };
 use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
@@ -1041,6 +1042,9 @@ impl StandaloneCoreRuntime {
         vault_router
             .set_active_backend(&settings.vault.backend)
             .map_err(vault_error_to_runtime)?;
+        vault_router
+            .set_unlock_policy(vault_unlock_policy_from_settings(&settings)?)
+            .map_err(vault_error_to_runtime)?;
         host_platform_adapter.runtime_logger().log(
             RuntimeLogLevel::Info,
             RuntimeLogCategory::Vault,
@@ -1217,6 +1221,50 @@ impl StandaloneCoreRuntime {
 
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
+    }
+
+    pub fn requires_startup_secret_input(&self) -> bool {
+        matches!(
+            self.vault_router.unlock_policy().trigger_policy,
+            VaultUnlockTriggerPolicy::OnCoreStart
+        ) && matches!(self.vault_router.vault_lock_state(), VaultLockState::Locked)
+            && self
+                .vault_router
+                .unlock_policy()
+                .allowed_methods
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case("passphrase"))
+    }
+
+    pub fn complete_startup_unlock_with_secret(
+        &mut self,
+        secret: Option<&str>,
+    ) -> Result<(), CoreRuntimeError> {
+        if !matches!(
+            self.vault_router.unlock_policy().trigger_policy,
+            VaultUnlockTriggerPolicy::OnCoreStart
+        ) {
+            return Ok(());
+        }
+        if matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+            return Ok(());
+        }
+        if let Some(secret) = secret {
+            self.vault_router
+                .unlock_with_passphrase(secret)
+                .map_err(vault_error_to_runtime)?;
+        }
+        match self.vault_router.vault_lock_state() {
+            VaultLockState::Unlocked => Ok(()),
+            VaultLockState::Unavailable => Err(CoreRuntimeError::Config(
+                "vault startup unlock is unavailable".into(),
+            )),
+            VaultLockState::Locked | VaultLockState::Unlocking | VaultLockState::Uninitialized => {
+                Err(CoreRuntimeError::Config(
+                    "vault startup unlock did not complete".into(),
+                ))
+            }
+        }
     }
 
     fn request_shutdown(&mut self) {
@@ -4037,45 +4085,29 @@ fn app_vault_state_projection(
 }
 
 fn token_vault_error_response(request_id: String, err: VaultError) -> ApiResponse {
-    match err {
-        VaultError::AgentTokenNotFound(message) => {
-            error_response(request_id, ApiErrorCode::NotFound, &message)
-        }
-        VaultError::AgentTokenRejected(message) => {
-            error_response(request_id, ApiErrorCode::ValidationFailed, &message)
-        }
-        VaultError::PassphraseRejected => {
-            error_response(request_id, ApiErrorCode::ValidationFailed, "passphrase rejected")
-        }
-        VaultError::LocalAdminVerificationRequired(message)
-        | VaultError::LocalAdminIntentMismatch(message)
-        | VaultError::LocalAdminIntentExpired(message)
-        | VaultError::LocalAdminAttestationMismatch(message)
-        | VaultError::LocalAdminAttestationExpired(message)
-        | VaultError::UnlockMethodNotAllowed(message)
-        | VaultError::UnlockFailed(message) => {
-            error_response(request_id, ApiErrorCode::ValidationFailed, &message)
-        }
-        VaultError::PassphraseNotConfigured => error_response(
-            request_id,
-            ApiErrorCode::DependencyUnavailable,
-            "passphrase protector is not configured",
-        ),
-        VaultError::FailClosed(message) | VaultError::BackendNotRegistered(message) => {
-            error_response(request_id, ApiErrorCode::DependencyUnavailable, &message)
-        }
-        other => error_response(request_id, ApiErrorCode::Internal, &format!("{other:?}")),
-    }
+    shared_error_response(request_id, err.shared_error())
 }
 
 fn error_response(request_id: String, code: ApiErrorCode, message: &str) -> ApiResponse {
+    let status = match code {
+        CommonErrorCode::MethodNotImplemented => ContractStatus::MethodNotImplemented,
+        CommonErrorCode::NotReady => ContractStatus::NotReady,
+        CommonErrorCode::Unsupported => ContractStatus::Unsupported,
+        CommonErrorCode::Degraded => ContractStatus::Degraded,
+        CommonErrorCode::Locked | CommonErrorCode::VerificationRequired => ContractStatus::Locked,
+        CommonErrorCode::DependencyUnavailable => ContractStatus::NotReady,
+        _ => ContractStatus::Failed,
+    };
+    shared_error_response(
+        request_id,
+        SharedError::new(status, ErrorDomain::ControlPlane, code, message),
+    )
+}
+
+fn shared_error_response(request_id: String, error: SharedError) -> ApiResponse {
     ApiResponse::Error {
         request_id,
-        error: ApiError {
-            code,
-            message: message.to_string(),
-            retriable: false,
-        },
+        error: ApiError::from_shared(error),
     }
 }
 
@@ -4689,6 +4721,34 @@ fn vault_readiness_to_capability_status(status: &VaultReadinessState) -> Capabil
         VaultReadinessState::Fallback => CapabilityStatus::Fallback,
         VaultReadinessState::Unsupported => CapabilityStatus::Unsupported,
     }
+}
+
+fn vault_unlock_policy_from_settings(settings: &CoreSettings) -> Result<VaultUnlockPolicy, CoreRuntimeError> {
+    let trigger_policy = match settings
+        .vault
+        .unlock
+        .trigger_policy
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "on-core-start" => VaultUnlockTriggerPolicy::OnCoreStart,
+        "on-first-secret-access" => VaultUnlockTriggerPolicy::OnFirstSecretAccess,
+        "on-every-secret-access" => VaultUnlockTriggerPolicy::OnEverySecretAccess,
+        "manual-only" => VaultUnlockTriggerPolicy::ManualOnly,
+        other => {
+            return Err(CoreRuntimeError::Config(format!(
+                "unsupported vault unlock trigger policy: {other}"
+            )))
+        }
+    };
+    Ok(VaultUnlockPolicy {
+        trigger_policy,
+        allowed_methods: settings.vault.unlock.allowed_methods.clone(),
+        preferred_method: settings.vault.unlock.preferred_method.clone(),
+        cache_ttl_sec: settings.vault.unlock.cache_ttl_sec,
+        require_fresh_user_verification: settings.vault.unlock.require_fresh_user_verification,
+    })
 }
 
 fn aggregate_health_state(statuses: &[CapabilityStatus]) -> &'static str {
@@ -7371,8 +7431,8 @@ mod tests {
         local_admin_create_token_target, local_admin_payload_digest_for_create_agent_token,
         local_admin_payload_digest_for_unlock_vault,
         local_admin_payload_digest_for_update_agent_token_scope, local_admin_unlock_vault_target,
-        CreateAgentTokenRequest, TokenScopeInput, UpdateAgentTokenScopeRequest, VaultUnlockPolicy,
-        VaultUnlockTriggerPolicy,
+        CreateAgentTokenRequest, TokenScopeInput, UpdateAgentTokenScopeRequest, VaultLockState,
+        VaultUnlockPolicy, VaultUnlockTriggerPolicy,
     };
 
     use super::{
@@ -9291,10 +9351,58 @@ enabled = true
             .expect_err("unavailable vault must block secret-backed ssh delivery");
         match unavailable_err {
             CoreRuntimeError::Config(message) => {
-                assert!(message.contains("VaultUnavailable"));
+                assert!(
+                    message.contains("VaultUnavailable") || message.contains("VaultLocked")
+                );
             }
             other => panic!("expected config error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn startup_unlock_requires_secret_and_unlocks_with_passphrase() {
+        let root = temp_dir("startup-unlock-passphrase");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        runtime
+            .vault_router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch vault backend");
+        runtime
+            .vault_router
+            .unlock_with_os_native()
+            .expect("unlock with os-native");
+        runtime
+            .vault_router
+            .configure_passphrase_protector("correct horse battery staple")
+            .expect("configure passphrase protector");
+        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+        runtime
+            .vault_router
+            .set_unlock_policy(VaultUnlockPolicy {
+                trigger_policy: VaultUnlockTriggerPolicy::OnCoreStart,
+                allowed_methods: vec!["passphrase".into()],
+                preferred_method: "passphrase".into(),
+                cache_ttl_sec: 600,
+                require_fresh_user_verification: true,
+            })
+            .expect("on-core-start policy");
+
+        assert!(runtime.requires_startup_secret_input());
+        assert!(runtime.complete_startup_unlock_with_secret(None).is_err());
+        runtime
+            .complete_startup_unlock_with_secret(Some("correct horse battery staple"))
+            .expect("startup unlock with passphrase");
+        assert_eq!(runtime.vault_router.vault_lock_state(), VaultLockState::Unlocked);
     }
 
     #[test]

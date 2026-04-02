@@ -5,6 +5,7 @@ This contract defines how `bridgingio-core` owns and uses directories under a ru
 ## Scope
 
 - Applies to `ui-managed-ephemeral` runtime roots and any host-managed runtime root with core-owned config.
+- Standalone default startup uses the canonical runtime root under `~/.bridgingio` when `--config` is omitted.
 - Host platform differences are resolved by `RuntimePathsAdapter`.
 
 ## Reserved By Core

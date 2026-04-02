@@ -32,6 +32,7 @@ Reference:
 - `design.md` (decisions and tradeoffs)
 - `tasks.md` (implemented scope)
 - `specs/**/*.md` (requirements)
+- matrix docs when relevant (`docs/matrix/SELF_TEST_CASE_MATRIX.md`, `docs/matrix/LOCAL_OPERATOR_INTERFACE_MATRIX.md`)
 - latest test/validation results
 
 Suggested structure:

@@ -12,6 +12,7 @@ members = [
     "bridgingio-providers",
     "bridgingio-mcp",
     "bridgingio-app-api",
+    "bridgingio-operator-console",
 ]
 
 [workspace.package]

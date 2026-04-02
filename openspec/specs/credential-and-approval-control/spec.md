@@ -320,3 +320,35 @@ BridgingIO 必须通过规范化的加密保险库真相层管理敏感凭据，
 - **当** 已初始化 vault 但没有任何策略允许的可用 protector
 - **那么** 状态投影必须明确返回 `unavailable` 或等价 fail-closed 结果，并阻止 secret-backed 管理动作继续执行
 
+### 需求:启动解锁载体必须收敛到最小安全集合
+BridgingIO 的 vault 启动解锁路径必须收敛到最小安全集合，以降低额外泄露面。对于正式 startup/unlock contract，系统只允许使用隐藏输入的本地终端 prompt、父进程一次性本地 carrier，或受信任本地验证触发的正式 unlock 路径。系统禁止把明文 argv、普通环境变量或普通文件作为正式启动解锁载体。
+
+#### 场景:standalone 前台需要解锁
+- **当** standalone 前台模式在启动阶段或首次 secret access 阶段需要输入 unlock material
+- **那么** 系统必须通过隐藏输入的本地终端 prompt 获取该材料，而不得要求操作员通过 argv、普通环境变量或普通文件提供明文口令
+
+#### 场景:standalone 后台或服务需要解锁
+- **当** standalone 后台/服务模式在启动阶段需要 unlock material
+- **那么** 系统必须只接受父进程提供的一次性本地 carrier，而不得要求后台进程在启动后再等待普通交互式输入
+
+### 需求:启动解锁失败必须保持 fail-closed
+若 policy 要求在启动阶段完成解锁，但系统未能通过允许的正式 carrier 成功获取 unlock material，则 core 必须保持 `locked` 或 `unavailable`，并拒绝 secret-backed 功能。系统禁止在这种情况下隐式降级为“先运行，稍后再看”。
+
+#### 场景:carrier 不可用或材料无效
+- **当** core 在启动阶段检测到 unlock material 缺失、carrier 不可用或输入验证失败
+- **那么** 系统必须保持 fail-closed 状态，并返回明确恢复提示，而不是把 vault 伪装为已准备就绪
+
+### 需求:vault 与本地验证错误必须映射到共享错误与状态契约
+BridgingIO 在 vault、token、intent、attestation、approval 与本地验证路径上返回的公共错误，必须映射到共享错误与状态契约，同时保留安全域专属子码。系统不得把 `locked`、`verification_required`、`attestation_mismatch`、`passphrase_rejected` 等专属语义统一压扁为普通 validation failure。
+
+#### 场景:本地管理员验证失败
+- **当** 用户或本地受信任调用面在执行高风险安全动作时遇到验证缺失、验证过期或 attestation 不匹配
+- **那么** 系统必须返回共享错误封装，并保留安全域专属子码，以便调用方稳定区分“需要重新验证”和“真正内部失败”
+
+### 需求:安全域公共错误必须默认保持 display-safe
+BridgingIO 在 vault、token、secret broker 和 approval 路径中对外暴露的错误 message 与 details 必须默认保持 display-safe，不得把 secret 明文、token 明文、密文 locator 或等价高敏内部字段带入公共错误对象。
+
+#### 场景:secret-backed 操作失败
+- **当** 一个 secret-backed 操作因为 vault unavailable、broker delivery 失败或 policy 拒绝而失败
+- **那么** 系统必须向公共调用面返回 display-safe 的错误摘要和恢复提示，而不能把内部 secret 材料或 locator 信息拼入错误消息
+

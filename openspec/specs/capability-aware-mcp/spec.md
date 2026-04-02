@@ -470,3 +470,14 @@ model-plane 的长期 agent token 签发与 scope 扩大必须在 runtime 中消
 - **当** trusted control-plane 或桌面 UI 后续列出现有 token
 - **那么** 系统必须只返回 display-safe 的 token summary，而不能再次 reveal 已签发 token 的明文值
 
+### 需求:MCP 错误回包必须映射到共享错误与状态契约
+BridgingIO 的 MCP 回包在出现参数错误、能力未就绪、方法未实现、受控降级或运行时失败时，必须映射到共享错误与状态契约，而不是继续依赖 ad hoc 字符串或过粗错误类别。
+
+#### 场景:tool 尚未实现
+- **当** MCP 客户端调用一个当前版本尚未实现但已保留入口的 tool 或 capability
+- **那么** JSON-RPC 错误或等价回包必须包含 `method_not_implemented` 对应的共享错误/状态语义，并保留原始请求 `id`
+
+#### 场景:能力处于受控降级
+- **当** MCP 客户端调用的能力当前处于 `degraded` 或 `not_ready` 状态
+- **那么** 系统必须在回包中明确返回对应共享状态与恢复提示，而不是把该情况统一压扁为内部错误
+

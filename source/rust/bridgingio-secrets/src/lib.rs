@@ -6,6 +6,7 @@ use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use bridgingio_domain::{CommonErrorCode, ContractStatus, ErrorDomain, SharedError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -914,6 +915,184 @@ pub enum VaultError {
     CryptoEnvelope(String),
 }
 
+impl VaultError {
+    pub fn shared_error(&self) -> SharedError {
+        let (status, common_code, module_code, message, recovery_hint) = match self {
+            Self::BackendNotRegistered(_) => (
+                ContractStatus::Unsupported,
+                CommonErrorCode::DependencyUnavailable,
+                "vault.backend_not_registered",
+                "requested vault backend is not registered",
+                "select a supported vault backend and retry",
+            ),
+            Self::InvalidCredentialRef(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.invalid_credential_ref",
+                "credential reference is invalid",
+                "use a canonical vault reference and retry",
+            ),
+            Self::PlaintextAccessDisabled(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::PermissionDenied,
+                "vault.plaintext_access_disabled",
+                "plaintext secret access is disabled",
+                "use a brokered secret route instead of plaintext access",
+            ),
+            Self::SecretNotFound(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::NotFound,
+                "vault.secret_not_found",
+                "secret was not found",
+                "verify the referenced secret exists and retry",
+            ),
+            Self::SecretVersionNotFound(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::NotFound,
+                "vault.secret_version_not_found",
+                "secret version was not found",
+                "verify the active secret version exists and retry",
+            ),
+            Self::FailClosed(_) => (
+                ContractStatus::NotReady,
+                CommonErrorCode::DependencyUnavailable,
+                "vault.fail_closed",
+                "vault is in fail-closed state",
+                "restore an allowed protector or unlock route before retrying",
+            ),
+            Self::LocalAdminVerificationRequired(_) => (
+                ContractStatus::Locked,
+                CommonErrorCode::VerificationRequired,
+                "vault.local_admin_verification_required",
+                "fresh local admin verification is required",
+                "complete trusted local verification and retry",
+            ),
+            Self::LocalAdminIntentMismatch(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.local_admin_intent_mismatch",
+                "local admin intent does not match the requested action",
+                "create a new intent for the current action and retry",
+            ),
+            Self::LocalAdminIntentExpired(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.local_admin_intent_expired",
+                "local admin intent has expired",
+                "create a fresh intent and retry",
+            ),
+            Self::LocalAdminAttestationMismatch(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.local_admin_attestation_mismatch",
+                "local admin attestation does not match the current action",
+                "complete a new trusted verification flow and retry",
+            ),
+            Self::LocalAdminAttestationExpired(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.local_admin_attestation_expired",
+                "local admin attestation has expired",
+                "complete a fresh trusted verification flow and retry",
+            ),
+            Self::SshBrokerSessionNotFound(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::NotFound,
+                "vault.ssh_broker_session_not_found",
+                "ssh broker session was not found",
+                "create a new ssh broker session and retry",
+            ),
+            Self::SshBrokerUnsupported(_) => (
+                ContractStatus::Unsupported,
+                CommonErrorCode::Unsupported,
+                "vault.ssh_broker_unsupported",
+                "ssh broker delivery is unsupported on the current route",
+                "use a supported broker route or configured fallback",
+            ),
+            Self::SshRuntimePassphraseForbidden(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.ssh_runtime_passphrase_forbidden",
+                "runtime ssh key passphrase entry is forbidden",
+                "import signer material through a trusted management route instead",
+            ),
+            Self::AgentTokenNotFound(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::NotFound,
+                "vault.agent_token_not_found",
+                "agent token was not found",
+                "verify the token id and retry",
+            ),
+            Self::AgentTokenRejected(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.agent_token_rejected",
+                "agent token request was rejected",
+                "review the requested token scope or verification state and retry",
+            ),
+            Self::VaultLocked(_) => (
+                ContractStatus::Locked,
+                CommonErrorCode::Locked,
+                "vault.locked",
+                "vault is locked",
+                "unlock the vault through an allowed local route and retry",
+            ),
+            Self::VaultUnavailable(_) => (
+                ContractStatus::NotReady,
+                CommonErrorCode::DependencyUnavailable,
+                "vault.unavailable",
+                "vault is unavailable",
+                "restore vault dependencies or unlock routes before retrying",
+            ),
+            Self::UnlockMethodNotAllowed(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.unlock_method_not_allowed",
+                "unlock method is not allowed by policy",
+                "use an allowed unlock method and retry",
+            ),
+            Self::UnlockFailed(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.unlock_failed",
+                "vault unlock failed",
+                "verify the provided unlock material and retry",
+            ),
+            Self::PassphraseNotConfigured => (
+                ContractStatus::NotReady,
+                CommonErrorCode::DependencyUnavailable,
+                "vault.passphrase_not_configured",
+                "passphrase protector is not configured",
+                "configure a passphrase protector before using this unlock route",
+            ),
+            Self::PassphraseRejected => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.passphrase_rejected",
+                "passphrase was rejected",
+                "verify the passphrase and retry",
+            ),
+            Self::StorageIo(_) => (
+                ContractStatus::NotReady,
+                CommonErrorCode::DependencyUnavailable,
+                "vault.storage_io",
+                "vault storage is unavailable",
+                "verify the vault storage path is available and retry",
+            ),
+            Self::CryptoEnvelope(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::Internal,
+                "vault.crypto_envelope",
+                "vault encryption envelope operation failed",
+                "inspect vault diagnostics before retrying the operation",
+            ),
+        };
+        SharedError::new(status, ErrorDomain::Vault, common_code, message)
+            .with_module_code(module_code)
+            .with_recovery_hint(recovery_hint)
+    }
+}
+
 struct StoredSecretVersionMaterial {
     version: VaultSecretVersionRecord,
     ciphertext: Vec<u8>,
@@ -1464,7 +1643,7 @@ impl SecretVaultRouter {
         if matches!(self.unlock_policy.trigger_policy, VaultUnlockTriggerPolicy::OnCoreStart) {
             let preferred = self.unlock_policy.preferred_method.clone();
             if self.try_unlock_with_method(&preferred).is_err() {
-                self.lock_state = VaultLockState::Unavailable;
+                self.lock_state = default_persisted_lock_state();
             }
         }
         self.persist_metadata_db()?;
@@ -5814,5 +5993,19 @@ mod tests {
 
         let _ = fs::remove_file(vault_dir.join("legacy-vault-state.json"));
         let _ = fs::remove_dir_all(vault_dir);
+    }
+
+    #[test]
+    fn vault_error_maps_to_shared_error_contract() {
+        let shared = VaultError::LocalAdminVerificationRequired("fresh verification".into())
+            .shared_error();
+        assert_eq!(shared.status.as_str(), "locked");
+        assert_eq!(shared.domain.as_str(), "vault");
+        assert_eq!(shared.common_code.as_str(), "verification_required");
+        assert_eq!(
+            shared.module_code.as_deref(),
+            Some("vault.local_admin_verification_required")
+        );
+        assert!(shared.recovery_hint.is_some());
     }
 }

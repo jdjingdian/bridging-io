@@ -9,6 +9,239 @@ pub const TARGET_TERMINAL_SHELL_METADATA_KEY: &str = "terminal.shell";
 pub const TARGET_TERMINAL_FAMILY_METADATA_KEY: &str = "terminal.family";
 pub const TARGET_TERMINAL_CONCURRENCY_METADATA_KEY: &str = "terminal.concurrency";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContractStatus {
+    Ready,
+    Degraded,
+    Fallback,
+    Unsupported,
+    Locked,
+    NotReady,
+    MethodNotImplemented,
+    Failed,
+}
+
+impl ContractStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+            Self::Fallback => "fallback",
+            Self::Unsupported => "unsupported",
+            Self::Locked => "locked",
+            Self::NotReady => "not_ready",
+            Self::MethodNotImplemented => "method_not_implemented",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ready" => Some(Self::Ready),
+            "degraded" => Some(Self::Degraded),
+            "fallback" => Some(Self::Fallback),
+            "unsupported" => Some(Self::Unsupported),
+            "locked" => Some(Self::Locked),
+            "not_ready" | "notready" => Some(Self::NotReady),
+            "method_not_implemented" | "methodnotimplemented" => Some(Self::MethodNotImplemented),
+            "failed" | "error" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommonErrorCode {
+    NotFound,
+    PermissionDenied,
+    ValidationFailed,
+    DependencyUnavailable,
+    Internal,
+    MethodNotImplemented,
+    NotReady,
+    Unsupported,
+    Degraded,
+    Locked,
+    VerificationRequired,
+}
+
+impl CommonErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::PermissionDenied => "permission_denied",
+            Self::ValidationFailed => "validation_failed",
+            Self::DependencyUnavailable => "dependency_unavailable",
+            Self::Internal => "internal",
+            Self::MethodNotImplemented => "method_not_implemented",
+            Self::NotReady => "not_ready",
+            Self::Unsupported => "unsupported",
+            Self::Degraded => "degraded",
+            Self::Locked => "locked",
+            Self::VerificationRequired => "verification_required",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "not_found" | "notfound" => Some(Self::NotFound),
+            "permission_denied" | "permissiondenied" => Some(Self::PermissionDenied),
+            "validation_failed" | "validationfailed" => Some(Self::ValidationFailed),
+            "dependency_unavailable" | "dependencyunavailable" => {
+                Some(Self::DependencyUnavailable)
+            }
+            "internal" => Some(Self::Internal),
+            "method_not_implemented" | "methodnotimplemented" => Some(Self::MethodNotImplemented),
+            "not_ready" | "notready" => Some(Self::NotReady),
+            "unsupported" => Some(Self::Unsupported),
+            "degraded" => Some(Self::Degraded),
+            "locked" => Some(Self::Locked),
+            "verification_required" | "verificationrequired" => Some(Self::VerificationRequired),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorDomain {
+    AppApi,
+    ControlPlane,
+    Mcp,
+    RuntimeLifecycle,
+    Config,
+    Vault,
+    Platform,
+}
+
+impl ErrorDomain {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AppApi => "app_api",
+            Self::ControlPlane => "control_plane",
+            Self::Mcp => "mcp",
+            Self::RuntimeLifecycle => "runtime_lifecycle",
+            Self::Config => "config",
+            Self::Vault => "vault",
+            Self::Platform => "platform",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "app_api" | "appapi" => Some(Self::AppApi),
+            "control_plane" | "controlplane" => Some(Self::ControlPlane),
+            "mcp" => Some(Self::Mcp),
+            "runtime_lifecycle" | "runtimelifecycle" => Some(Self::RuntimeLifecycle),
+            "config" => Some(Self::Config),
+            "vault" => Some(Self::Vault),
+            "platform" => Some(Self::Platform),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedError {
+    pub status: ContractStatus,
+    pub domain: ErrorDomain,
+    pub common_code: CommonErrorCode,
+    pub module_code: Option<String>,
+    pub message: String,
+    pub retriable: bool,
+    pub recovery_hint: Option<String>,
+}
+
+impl SharedError {
+    pub fn new(
+        status: ContractStatus,
+        domain: ErrorDomain,
+        common_code: CommonErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            domain,
+            common_code,
+            module_code: None,
+            message: message.into(),
+            retriable: false,
+            recovery_hint: None,
+        }
+    }
+
+    pub fn with_module_code(mut self, module_code: impl Into<String>) -> Self {
+        self.module_code = Some(module_code.into());
+        self
+    }
+
+    pub fn with_retriable(mut self, retriable: bool) -> Self {
+        self.retriable = retriable;
+        self
+    }
+
+    pub fn with_recovery_hint(mut self, recovery_hint: impl Into<String>) -> Self {
+        self.recovery_hint = Some(recovery_hint.into());
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeBootstrapStatus {
+    Ready,
+    NeedsRelocate,
+    NeedsPermissionFix,
+    NeedsMigration,
+    Failed,
+}
+
+impl RuntimeBootstrapStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NeedsRelocate => "needs_relocate",
+            Self::NeedsPermissionFix => "needs_permission_fix",
+            Self::NeedsMigration => "needs_migration",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeRecoveryAction {
+    Retry,
+    ChooseRuntimeRoot,
+    FixPermissions,
+    MigrateConfig,
+}
+
+impl RuntimeRecoveryAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::ChooseRuntimeRoot => "choose_runtime_root",
+            Self::FixPermissions => "fix_permissions",
+            Self::MigrateConfig => "migrate_config",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StartupUnlockCarrierKind {
+    HiddenPrompt,
+    ParentStdin,
+    TrustedLocalVerification,
+}
+
+impl StartupUnlockCarrierKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HiddenPrompt => "hidden_prompt",
+            Self::ParentStdin => "parent_stdin",
+            Self::TrustedLocalVerification => "trusted_local_verification",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TargetKind {
     Ssh,

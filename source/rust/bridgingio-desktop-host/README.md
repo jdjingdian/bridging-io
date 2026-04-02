@@ -7,6 +7,7 @@ Included capabilities:
 
 - single-window + tray/menu lifecycle model
 - runtime root startup preference persistence and startup routing
+- shared bootstrap status + recovery action projection for onboarding/recovery
 - trusted local control-plane bridge (line codec over local transport)
 - managed restart state + recovery action model
 - onboarding gate contract (no cancel path before valid runtime root)

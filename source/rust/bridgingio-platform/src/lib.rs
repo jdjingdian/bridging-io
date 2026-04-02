@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
+use bridgingio_domain::ContractStatus;
+
 mod local_shell_runtime;
 
 use local_shell_runtime::{BaselineLocalShellRuntime, InteractiveShellRuntimeSnapshot};
@@ -51,6 +53,15 @@ impl CapabilityStatus {
             CapabilityStatus::Degraded => "degraded",
             CapabilityStatus::Fallback => "fallback",
             CapabilityStatus::Unsupported => "unsupported",
+        }
+    }
+
+    pub fn contract_status(self) -> ContractStatus {
+        match self {
+            Self::Ready => ContractStatus::Ready,
+            Self::Degraded => ContractStatus::Degraded,
+            Self::Fallback => ContractStatus::Fallback,
+            Self::Unsupported => ContractStatus::Unsupported,
         }
     }
 }
@@ -985,12 +996,8 @@ impl RuntimePathsAdapter for PlatformRuntimePathsAdapter {
 
     fn default_data_dir(&self, instance_name: &str) -> PathBuf {
         let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-        match self.platform {
-            HostPlatform::Windows => home
-                .join("BridgingIO")
-                .join(sanitize_instance_name(instance_name)),
-            _ => home.join(".bridgingio"),
-        }
+        let _ = instance_name;
+        home.join(".bridgingio")
     }
 
     fn expand_user_path(&self, raw: &str) -> PathBuf {

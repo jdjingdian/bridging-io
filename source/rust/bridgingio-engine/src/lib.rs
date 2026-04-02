@@ -6,10 +6,10 @@ use std::time::SystemTime;
 
 use bridgingio_domain::{
     build_logical_session_key, AccessScope, ApprovalRequestRecord, ArtifactRecord, AuditEvent,
-    ChannelKind, ChannelRecord, ChannelStatus, EnvironmentFingerprint, LogicalSessionRecord,
-    LogicalSessionStatus, SessionRecord, SessionReusePolicy, TargetKind, TargetProfile,
-    TerminalConcurrencyPolicy, TerminalTargetFamily, TransportSessionRecord,
-    TransportSessionStatus,
+    ChannelKind, ChannelRecord, ChannelStatus, CommonErrorCode, ContractStatus,
+    EnvironmentFingerprint, ErrorDomain, LogicalSessionRecord, LogicalSessionStatus,
+    SessionRecord, SessionReusePolicy, SharedError, TargetKind, TargetProfile,
+    TerminalConcurrencyPolicy, TerminalTargetFamily, TransportSessionRecord, TransportSessionStatus,
 };
 
 #[derive(Default)]
@@ -583,6 +583,72 @@ pub enum ConfigError {
     NonLoopbackExplicitEnableRequired(String),
     NonLoopbackAuthRequired(String),
     Io(String),
+}
+
+impl ConfigError {
+    pub fn shared_error(&self) -> SharedError {
+        let (common_code, module_code, message, recovery_hint) = match self {
+            Self::MissingSection(section) => (
+                CommonErrorCode::ValidationFailed,
+                format!("config.missing_section.{section}"),
+                format!("missing config section `{section}`"),
+                "add the missing section to the config and retry".to_string(),
+            ),
+            Self::MissingField(field) => (
+                CommonErrorCode::ValidationFailed,
+                format!("config.missing_field.{field}"),
+                format!("missing config field `{field}`"),
+                "fill in the missing config field and retry".to_string(),
+            ),
+            Self::InvalidValue { field, reason } => (
+                CommonErrorCode::ValidationFailed,
+                format!("config.invalid_value.{field}"),
+                format!("invalid config value for `{field}`: {reason}"),
+                "fix the invalid config value and retry".to_string(),
+            ),
+            Self::UnsupportedSchemaVersion(version) => (
+                CommonErrorCode::Unsupported,
+                "config.unsupported_schema_version".to_string(),
+                format!("unsupported config schema version `{version}`"),
+                "migrate the config to a supported schema version".to_string(),
+            ),
+            Self::SensitiveFieldInConfig(field) => (
+                CommonErrorCode::ValidationFailed,
+                format!("config.sensitive_field.{field}"),
+                format!("sensitive field `{field}` is not allowed in config"),
+                "remove secret material from the config file and use a managed secret route"
+                    .to_string(),
+            ),
+            Self::NonLoopbackExplicitEnableRequired(host) => (
+                CommonErrorCode::NotReady,
+                "config.non_loopback_explicit_enable_required".to_string(),
+                format!("non-loopback model-plane host `{host}` requires explicit enable"),
+                "set allow_non_loopback explicitly before exposing the model-plane"
+                    .to_string(),
+            ),
+            Self::NonLoopbackAuthRequired(host) => (
+                CommonErrorCode::NotReady,
+                "config.non_loopback_auth_required".to_string(),
+                format!("non-loopback model-plane host `{host}` requires authentication"),
+                "configure a protected auth mode before exposing the model-plane".to_string(),
+            ),
+            Self::Io(_) => (
+                CommonErrorCode::DependencyUnavailable,
+                "config.io".to_string(),
+                "config file could not be read".to_string(),
+                "verify the config path is readable and try again".to_string(),
+            ),
+        };
+        let status = match common_code {
+            CommonErrorCode::Unsupported => ContractStatus::Unsupported,
+            CommonErrorCode::NotReady => ContractStatus::NotReady,
+            CommonErrorCode::DependencyUnavailable => ContractStatus::NotReady,
+            _ => ContractStatus::Failed,
+        };
+        SharedError::new(status, ErrorDomain::Config, common_code, message)
+            .with_module_code(module_code)
+            .with_recovery_hint(recovery_hint)
+    }
 }
 
 impl CoreSettings {
@@ -2517,5 +2583,18 @@ mod config_tests {
         );
         let err = CoreSettings::from_toml_str(&invalid).expect_err("must reject unknown policy");
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn config_error_maps_to_shared_error_contract() {
+        let shared = ConfigError::NonLoopbackAuthRequired("0.0.0.0".into()).shared_error();
+        assert_eq!(shared.status.as_str(), "not_ready");
+        assert_eq!(shared.domain.as_str(), "config");
+        assert_eq!(shared.common_code.as_str(), "not_ready");
+        assert_eq!(
+            shared.module_code.as_deref(),
+            Some("config.non_loopback_auth_required")
+        );
+        assert!(shared.recovery_hint.is_some());
     }
 }

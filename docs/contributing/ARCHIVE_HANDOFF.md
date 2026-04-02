@@ -28,6 +28,7 @@ PR description must include:
 - why the change is needed
 - key implementation or design decisions
 - test and validation status
+- matrix updates (self-test / interface matrix) when applicable
 - follow-up or risk notes when relevant
 
 ## Recommended Template
@@ -48,4 +49,3 @@ PR description must include:
 ## Risks / Follow-ups
 [optional]
 ```
-

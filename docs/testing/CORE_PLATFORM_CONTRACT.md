@@ -13,7 +13,7 @@ The contract must cover these capability groups:
 - vault: `os-native` backend status and degraded semantics
 - logger: runtime event categories and level-controlled output
 - decoder: platform-compatible text decode plus newline normalization
-- self-test: `bridgingio-core --self-test` validates key contract paths, including vault/auth contract smoke and default model-plane bind probe on `127.0.0.1:19718`
+- self-test: debug-build-only `bridgingio-core --self-test` validates key contract paths, including vault/auth contract smoke and default model-plane bind probe on `127.0.0.1:19718`
 
 ## Matrix Suites
 
@@ -25,7 +25,7 @@ The contract must cover these capability groups:
 | `CP-RUNTIME-PATHS` | host-aware runtime path resolution and endpoint contract | `source/rust/bridgingio-platform/src/lib.rs` unit tests + `bridgingio-core --self-test` step `[8/8]` |
 | `CP-TOOLCHAIN-FALLBACK` | toolchain fallback and diagnostics hierarchy | `source/rust/bridgingio-mcp/src/lib.rs` toolchain tests + connector/runtime integration tests |
 | `CP-VAULT-LOGGER-DECODER` | native vault degraded semantics, broker-only secret use, local admin verification, logger categories, decoder normalization | `source/rust/bridgingio-secrets/src/lib.rs` unit tests + `source/rust/bridgingio-platform/src/lib.rs` unit tests + `bridgingio-core --self-test` steps `[5/8]` and `[8/8]` |
-| `CP-SELF-TEST` | end-to-end CLI self-test smoke for contract-critical paths, including vault/auth smoke, non-loopback safety defaults, and default model-plane bind diagnostics on `127.0.0.1:19718` | `cargo run -p bridgingio-mcp --bin bridgingio-core -- --self-test` |
+| `CP-SELF-TEST` | end-to-end CLI self-test smoke for contract-critical paths, including vault/auth smoke, non-loopback safety defaults, and default model-plane bind diagnostics on `127.0.0.1:19718` | `cargo run -p bridgingio-mcp --bin bridgingio-core -- --self-test` (debug builds only; release rejects) |
 
 ## Standard Matrix Run
 
@@ -37,6 +37,10 @@ scripts/testing/run-core-platform-contract.sh
 
 The script runs the minimum reproducible local contract suites and writes a JSONL execution record.
 
+Canonical matrix details live in:
+
+- `docs/matrix/SELF_TEST_CASE_MATRIX.md`
+
 ## Execution Record Format (CI And Manual)
 
 Every platform run (macOS, Windows, Linux) should persist one JSONL line per suite:
@@ -44,6 +48,8 @@ Every platform run (macOS, Windows, Linux) should persist one JSONL line per sui
 ```json
 {
   "platform": "macos|windows|linux",
+  "arch": "x86_64|aarch64|arm64",
+  "build_profile": "debug",
   "suite": "CP-INTERACTIVE",
   "status": "passed|failed",
   "retries": 0,
@@ -56,6 +62,8 @@ Every platform run (macOS, Windows, Linux) should persist one JSONL line per sui
 Required fields:
 
 - `platform`: host OS label used in matrix reports
+- `arch`: host CPU architecture label used in matrix reports
+- `build_profile`: build profile used for the run
 - `suite`: contract suite id
 - `status`: final status
 - `retries`: number of retries used to pass

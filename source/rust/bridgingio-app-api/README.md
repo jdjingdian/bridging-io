@@ -1,7 +1,7 @@
 # BridgingIO App API Boundary
 
-This crate defines the boundary contract between the SwiftUI macOS shell and
-the Rust core engine.
+This crate defines the boundary contract between trusted local operator
+surfaces and the Rust core engine.
 
 ## Design Goals
 
@@ -54,6 +54,17 @@ decode typed `ApiRequest`/`ApiResponse` payloads for local IPC adapters.
 
 ## Error Model
 
-- `ApiErrorCode` captures high-level classes (not found, permission denied,
-  validation failed, dependency unavailable, internal).
-- `ApiError` includes retriable hint for user-facing recovery behavior.
+- `ApiError` carries a shared error contract:
+  - `status`
+  - `domain`
+  - `common_code`
+  - optional `module_code`
+  - display-safe `message`
+  - `retriable`
+  - optional `recovery_hint`
+- Error fields are intended to stay stable across local control-plane,
+  standalone operator flows, and future UI/TUI hosts.
+
+Canonical local operator surface coverage lives in:
+
+- `docs/matrix/LOCAL_OPERATOR_INTERFACE_MATRIX.md`

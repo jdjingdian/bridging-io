@@ -40,10 +40,24 @@ Secret input source contract:
 - explicit multi-source declaration fails closed
 - audit emits `source_kind`/`intent_id`/source digest metadata, never plaintext
 
+Startup unlock contract:
+
+- standalone foreground (`run`) keeps the configured `trigger_policy`
+- if foreground startup needs passphrase material, it must use hidden local TTY input
+- standalone detached (`-d`) overrides `trigger_policy` to `on-core-start`
+- detached startup may only consume a one-shot parent-provided local carrier
+  (currently piped stdin from the launcher path)
+- if detached startup does not receive valid unlock material for an
+  `on-core-start` path, startup stays fail-closed instead of silently deferring
+  unlock to a later secret access
+
 ## Operational Checklist
 
 1. Initialize vault metadata and confirm lock/protector state projection.
 2. Import secrets via fd/stdin/file/tty routes (never plaintext argv).
-3. Unlock vault through trusted verification flow.
-4. Create least-privilege long-lived tokens and capture one-time reveal.
-5. Revoke stale tokens and rotate secrets/protector policy periodically.
+3. For foreground startup, unlock vault through trusted verification or hidden
+   local prompt as required by policy.
+4. For detached startup, provide startup unlock material via the launcher
+   carrier before backgrounding the child process.
+5. Create least-privilege long-lived tokens and capture one-time reveal.
+6. Revoke stale tokens and rotate secrets/protector policy periodically.

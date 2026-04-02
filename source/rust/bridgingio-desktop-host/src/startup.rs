@@ -1,6 +1,8 @@
 use std::io;
 use std::path::PathBuf;
 
+use bridgingio_domain::{RuntimeBootstrapStatus, RuntimeRecoveryAction};
+
 use crate::storage::{
     validate_runtime_root, RuntimeRootPreferenceStore, RuntimeRootValidationError,
 };
@@ -15,6 +17,27 @@ pub enum StartupRoute {
     Workspace {
         runtime_root: PathBuf,
     },
+}
+
+impl StartupRoute {
+    pub fn bootstrap_status(&self) -> RuntimeBootstrapStatus {
+        match self {
+            StartupRoute::Onboarding => RuntimeBootstrapStatus::NeedsRelocate,
+            StartupRoute::Recovery { reason, .. } => reason.bootstrap_status(),
+            StartupRoute::Workspace { .. } => RuntimeBootstrapStatus::Ready,
+        }
+    }
+
+    pub fn recovery_actions(&self) -> Vec<RuntimeRecoveryAction> {
+        match self {
+            StartupRoute::Onboarding => vec![
+                RuntimeRecoveryAction::ChooseRuntimeRoot,
+                RuntimeRecoveryAction::Retry,
+            ],
+            StartupRoute::Recovery { reason, .. } => reason.recovery_actions(),
+            StartupRoute::Workspace { .. } => Vec::new(),
+        }
+    }
 }
 
 pub fn resolve_startup_route(store: &RuntimeRootPreferenceStore) -> io::Result<StartupRoute> {
@@ -58,6 +81,8 @@ mod tests {
 
         let route = resolve_startup_route(&store)?;
         assert_eq!(route, StartupRoute::Onboarding);
+        assert_eq!(route.bootstrap_status().as_str(), "needs_relocate");
+        assert_eq!(route.recovery_actions().len(), 2);
 
         fs::remove_dir_all(&root)?;
         Ok(())
@@ -79,6 +104,7 @@ mod tests {
                 reason: RuntimeRootValidationError::MissingPath,
             }
         );
+        assert_eq!(route.bootstrap_status().as_str(), "needs_relocate");
 
         fs::remove_dir_all(&root)?;
         Ok(())
@@ -100,6 +126,8 @@ mod tests {
                 runtime_root: runtime,
             }
         );
+        assert_eq!(route.bootstrap_status().as_str(), "ready");
+        assert!(route.recovery_actions().is_empty());
 
         fs::remove_dir_all(&root)?;
         Ok(())

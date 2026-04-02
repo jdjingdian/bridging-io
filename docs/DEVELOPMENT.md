@@ -46,6 +46,8 @@ Terminal provider runtime notes:
 Cross-platform architecture references:
 
 - core platform contract: `docs/testing/CORE_PLATFORM_CONTRACT.md`
+- self-test / contract matrix: `docs/matrix/SELF_TEST_CASE_MATRIX.md`
+- local operator interface matrix: `docs/matrix/LOCAL_OPERATOR_INTERFACE_MATRIX.md`
 - runtime root layout contract: `docs/runtime/RUNTIME_ROOT_LAYOUT.md`
 - platform handoff and workflow boundaries: `docs/runtime/PLATFORM_RUNTIME_HANDOFF.md`
 - tauri shell host/webview handoff: `docs/runtime/TAURI_SHELL_HANDOFF.md`
@@ -143,19 +145,48 @@ source/ui/tauri-console-web/src-tauri/scripts/stage-sidecar.sh debug
 
 ## Standalone Core Quick Start
 
-1. Prepare a standalone config (TOML). You can start from:
+1. Optional: prepare or edit config through `menuconfig`.
+
+```bash
+cd source/rust
+
+# use the canonical default config under ~/.bridgingio
+cargo run -p bridgingio-mcp --bin bridgingio-core -- menuconfig
+
+# or edit a specific config file
+cargo run -p bridgingio-mcp --bin bridgingio-core -- menuconfig --config /absolute/path/to/config.toml
+```
+
+`menuconfig` is the common configuration mode for `bridgingio-core`; it is not
+standalone-specific. Existing `vault ...` and `auth ...` subcommands remain
+available as compatibility management routes for now.
+
+2. Optional: prepare a standalone config (TOML) manually. You can start from:
 
 - `source/rust/bridgingio-engine/tests/fixtures/standalone-minimal.toml`
 - `source/rust/bridgingio-engine/tests/fixtures/standalone-complete.toml`
 
-2. Start core:
+3. Start core.
+
+Default standalone startup now uses the canonical runtime root under the user
+home directory:
+
+- `~/.bridgingio`
+- `config/managed-core.toml` is load-or-create when `--config` is omitted
+
+Examples:
 
 ```bash
 cd source/rust
+
+# use default runtime root + default config
+cargo run -p bridgingio-mcp --bin bridgingio-core --
+
+# use explicit standalone config override
 cargo run -p bridgingio-mcp --bin bridgingio-core -- --config /absolute/path/to/standalone.toml
 ```
 
-3. Validate model-plane HTTP:
+4. Validate model-plane HTTP:
 
 ```bash
 curl http://127.0.0.1:19718/health
@@ -233,6 +264,8 @@ curl -s http://127.0.0.1:19718/mcp \
 
 `bridgingio-core` supports three operator-facing launch modes:
 
+- `menuconfig`: common TUI configuration mode for editing a config file before
+  runtime startup.
 - `run`: standalone foreground mode. Core stays attached to the current terminal.
 - `-d`: standalone detached mode. A launcher process spawns a background core child and returns immediately.
 - `ui-managed-ephemeral`: bundled mode for platform UI hosts (for example macOS SwiftUI) that own the core lifecycle.
@@ -242,10 +275,19 @@ Examples:
 ```bash
 cd source/rust
 
-# standalone foreground
+# standalone foreground (default config)
+cargo run -p bridgingio-mcp --bin bridgingio-core -- run
+
+# menuconfig using the default config
+cargo run -p bridgingio-mcp --bin bridgingio-core -- menuconfig
+
+# standalone foreground (explicit config override)
 cargo run -p bridgingio-mcp --bin bridgingio-core -- run --config /absolute/path/to/standalone.toml
 
-# standalone detached
+# standalone detached (default config)
+cargo run -p bridgingio-mcp --bin bridgingio-core -- -d
+
+# standalone detached (explicit config override)
 cargo run -p bridgingio-mcp --bin bridgingio-core -- -d --config /absolute/path/to/standalone.toml
 
 # bundled UI-managed mode (load-or-create from runtime root)
@@ -273,6 +315,16 @@ Standalone lifecycle contract (`run` and `-d`):
 - Model-plane is available immediately after core startup completes.
 - Attach gating is not enforced.
 - `run` and `-d` reuse the same runtime/configuration semantics.
+- Omit `--config` to use the canonical default runtime root under `~/.bridgingio`.
+- Use `--config` only when intentionally overriding the default config path.
+- `run` keeps the configured vault `trigger_policy`; if startup needs passphrase
+  material, the core uses hidden local TTY input.
+- `-d` is still a standalone sub-mode, but it overrides vault startup semantics
+  to `on-core-start`; if startup unlock material is required, the launcher must
+  provide it through a one-shot local carrier instead of waiting for later
+  interaction.
+- `menuconfig` is the intended pre-run configuration flow; use it to inspect
+  and update config before `run` / `-d`.
 
 Future extension point:
 

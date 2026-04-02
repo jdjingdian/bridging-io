@@ -12,7 +12,10 @@ use bridgingio_app_api::{ApiRequest, ApiRequestContext, ApiResponse, AppCommand}
 use bridgingio_connectors::{
     BuiltInBinarySpec, BuiltInDistributionKind, ExecutableResolver, ToolchainResolver,
 };
-use bridgingio_domain::{PolicyProfile, SessionReusePolicy, TargetKind};
+use bridgingio_domain::{
+    CommonErrorCode, ContractStatus, ErrorDomain, PolicyProfile, RuntimeBootstrapStatus,
+    RuntimeRecoveryAction, SessionReusePolicy, SharedError, StartupUnlockCarrierKind, TargetKind,
+};
 use bridgingio_engine::{
     ConfigError, CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile,
     StandaloneTerminalSection, TerminalProviderSection,
@@ -21,6 +24,7 @@ use bridgingio_mcp::{
     control_plane_socket_path, CoreHostMode, CoreRuntimeError, ModelPlaneHttpServer,
     StandaloneCoreRuntime,
 };
+use bridgingio_operator_console::run_menuconfig;
 use bridgingio_platform::{
     detect_host_platform_adapter, CapabilityStatus, HostPlatform, RuntimeLogCategory,
     RuntimeLogLevel,
@@ -42,6 +46,7 @@ use bridgingio_mcp::ControlPlaneIpcServer;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchMode {
     SelfTest,
+    MenuConfig,
     UiManagedEphemeral,
     StandaloneRun,
     StandaloneDetachedLauncher,
@@ -138,25 +143,73 @@ struct CliArgs {
     management_command: Option<ManagementCommand>,
 }
 
+#[allow(dead_code)]
+struct RuntimeBootstrapOutcome {
+    config_path: PathBuf,
+    status: RuntimeBootstrapStatus,
+    recovery_actions: Vec<RuntimeRecoveryAction>,
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("{message}");
+            emit_cli_shared_error(
+                SharedError::new(
+                    ContractStatus::Failed,
+                    ErrorDomain::RuntimeLifecycle,
+                    CommonErrorCode::ValidationFailed,
+                    message,
+                )
+                .with_module_code("standalone_cli.argument_error")
+                .with_recovery_hint("review command usage and retry"),
+            );
             print_usage();
             std::process::exit(2);
         }
     };
 
     if let Err(err) = run(args) {
-        eprintln!("failed to start bridgingio-core: {err}");
+        emit_cli_shared_error(
+            SharedError::new(
+                ContractStatus::Failed,
+                ErrorDomain::RuntimeLifecycle,
+                CommonErrorCode::DependencyUnavailable,
+                format!("failed to start bridgingio-core: {err}"),
+            )
+            .with_module_code("standalone_cli.startup_failed")
+            .with_recovery_hint("inspect startup diagnostics and retry"),
+        );
         std::process::exit(1);
     }
+}
+
+fn emit_cli_shared_error(error: SharedError) {
+    eprintln!(
+        "status={}|domain={}|common_code={}|module_code={}|message={}|recovery_hint={}",
+        error.status.as_str(),
+        error.domain.as_str(),
+        error.common_code.as_str(),
+        escape_cli(error.module_code.as_deref().unwrap_or("")),
+        escape_cli(&error.message),
+        escape_cli(error.recovery_hint.as_deref().unwrap_or("")),
+    );
+}
+
+fn escape_cli(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\p")
+        .replace('\n', "\\n")
 }
 
 fn run(args: CliArgs) -> Result<(), String> {
     if args.mode == LaunchMode::SelfTest {
         return run_self_test();
+    }
+    if args.mode == LaunchMode::MenuConfig {
+        let config_path = resolve_menuconfig_path(&args)?;
+        return run_menuconfig_command(&config_path);
     }
     if let Some(command) = args.management_command.clone() {
         let config_path = resolve_config_path(&args)?;
@@ -185,6 +238,7 @@ fn run(args: CliArgs) -> Result<(), String> {
             CoreHostMode::StandaloneDetached,
             args.control_plane_socket_override.as_deref(),
         ),
+        LaunchMode::MenuConfig => unreachable!("menuconfig handled before config resolution"),
         LaunchMode::SelfTest => unreachable!("self-test handled before config resolution"),
     }
 }
@@ -372,6 +426,9 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
 }
 
 fn run_self_test() -> Result<(), String> {
+    if !cfg!(debug_assertions) {
+        return Err("--self-test is only available in debug builds".to_string());
+    }
     println!("running bridgingio-core self-test...");
 
     let stamp = SystemTime::now()
@@ -1202,6 +1259,7 @@ fn run_core(
         ),
     );
     apply_control_plane_socket_override(&mut settings, control_plane_socket_override)?;
+    apply_detached_unlock_override(&mut settings, host_mode, host_platform_adapter.as_ref());
     if control_plane_socket_override.is_some() {
         let warning =
             "using --control-plane-socket-override escape hatch (intended for debug/testing)";
@@ -1213,13 +1271,17 @@ fn run_core(
         );
     }
     let toolchain_resolver = default_toolchain_resolver(&settings, &config_path);
-    let runtime = StandaloneCoreRuntime::from_settings_with_mode(
+    let mut runtime = StandaloneCoreRuntime::from_settings_with_mode(
         settings.clone(),
         toolchain_resolver,
         host_mode,
     )
-    .map_err(|err| format!("{err:?}"))?
-    .shared();
+    .map_err(|err| format!("{err:?}"))?;
+    let startup_unlock_secret = startup_unlock_secret_for_mode(host_mode, &runtime)?;
+    runtime
+        .complete_startup_unlock_with_secret(startup_unlock_secret.as_deref())
+        .map_err(|err| format!("{err:?}"))?;
+    let runtime = runtime.shared();
     {
         let mut locked = runtime
             .lock()
@@ -1491,6 +1553,16 @@ fn spawn_detached_child(
     config_path: &Path,
     control_plane_socket_override: Option<&Path>,
 ) -> Result<(), String> {
+    let forwarded_startup_secret = if io::stdin().is_terminal() {
+        None
+    } else {
+        let bytes = read_all_stdin()?;
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(bytes)
+        }
+    };
     let exe = env::current_exe().map_err(|err| format!("resolve current_exe failed: {err}"))?;
     let mut command = Command::new(exe);
     command
@@ -1501,12 +1573,23 @@ fn spawn_detached_child(
     if let Some(path) = control_plane_socket_override {
         command.arg("--control-plane-socket-override").arg(path);
     }
-    let child = command
-        .stdin(Stdio::null())
+    let mut child = command
+        .stdin(if forwarded_startup_secret.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("spawn detached child failed: {err}"))?;
+    if let Some(bytes) = forwarded_startup_secret {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(&bytes)
+                .map_err(|err| format!("forward detached startup carrier failed: {err}"))?;
+        }
+    }
     println!(
         "bridgingio-core detached in background (pid={})",
         child.id()
@@ -1604,6 +1687,7 @@ where
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--self-test" => mode = LaunchMode::SelfTest,
+            "menuconfig" => mode = LaunchMode::MenuConfig,
             "run" => mode = LaunchMode::StandaloneRun,
             "ui-managed-ephemeral" => mode = LaunchMode::UiManagedEphemeral,
             "-d" => mode = LaunchMode::StandaloneDetachedLauncher,
@@ -1662,10 +1746,15 @@ where
                 );
             }
         }
-        _ => {
-            if config_path.is_none() {
-                return Err("missing required argument: --config <path>".to_string());
+        LaunchMode::MenuConfig => {
+            if runtime_root.is_some() || control_plane_socket_override.is_some() {
+                return Err(
+                    "menuconfig only accepts optional --config and does not consume --runtime-root/--control-plane-socket-override"
+                        .to_string(),
+                );
             }
+        }
+        _ => {
             if runtime_root.is_some() {
                 return Err("--runtime-root is only supported in ui-managed-ephemeral mode".into());
             }
@@ -1993,15 +2082,62 @@ fn read_secret_from_tty_prompt(prompt: &str) -> Result<Vec<u8>, String> {
     if !io::stdin().is_terminal() {
         return Err("tty prompt requested but stdin is not a tty".to_string());
     }
-    print!("{prompt}");
-    io::stdout()
-        .flush()
-        .map_err(|err| format!("flush tty prompt failed: {err}"))?;
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|err| format!("read tty prompt input failed: {err}"))?;
+    let line =
+        rpassword::prompt_password(prompt).map_err(|err| format!("read tty prompt input failed: {err}"))?;
     Ok(trim_single_trailing_newline(line).into_bytes())
+}
+
+fn apply_detached_unlock_override(
+    settings: &mut CoreSettings,
+    host_mode: CoreHostMode,
+    host_platform_adapter: &dyn bridgingio_platform::HostPlatformAdapter,
+) {
+    if host_mode != CoreHostMode::StandaloneDetached {
+        return;
+    }
+    if settings.vault.unlock.trigger_policy != "on-core-start" {
+        settings.vault.unlock.trigger_policy = "on-core-start".into();
+        host_platform_adapter.runtime_logger().log(
+            RuntimeLogLevel::Warn,
+            RuntimeLogCategory::Vault,
+            "standalone detached mode overrides vault trigger_policy to on-core-start",
+        );
+    }
+}
+
+fn startup_unlock_secret_for_mode(
+    host_mode: CoreHostMode,
+    runtime: &StandaloneCoreRuntime,
+) -> Result<Option<String>, String> {
+    if !runtime.requires_startup_secret_input() {
+        return Ok(None);
+    }
+    match host_mode {
+        CoreHostMode::StandaloneRun => {
+            let secret = String::from_utf8(read_secret_from_tty_prompt(
+                "Enter vault passphrase: ",
+            )?)
+            .map_err(|_| "startup unlock secret must be valid UTF-8".to_string())?;
+            let _carrier = StartupUnlockCarrierKind::HiddenPrompt;
+            Ok(Some(secret))
+        }
+        CoreHostMode::StandaloneDetached => {
+            if io::stdin().is_terminal() {
+                return Ok(None);
+            }
+            let secret = String::from_utf8(read_all_stdin()?)
+                .map_err(|_| "startup unlock secret must be valid UTF-8".to_string())?;
+            if secret.is_empty() {
+                return Ok(None);
+            }
+            let _carrier = StartupUnlockCarrierKind::ParentStdin;
+            Ok(Some(trim_single_trailing_newline(secret)))
+        }
+        CoreHostMode::UiManagedEphemeral => {
+            let _carrier = StartupUnlockCarrierKind::TrustedLocalVerification;
+            Ok(None)
+        }
+    }
 }
 
 fn trim_single_trailing_newline(value: String) -> String {
@@ -2114,8 +2250,9 @@ fn reject_plaintext_secret_argv(args: &[String]) -> Result<(), String> {
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  bridgingio-core --self-test");
-    eprintln!("  bridgingio-core run --config <path-to-standalone.toml>");
-    eprintln!("  bridgingio-core -d --config <path-to-standalone.toml>");
+    eprintln!("  bridgingio-core menuconfig [--config <path-to-config.toml>]");
+    eprintln!("  bridgingio-core run [--config <path-to-standalone.toml>]");
+    eprintln!("  bridgingio-core -d [--config <path-to-standalone.toml>]");
     eprintln!("  bridgingio-core ui-managed-ephemeral --runtime-root <runtime-root-dir>");
     eprintln!("  bridgingio-core ui-managed-ephemeral --config <path-to-managed-core.toml>");
     eprintln!("  bridgingio-core vault init --config <path-to-standalone.toml>");
@@ -2130,20 +2267,122 @@ fn resolve_config_path(args: &CliArgs) -> Result<PathBuf, String> {
     if let Some(path) = args.config_path.clone() {
         return Ok(path);
     }
-    if args.mode == LaunchMode::UiManagedEphemeral {
-        if let Some(runtime_root) = args.runtime_root.as_ref() {
-            return ensure_runtime_root_layout(runtime_root);
+    match args.mode {
+        LaunchMode::UiManagedEphemeral => {
+            if let Some(runtime_root) = args.runtime_root.as_ref() {
+                return ensure_runtime_root_layout(
+                    runtime_root,
+                    "bridgingio-ui-managed",
+                    "managed-core.toml",
+                    default_managed_core_config,
+                )
+                .map(|outcome| {
+                    let RuntimeBootstrapOutcome {
+                        config_path,
+                        status: _,
+                        recovery_actions: _,
+                    } = outcome;
+                    config_path
+                });
+            }
+            Err("missing config path".to_string())
         }
+        LaunchMode::StandaloneRun
+        | LaunchMode::StandaloneDetachedLauncher
+        | LaunchMode::StandaloneDetachedChild
+        | LaunchMode::MenuConfig => {
+            let runtime_root = default_standalone_runtime_root()?;
+            ensure_runtime_root_layout(
+                &runtime_root,
+                "bridgingio-standalone",
+                "managed-core.toml",
+                default_standalone_core_config,
+            )
+            .map(|outcome| {
+                let RuntimeBootstrapOutcome {
+                    config_path,
+                    status: _,
+                    recovery_actions: _,
+                } = outcome;
+                config_path
+            })
+        }
+        LaunchMode::SelfTest => Err("missing config path".to_string()),
     }
-    Err("missing config path".to_string())
 }
 
-fn ensure_runtime_root_layout(runtime_root: &Path) -> Result<PathBuf, String> {
+fn resolve_menuconfig_path(args: &CliArgs) -> Result<PathBuf, String> {
+    if let Some(path) = args.config_path.as_ref() {
+        return ensure_explicit_menuconfig_path(path);
+    }
+    resolve_config_path(args)
+}
+
+fn ensure_explicit_menuconfig_path(config_path: &Path) -> Result<PathBuf, String> {
+    if config_path.exists() {
+        return Ok(config_path.to_path_buf());
+    }
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| "menuconfig --config requires a path with a parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create menuconfig config parent failed: {} ({err})",
+            parent.display()
+        )
+    })?;
+    let runtime_root = if config_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value == "managed-core.toml")
+        && parent
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value == "config")
+    {
+        parent.parent().unwrap_or(parent)
+    } else {
+        parent
+    };
+    let adapter = detect_host_platform_adapter("info");
+    let runtime_paths = adapter
+        .runtime_paths()
+        .runtime_paths("bridgingio-menuconfig", runtime_root);
+    let config_text = if config_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value == "managed-core.toml")
+    {
+        default_managed_core_config(runtime_root, &runtime_paths)
+    } else {
+        default_standalone_core_config(runtime_root, &runtime_paths)
+    };
+    fs::write(config_path, config_text).map_err(|err| {
+        format!(
+            "create menuconfig config failed: {} ({err})",
+            config_path.display()
+        )
+    })?;
+    Ok(config_path.to_path_buf())
+}
+
+fn default_standalone_runtime_root() -> Result<PathBuf, String> {
+    Ok(detect_host_platform_adapter("info")
+        .runtime_paths()
+        .default_data_dir("bridgingio"))
+}
+
+fn ensure_runtime_root_layout(
+    runtime_root: &Path,
+    instance_name: &str,
+    config_name: &str,
+    default_config: fn(&Path, &bridgingio_platform::RuntimePaths) -> String,
+) -> Result<RuntimeBootstrapOutcome, String> {
     ensure_runtime_dir(runtime_root, "runtime root")?;
     let host_platform_adapter = detect_host_platform_adapter("info");
     let runtime_paths = host_platform_adapter
         .runtime_paths()
-        .runtime_paths("bridgingio-ui-managed", runtime_root);
+        .runtime_paths(instance_name, runtime_root);
     let config_dir = runtime_root.join("config");
     let state_dir = runtime_paths.state_dir.clone();
     let artifacts_dir = runtime_paths.artifact_root.clone();
@@ -2167,20 +2406,20 @@ fn ensure_runtime_root_layout(runtime_root: &Path) -> Result<PathBuf, String> {
     ensure_writable_probe(&artifacts_dir, "artifacts dir")?;
     ensure_writable_probe(&logs_dir, "logs dir")?;
 
-    let config_path = config_dir.join("managed-core.toml");
+    let config_path = config_dir.join(config_name);
     if !config_path.exists() {
-        fs::write(
-            &config_path,
-            default_managed_core_config(runtime_root, &runtime_paths),
-        )
-        .map_err(|err| {
+        fs::write(&config_path, default_config(runtime_root, &runtime_paths)).map_err(|err| {
             format!(
-                "create managed config failed: {} ({err})",
+                "create default config failed: {} ({err})",
                 config_path.display()
             )
         })?;
     }
-    Ok(config_path)
+    Ok(RuntimeBootstrapOutcome {
+        config_path,
+        status: RuntimeBootstrapStatus::Ready,
+        recovery_actions: Vec::new(),
+    })
 }
 
 fn ensure_runtime_dir(path: &Path, label: &str) -> Result<(), String> {
@@ -2264,6 +2503,97 @@ capture_env_fingerprint = true
     )
 }
 
+fn default_standalone_core_config(
+    runtime_root: &Path,
+    runtime_paths: &bridgingio_platform::RuntimePaths,
+) -> String {
+    let data_dir = toml_escape_path(runtime_root);
+    let metadata_path = toml_escape_path(&runtime_paths.metadata_path);
+    let artifacts_path = toml_escape_path(&runtime_paths.artifact_root);
+    let endpoint = toml_escape_string(&runtime_paths.control_plane_endpoint);
+    format!(
+        r#"schema_version = 1
+
+[core]
+instance_name = "bridgingio-standalone"
+data_dir = "{data_dir}"
+log_level = "info"
+
+[storage]
+metadata_backend = "sqlite"
+metadata_path = "{metadata_path}"
+
+[storage.artifacts]
+backend = "filesystem"
+root = "{artifacts_path}"
+max_bytes = 268435456
+eviction_policy = "lru"
+
+[vault]
+backend = "builtin-encrypted"
+namespace = "io.bridgingio"
+
+[vault.unlock]
+trigger_policy = "on-first-secret-access"
+allowed_methods = ["os-native", "passphrase"]
+preferred_method = "os-native"
+cache_ttl_sec = 600
+require_fresh_user_verification = true
+
+[vault.protectors.primary]
+kind = "os-native"
+
+[[vault.protectors.recovery]]
+kind = "passphrase"
+kdf = "argon2id"
+profile = "interactive-default"
+
+[vault.ssh]
+delivery_mode = "ssh-agent-broker"
+fallback_delivery_mode = "ephemeral-identity-file"
+
+[control_plane]
+enabled = true
+transport = "platform-ipc"
+endpoint = "{endpoint}"
+
+[model_plane.http]
+enabled = true
+host = "127.0.0.1"
+port = 19718
+allow_non_loopback = false
+
+[model_plane.http.auth]
+mode = "none"
+required_when_non_loopback = true
+allow_loopback_anonymous_compat = true
+
+[policies.defaults]
+reuse_policy = "resume_or_create"
+approval_mode = "on-risk"
+capture_env_fingerprint = true
+mcp_target_resolution_policy = "confirm_if_family"
+"#
+    )
+}
+
+fn run_menuconfig_command(config_path: &Path) -> Result<(), String> {
+    let outcome = run_menuconfig(config_path.to_path_buf())?;
+    if outcome.saved {
+        if let Some(strategy) = outcome.apply_strategy {
+            println!(
+                "menuconfig saved config at {} (apply_strategy={strategy})",
+                outcome.config_path.display()
+            );
+        } else {
+            println!("menuconfig closed without pending changes");
+        }
+    } else {
+        println!("menuconfig exited with unsaved changes");
+    }
+    Ok(())
+}
+
 fn toml_escape_path(path: &Path) -> String {
     toml_escape_string(&path.to_string_lossy())
 }
@@ -2283,6 +2613,8 @@ mod tests {
     use bridgingio_engine::CoreSettings;
 
     use super::{parse_args_from, CliArgs, LaunchMode, ManagementCommand, SecretInputRoute};
+    use bridgingio_mcp::CoreHostMode;
+    use bridgingio_platform::detect_host_platform_adapter;
 
     fn parse(items: &[&str]) -> LaunchMode {
         let args = items
@@ -2302,10 +2634,12 @@ mod tests {
 
     #[test]
     fn parses_default_as_standalone_run() {
-        assert_eq!(
-            parse(&["--config", "/tmp/standalone.toml"]),
-            LaunchMode::StandaloneRun
-        );
+        assert_eq!(parse(&[]), LaunchMode::StandaloneRun);
+    }
+
+    #[test]
+    fn parses_menuconfig_mode() {
+        assert_eq!(parse(&["menuconfig"]), LaunchMode::MenuConfig);
     }
 
     #[test]
@@ -2461,17 +2795,63 @@ mod tests {
             .as_nanos();
         let root = PathBuf::from("/tmp").join(format!("bridgingio-runtime-{stamp}"));
         fs::create_dir_all(&root).expect("create runtime root");
-        let config_path = super::ensure_runtime_root_layout(&root).expect("layout");
+        let outcome = super::ensure_runtime_root_layout(
+            &root,
+            "bridgingio-ui-managed",
+            "managed-core.toml",
+            super::default_managed_core_config,
+        )
+        .expect("layout");
+        let config_path = outcome.config_path;
         assert!(root.join("config").is_dir());
         assert!(root.join("state").is_dir());
         assert!(root.join("artifacts").is_dir());
         assert!(root.join("logs").is_dir());
         assert!(config_path.exists());
+        assert_eq!(outcome.status.as_str(), "ready");
+        assert!(outcome.recovery_actions.is_empty());
 
         let settings = CoreSettings::load_from_file(&config_path).expect("parse config");
         assert_eq!(settings.model_plane.http.host, "127.0.0.1");
         assert_eq!(settings.model_plane.http.port, 19718);
         assert_eq!(settings.core.data_dir, root.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn resolves_default_standalone_runtime_root_under_user_home() {
+        let root = super::default_standalone_runtime_root().expect("default root");
+        assert!(root.ends_with(".bridgingio"));
+    }
+
+    #[test]
+    fn menuconfig_explicit_path_is_created_when_missing() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = PathBuf::from("/tmp").join(format!("bridgingio-menuconfig-{stamp}"));
+        fs::create_dir_all(&root).expect("create root");
+        let config_path = root.join("custom.toml");
+        let resolved =
+            super::ensure_explicit_menuconfig_path(&config_path).expect("ensure menuconfig path");
+        assert_eq!(resolved, config_path);
+        assert!(resolved.exists());
+        let settings = CoreSettings::load_from_file(&resolved).expect("parse config");
+        assert_eq!(settings.core.data_dir, root.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn detached_mode_overrides_trigger_policy_to_on_core_start() {
+        let mut settings = CoreSettings::from_toml_str(CoreSettings::minimal_example())
+            .expect("parse minimal settings");
+        settings.vault.unlock.trigger_policy = "manual-only".into();
+        let adapter = detect_host_platform_adapter("info");
+        super::apply_detached_unlock_override(
+            &mut settings,
+            CoreHostMode::StandaloneDetached,
+            adapter.as_ref(),
+        );
+        assert_eq!(settings.vault.unlock.trigger_policy, "on-core-start");
     }
 
     fn self_test_probe_settings(port: u16) -> (CoreSettings, PathBuf, PathBuf) {

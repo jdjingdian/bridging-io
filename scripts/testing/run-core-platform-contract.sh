@@ -7,6 +7,8 @@ RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
 RECORD_DIR="${REPO_ROOT}/tmp"
 RECORD_FILE="${RECORD_DIR}/core-platform-contract-${RUN_STAMP}.jsonl"
 PLATFORM_LABEL="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH_LABEL="$(uname -m | tr '[:upper:]' '[:lower:]')"
+BUILD_PROFILE="debug"
 
 mkdir -p "${RECORD_DIR}"
 
@@ -37,8 +39,8 @@ run_suite() {
   end="$(date +%s)"
   duration="$((end - start))"
 
-  printf '{"platform":"%s","suite":"%s","status":"%s","retries":%s,"jitter_ms":0,"duration_sec":%s,"command":"%s"}\n' \
-    "${PLATFORM_LABEL}" "${suite}" "${status}" "${retries}" "${duration}" "${cmd[*]}" >> "${RECORD_FILE}"
+  printf '{"platform":"%s","arch":"%s","build_profile":"%s","suite":"%s","status":"%s","retries":%s,"jitter_ms":0,"duration_sec":%s,"command":"%s"}\n' \
+    "${PLATFORM_LABEL}" "${ARCH_LABEL}" "${BUILD_PROFILE}" "${suite}" "${status}" "${retries}" "${duration}" "${cmd[*]}" >> "${RECORD_FILE}"
 
   if [[ "${status}" != "passed" ]]; then
     echo "[contract] suite failed: ${suite}" >&2

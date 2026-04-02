@@ -624,3 +624,74 @@ standalone 模式下的 `vault init/import/unlock` 与 `auth token create/revoke
 - **当** 操作员通过 standalone 管理入口执行 `auth token create`
 - **那么** 系统必须复用 shared token authority、attestation enforcement 与 one-time reveal 语义，而不是实现另一套独立 token 存储或签发流程
 
+### 需求:core 必须允许通过 `menuconfig` 管理同一套设置真相
+BridgingIO 除了允许通过配置文件管理设置外，还必须允许通过 `bridgingio-core menuconfig` 管理同一套设置真相。该交互式配置面必须与配置文件、control-plane 和 future UI 共享同一套校验与持久化语义，而不是只服务 standalone。
+
+#### 场景:用户通过 `menuconfig` 修改设置
+- **当** 操作员在 `bridgingio-core menuconfig` 中修改某个 profile、toolchain、model-plane 或 storage 配置
+- **那么** 系统必须对该修改应用与配置文件、control-plane 相同的校验与持久化规则，而不是由 TUI 维护一套私有逻辑
+
+#### 场景:修改需要重启才能生效
+- **当** 操作员通过 `menuconfig` 保存了一个需要重启或重新初始化才能生效的配置项
+- **那么** 系统必须返回正式的 apply 结果或等价状态，而不是让 TUI 自行猜测修改是否立即生效
+
+#### 场景:Target 列表与编辑入口遵循一致的 menuconfig 视觉语义
+- **当** 操作员在 Targets 菜单浏览或进入某个 target
+- **那么** 系统必须在 target 入口行使用可识别的状态标记（如 `< >` / `<*>`）与 `--->` 导航提示
+- **并且当** 操作员编辑 target 字段
+- **那么** 系统必须沿用统一弹窗字段样式 `Label (value) --->` 与统一开关标记 `[ ]` / `[*]`
+
+### 需求:standalone `run` 与 `-d` 必须属于同一模式家族但允许不同解锁策略
+BridgingIO 必须把 standalone 前台 `run` 与后台 `-d` 视为同一 standalone 模式家族下的两个子模式。两者必须共享相同的 runtime/config 真相与基本生命周期模型，但在启动解锁策略上允许受控差异。
+
+#### 场景:前台模式遵从配置中的 trigger policy
+- **当** 操作员使用 standalone `run` 启动 core
+- **那么** 系统必须继续按配置中的 trigger policy 决定何时要求完成 vault 解锁，而不是无条件改写为启动即解锁
+
+### 需求:standalone 后台模式必须覆盖 trigger policy 为 `on-core-start`
+当 standalone 以后台/脱离式子模式启动时，系统必须忽略配置中的常规 trigger policy，并以安全优先的方式强制使用 `on-core-start`。该 override 必须被视为正式 lifecycle 规则，而不是临时实现细节。
+
+#### 场景:配置声明 `on-first-secret-access` 但操作员使用 `-d`
+- **当** 操作员以 `-d` 启动 standalone core，且配置中的 vault trigger policy 为 `on-first-secret-access`、`manual-only` 或其他非启动即解锁策略
+- **那么** 系统必须覆盖为 `on-core-start`，并在完成解锁前保持该后台实例未就绪或 fail-closed
+
+#### 场景:后台模式未能在启动阶段完成解锁
+- **当** standalone `-d` 模式在启动阶段未能通过允许的安全 carrier 成功解锁 vault
+- **那么** 系统必须保持 locked/unavailable 状态并返回明确启动失败或受控未就绪语义，而不能在后台默默等待未来某次 secret access 时再尝试解锁
+
+### 需求:standalone 默认 runtime root 与配置路径必须统一到用户目录 `.bridgingio`
+BridgingIO 在 standalone 模式下，未显式提供 `--config` 时，必须把用户目录下的 `.bridgingio` 作为 canonical 默认 runtime root，并从该目录解析或创建默认配置文件。系统不得继续要求 standalone 只能通过显式 `--config` 启动。
+
+#### 场景:未提供 `--config` 启动 standalone
+- **当** 操作员以 standalone `run` 或 `-d` 模式启动 core，且未传入 `--config`
+- **那么** 系统必须从用户目录下的 `.bridgingio` 解析 runtime root、保留目录和默认配置，而不是直接报缺少 `--config`
+
+#### 场景:显式提供 `--config`
+- **当** 操作员为 standalone 启动显式传入 `--config <path>`
+- **那么** 系统必须使用该配置路径作为覆盖入口，并优先采用该配置而不是默认 `.bridgingio` 路径
+
+### 需求:runtime/config bootstrap 必须提供共享生命周期状态与恢复动作
+BridgingIO 必须把 runtime root 解析、可写性校验、配置 load-or-create、迁移、修复与受控失败纳入共享生命周期状态机，并向本地 control-plane、TUI 与 future UI 返回明确状态和恢复动作。
+
+#### 场景:默认 runtime root 不可写
+- **当** core 在解析 standalone 默认 `.bridgingio` runtime root 后发现该目录不存在、不可写或保留子目录校验失败
+- **那么** 系统必须进入明确的恢复状态，并返回诸如重新选择目录、修复权限或重试等恢复动作，而不是静默退回到随机临时目录
+
+#### 场景:配置需要迁移
+- **当** core 在启动阶段检测到默认配置或显式配置需要迁移、修复或版本升级
+- **那么** 系统必须返回明确的 lifecycle 状态和迁移提示，而不是在未告知调用方的情况下继续使用不兼容配置
+
+### 需求:standalone 生命周期与 control-plane 错误必须使用共享错误与状态契约
+BridgingIO 在 standalone 启动、runtime root bootstrap、配置装载、会话恢复、control-plane attach 和 host mode 切换过程中，必须通过共享错误与状态契约返回 lifecycle 状态与失败结果，而不是继续依赖散落的字符串消息。
+
+#### 场景:standalone 启动遇到配置问题
+- **当** standalone core 在启动阶段遇到配置缺失、配置不兼容、运行目录不可写或迁移失败
+- **那么** 系统必须返回共享状态、共享错误分类、模块子码和恢复提示，而不是只输出临时错误文本
+
+### 需求:会话与运行模式状态投影必须使用 canonical 状态词汇
+BridgingIO 对外暴露的会话、运行模式和 lifecycle 状态投影必须使用共享状态词汇，至少能够稳定区分 `ready`、`degraded`、`locked`、`not_ready`、`unsupported` 和 `method_not_implemented` 等语义。
+
+#### 场景:control-plane 读取当前运行状态
+- **当** 本地 control-plane、TUI 或 future UI 读取当前 core 的启动、attach、恢复或 shutdown 状态
+- **那么** 返回结果必须使用共享状态词汇，而不能由不同调用面各自发明近义状态标签
+
