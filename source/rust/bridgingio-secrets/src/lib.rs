@@ -554,6 +554,23 @@ pub struct VaultReadinessDiagnostic {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultPassiveProjection {
+    pub lock_state: VaultLockState,
+    pub secret_count: usize,
+    pub token_count: usize,
+}
+
+impl Default for VaultPassiveProjection {
+    fn default() -> Self {
+        Self {
+            lock_state: VaultLockState::Locked,
+            secret_count: 0,
+            token_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtectorAssembly {
     pub primary: String,
     pub recovery: Vec<String>,
@@ -1132,7 +1149,10 @@ impl VaultStorageLayout {
     fn open(root_dir: impl AsRef<Path>) -> Result<Self, VaultError> {
         let root_dir = root_dir.as_ref().to_path_buf();
         fs::create_dir_all(&root_dir).map_err(|err| {
-            VaultError::StorageIo(format!("failed to create vault root {}: {err}", root_dir.display()))
+            VaultError::StorageIo(format!(
+                "failed to create vault root {}: {err}",
+                root_dir.display()
+            ))
         })?;
         let blobs_dir = root_dir.join("blobs");
         let secret_blob_dir = blobs_dir.join("secret");
@@ -1160,7 +1180,10 @@ impl VaultStorageLayout {
         let stable = short_digest(reference.as_bytes());
         let cipher = format!("secret/{stable}-{version_id}.cipher.bin");
         let wrap = format!("wrap/{stable}-{version_id}.dek.bin");
-        (format!("blob://vault/{cipher}"), format!("blob://vault/{wrap}"))
+        (
+            format!("blob://vault/{cipher}"),
+            format!("blob://vault/{wrap}"),
+        )
     }
 
     fn wrap_uri_for_manifest(&self, wrap_id: &str) -> String {
@@ -1477,6 +1500,101 @@ fn default_persisted_unlock_policy() -> PersistedVaultUnlockPolicyV2 {
     }
 }
 
+pub fn read_passive_vault_projection(
+    root_dir: impl AsRef<Path>,
+) -> Result<VaultPassiveProjection, VaultError> {
+    let root_dir = root_dir.as_ref();
+    let metadata_db_path = root_dir.join(METADATA_DB_FILENAME);
+    if metadata_db_path.exists() {
+        let raw = fs::read_to_string(&metadata_db_path).map_err(|err| {
+            VaultError::StorageIo(format!(
+                "failed to read metadata db {}: {err}",
+                metadata_db_path.display()
+            ))
+        })?;
+        let schema_version = detect_schema_version(&raw)?;
+        let payload: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+            VaultError::StorageIo(format!(
+                "failed to parse metadata db {}: {err}",
+                metadata_db_path.display()
+            ))
+        })?;
+        return match schema_version {
+            CANONICAL_METADATA_SCHEMA_VERSION => Ok(passive_projection_from_v2_payload(&payload)),
+            LEGACY_METADATA_SCHEMA_VERSION => Ok(passive_projection_from_v1_payload(&payload)),
+            other => Err(VaultError::StorageIo(format!(
+                "unsupported metadata schema version {other}; expected 1 or 2"
+            ))),
+        };
+    }
+
+    let legacy_metadata_path = root_dir.join(LEGACY_METADATA_FILENAME);
+    if legacy_metadata_path.exists() {
+        let raw = fs::read_to_string(&legacy_metadata_path).map_err(|err| {
+            VaultError::StorageIo(format!(
+                "failed to read legacy metadata {}: {err}",
+                legacy_metadata_path.display()
+            ))
+        })?;
+        let payload: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+            VaultError::StorageIo(format!(
+                "failed to parse legacy metadata {}: {err}",
+                legacy_metadata_path.display()
+            ))
+        })?;
+        return Ok(passive_projection_from_v1_payload(&payload));
+    }
+
+    Ok(VaultPassiveProjection::default())
+}
+
+fn passive_projection_from_v2_payload(payload: &serde_json::Value) -> VaultPassiveProjection {
+    let lock_state = payload
+        .get("lock_state")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_lock_state_label)
+        .unwrap_or(VaultLockState::Locked);
+    let secret_count = payload
+        .get("secrets")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let token_count = payload
+        .get("agent_tokens")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    VaultPassiveProjection {
+        lock_state,
+        secret_count,
+        token_count,
+    }
+}
+
+fn passive_projection_from_v1_payload(payload: &serde_json::Value) -> VaultPassiveProjection {
+    let secret_count = payload
+        .get("secrets")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    VaultPassiveProjection {
+        lock_state: VaultLockState::Locked,
+        secret_count,
+        token_count: 0,
+    }
+}
+
+fn parse_lock_state_label(raw: &str) -> Option<VaultLockState> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "uninitialized" => Some(VaultLockState::Uninitialized),
+        "locked" => Some(VaultLockState::Locked),
+        "unlocking" => Some(VaultLockState::Unlocking),
+        "unlocked" => Some(VaultLockState::Unlocked),
+        "unavailable" => Some(VaultLockState::Unavailable),
+        _ => None,
+    }
+}
+
 fn default_passphrase_kdf_params() -> PassphraseKdfParams {
     PassphraseKdfParams {
         kdf: "argon2id".into(),
@@ -1581,13 +1699,9 @@ impl Default for SecretVaultRouter {
         });
         let bootstrap_root_key = SecretBytes::from_bytes(pseudo_random_bytes(32, "vault-root-key"));
         router
-            .rewrap_root_key_for_protectors(bootstrap_root_key.expose_for_use())
+            .bootstrap_root_key_for_protectors_without_keyring(bootstrap_root_key.expose_for_use())
             .expect("bootstrap root wraps");
         router.lock_state = VaultLockState::Locked;
-        router
-            .try_unlock_with_method("os-native")
-            .expect("bootstrap unlock");
-        router.lock_vault_internal("bootstrap-lock");
         router
     }
 }
@@ -1603,7 +1717,10 @@ impl SecretVaultRouter {
         self.backends.insert(backend.kind().to_string(), backend);
     }
 
-    pub fn enable_persistent_store(&mut self, root_dir: impl AsRef<Path>) -> Result<(), VaultError> {
+    pub fn enable_persistent_store(
+        &mut self,
+        root_dir: impl AsRef<Path>,
+    ) -> Result<(), VaultError> {
         let layout = VaultStorageLayout::open(root_dir)?;
         self.storage_layout = Some(layout);
         self.load_or_initialize_metadata_db()?;
@@ -1640,7 +1757,10 @@ impl SecretVaultRouter {
 
     pub fn set_unlock_policy(&mut self, policy: VaultUnlockPolicy) -> Result<(), VaultError> {
         self.unlock_policy = normalize_unlock_policy(policy);
-        if matches!(self.unlock_policy.trigger_policy, VaultUnlockTriggerPolicy::OnCoreStart) {
+        if matches!(
+            self.unlock_policy.trigger_policy,
+            VaultUnlockTriggerPolicy::OnCoreStart
+        ) {
             let preferred = self.unlock_policy.preferred_method.clone();
             if self.try_unlock_with_method(&preferred).is_err() {
                 self.lock_state = default_persisted_lock_state();
@@ -1704,6 +1824,10 @@ impl SecretVaultRouter {
 
     pub fn unlock_with_os_native(&mut self) -> Result<(), VaultError> {
         self.try_unlock_with_method("os-native")
+    }
+
+    pub fn unlock_with_os_native_verified(&mut self) -> Result<(), VaultError> {
+        self.try_unlock_with_method_verified("os-native")
     }
 
     pub fn lock_vault(&mut self, reason: &str) -> Result<(), VaultError> {
@@ -1850,11 +1974,8 @@ impl SecretVaultRouter {
         if let Some(plain) = secret.expose_utf8_for_use() {
             self.redaction_registry.register(plain);
         }
-        let output = secret_record_from_metadata(
-            &record.record,
-            self.active_backend.clone(),
-            version_seq,
-        );
+        let output =
+            secret_record_from_metadata(&record.record, self.active_backend.clone(), version_seq);
         if matches!(
             self.unlock_policy.trigger_policy,
             VaultUnlockTriggerPolicy::OnEverySecretAccess
@@ -1930,14 +2051,11 @@ impl SecretVaultRouter {
                 "created_by principal must be non-empty".into(),
             ));
         }
-        let attestation_id = request
-            .attestation_id
-            .as_deref()
-            .ok_or_else(|| {
-                VaultError::LocalAdminVerificationRequired(
-                    "create_agent_token requires local admin attestation".into(),
-                )
-            })?;
+        let attestation_id = request.attestation_id.as_deref().ok_or_else(|| {
+            VaultError::LocalAdminVerificationRequired(
+                "create_agent_token requires local admin attestation".into(),
+            )
+        })?;
         let payload_digest = payload_digest_for_token_create_request(&request);
         let validated = self.validate_local_admin_attestation(
             LocalAdminActionKind::CreateAgentToken,
@@ -2084,14 +2202,11 @@ impl SecretVaultRouter {
                 )));
             }
         }
-        let attestation_id = request
-            .attestation_id
-            .as_deref()
-            .ok_or_else(|| {
-                VaultError::LocalAdminVerificationRequired(
-                    "update_agent_token_scope requires local admin attestation".into(),
-                )
-            })?;
+        let attestation_id = request.attestation_id.as_deref().ok_or_else(|| {
+            VaultError::LocalAdminVerificationRequired(
+                "update_agent_token_scope requires local admin attestation".into(),
+            )
+        })?;
         let payload_digest = payload_digest_for_token_scope_update_request(&request);
         let validated = self.validate_local_admin_attestation(
             LocalAdminActionKind::UpdateAgentTokenScope,
@@ -2208,7 +2323,8 @@ impl SecretVaultRouter {
         revoked_at: SystemTime,
         reason: Option<String>,
     ) {
-        let inherited_reason = reason.unwrap_or_else(|| format!("ancestor_revoked:{root_token_id}"));
+        let inherited_reason =
+            reason.unwrap_or_else(|| format!("ancestor_revoked:{root_token_id}"));
         let mut queue = vec![root_token_id.to_string()];
         let mut visited = HashSet::<String>::new();
         while let Some(parent) = queue.pop() {
@@ -2313,9 +2429,10 @@ impl SecretVaultRouter {
                 "requested_by principal must be non-empty".into(),
             ));
         }
-        let payload_digest = normalize_payload_digest(requested_payload_digest).ok_or_else(|| {
-            VaultError::LocalAdminIntentMismatch("payload digest must be non-empty".into())
-        })?;
+        let payload_digest =
+            normalize_payload_digest(requested_payload_digest).ok_or_else(|| {
+                VaultError::LocalAdminIntentMismatch("payload digest must be non-empty".into())
+            })?;
         self.next_intent_seq += 1;
         let now = SystemTime::now();
         let intent = LocalAdminActionIntent {
@@ -2402,7 +2519,12 @@ impl SecretVaultRouter {
         verification_method: &str,
         ttl: Duration,
     ) -> Result<LocalAdminAttestationRecord, VaultError> {
-        self.complete_local_admin_attestation(intent_id, verified_principal, verification_method, ttl)
+        self.complete_local_admin_attestation(
+            intent_id,
+            verified_principal,
+            verification_method,
+            ttl,
+        )
     }
 
     pub fn unlock_vault_with_attestation(
@@ -2428,7 +2550,9 @@ impl SecretVaultRouter {
         self.consume_local_admin_attestation(&validated)?;
         match method.as_str() {
             "os-native" => self.unlock_with_os_native(),
-            "passphrase" => self.unlock_with_passphrase(request.passphrase.as_deref().unwrap_or("")),
+            "passphrase" => {
+                self.unlock_with_passphrase(request.passphrase.as_deref().unwrap_or(""))
+            }
             other => Err(VaultError::UnlockMethodNotAllowed(other.to_string())),
         }
     }
@@ -2442,8 +2566,11 @@ impl SecretVaultRouter {
     ) -> Result<SecretBytes, VaultError> {
         let canonical = normalize_credential_ref(reference)?;
         self.ensure_backend_allows_secret_use()?;
-        let payload_digest =
-            payload_digest_for_local_admin_action(&LocalAdminActionKind::RevealSecret, &canonical, None);
+        let payload_digest = payload_digest_for_local_admin_action(
+            &LocalAdminActionKind::RevealSecret,
+            &canonical,
+            None,
+        );
         let validated = self.validate_local_admin_attestation(
             LocalAdminActionKind::RevealSecret,
             &canonical,
@@ -2466,8 +2593,11 @@ impl SecretVaultRouter {
     ) -> Result<SecretBytes, VaultError> {
         let canonical = normalize_credential_ref(reference)?;
         self.ensure_backend_allows_secret_use()?;
-        let payload_digest =
-            payload_digest_for_local_admin_action(&LocalAdminActionKind::ExportSecret, &canonical, None);
+        let payload_digest = payload_digest_for_local_admin_action(
+            &LocalAdminActionKind::ExportSecret,
+            &canonical,
+            None,
+        );
         let validated = self.validate_local_admin_attestation(
             LocalAdminActionKind::ExportSecret,
             &canonical,
@@ -2526,7 +2656,10 @@ impl SecretVaultRouter {
                 attestation_id.to_string(),
             ));
         }
-        if !matches!(attestation_snapshot.status, LocalAdminAttestationStatus::Active) {
+        if !matches!(
+            attestation_snapshot.status,
+            LocalAdminAttestationStatus::Active
+        ) {
             return Err(VaultError::LocalAdminAttestationMismatch(
                 attestation_id.to_string(),
             ));
@@ -2562,7 +2695,9 @@ impl SecretVaultRouter {
             || intent_snapshot.target_object_ref != normalized_target
             || intent_snapshot.requested_payload_digest != normalized_digest
         {
-            return Err(VaultError::LocalAdminIntentMismatch(intent_snapshot.intent_id));
+            return Err(VaultError::LocalAdminIntentMismatch(
+                intent_snapshot.intent_id,
+            ));
         }
         Ok(ValidatedLocalAdminAttestation {
             intent_id: intent_snapshot.intent_id,
@@ -2697,7 +2832,8 @@ impl SecretVaultRouter {
             }
             VaultLockState::Unlocking => {
                 return Err(VaultError::VaultLocked(
-                    "vault is currently unlocking; retry ssh delivery after unlock completes".into(),
+                    "vault is currently unlocking; retry ssh delivery after unlock completes"
+                        .into(),
                 ))
             }
             VaultLockState::Unavailable | VaultLockState::Uninitialized => {
@@ -2927,10 +3063,7 @@ impl SecretVaultRouter {
             "vault binding: {}@{}",
             stored.secret_reference, stored.secret_version_id
         ));
-        lines.push(format!(
-            "session state: {}",
-            stored.session.state.as_str()
-        ));
+        lines.push(format!("session state: {}", stored.session.state.as_str()));
         if let Some(deadline) = stored.session.cleanup_deadline {
             lines.push(format!(
                 "cleanup deadline unix_sec={}",
@@ -3222,10 +3355,23 @@ impl SecretVaultRouter {
         self.try_unlock_with_method_and_secret(method, None)
     }
 
+    fn try_unlock_with_method_verified(&mut self, method: &str) -> Result<(), VaultError> {
+        self.try_unlock_with_method_and_secret_mode(method, None, true)
+    }
+
     fn try_unlock_with_method_and_secret(
         &mut self,
         method: &str,
         secret: Option<&str>,
+    ) -> Result<(), VaultError> {
+        self.try_unlock_with_method_and_secret_mode(method, secret, false)
+    }
+
+    fn try_unlock_with_method_and_secret_mode(
+        &mut self,
+        method: &str,
+        secret: Option<&str>,
+        require_verified_os_native: bool,
     ) -> Result<(), VaultError> {
         let method = normalize_vault_method_label(method);
         if !self
@@ -3239,7 +3385,13 @@ impl SecretVaultRouter {
         self.lock_state = VaultLockState::Unlocking;
         let now = SystemTime::now();
         let unlock_result = match method.as_str() {
-            "os-native" => self.try_unlock_with_os_native_internal(),
+            "os-native" => {
+                if require_verified_os_native {
+                    self.try_unlock_with_os_native_verified_internal()
+                } else {
+                    self.try_unlock_with_os_native_internal()
+                }
+            }
             "passphrase" => {
                 let passphrase = secret.ok_or(VaultError::PassphraseRejected)?;
                 self.try_unlock_with_passphrase_internal(passphrase)
@@ -3290,19 +3442,91 @@ impl SecretVaultRouter {
                 )
             })?;
         let wrapped = self.read_wrap_blob(&manifest.wrapped_key_locator)?;
-        open_aead(
-            &protector_kek("os-native"),
-            format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id).as_bytes(),
-            &wrapped,
+        let aad = format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id);
+        let primary_kek = protector_kek("os-native");
+        if let Ok(root_key) = open_aead(&primary_kek, aad.as_bytes(), &wrapped) {
+            return Ok(root_key);
+        }
+        let fallback_kek = fallback_protector_kek("os-native");
+        if fallback_kek != primary_kek {
+            if let Ok(root_key) = open_aead(&fallback_kek, aad.as_bytes(), &wrapped) {
+                return Ok(root_key);
+            }
+        }
+        Err(VaultError::UnlockFailed(
+            "os-native protector could not unwrap the canonical vault root key".into(),
+        ))
+    }
+
+    fn try_unlock_with_os_native_verified_internal(&mut self) -> Result<Vec<u8>, VaultError> {
+        let manifest = self
+            .wrap_manifests
+            .iter()
+            .find(|item| {
+                item.vault_key_id == self.key_envelope.vault_key_id
+                    && normalize_vault_method_label(&item.protector_binding) == "os-native"
+            })
+            .cloned()
+            .ok_or_else(|| {
+                VaultError::VaultUnavailable(
+                    "no os-native protector wrap is registered for vault root key".into(),
+                )
+            })?;
+        let wrapped = self.read_wrap_blob(&manifest.wrapped_key_locator)?;
+        let kek = os_native_protector_kek_verified().ok_or_else(|| {
+            VaultError::UnlockFailed(
+                "os-native unlock verification did not complete or was cancelled".into(),
+            )
+        })?;
+        self.unwrap_os_native_root_key_with_verified_kek(&manifest, &wrapped, &kek)
+    }
+
+    fn unwrap_os_native_root_key_with_verified_kek(
+        &mut self,
+        manifest: &ProtectorWrapManifest,
+        wrapped: &[u8],
+        verified_kek: &[u8],
+    ) -> Result<Vec<u8>, VaultError> {
+        let aad = format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id);
+        if let Ok(root_key) = open_aead(verified_kek, aad.as_bytes(), wrapped) {
+            return Ok(root_key);
+        }
+
+        // Compatibility path:
+        // Older wraps can be sealed with the deterministic fallback KEK when
+        // os-native keyring probing timed out. If local verification succeeded,
+        // we unwrap once with legacy fallback and rewrap using verified os-native.
+        let legacy_root_key = open_aead(
+            fallback_protector_kek("os-native").as_slice(),
+            aad.as_bytes(),
+            wrapped,
         )
         .map_err(|_| {
             VaultError::UnlockFailed(
                 "os-native protector could not unwrap the canonical vault root key".into(),
             )
-        })
+        })?;
+
+        let rewrapped = seal_aead(verified_kek, aad.as_bytes(), &legacy_root_key);
+        if self
+            .write_wrap_blob(&manifest.wrapped_key_locator, rewrapped.clone())
+            .is_ok()
+        {
+            self.upsert_wrap_manifest(ProtectorWrapManifest {
+                wrapped_key_digest: short_digest(&rewrapped),
+                last_verified_at: Some(SystemTime::now()),
+                status: ProtectorWrapStatus::Ready,
+                ..manifest.clone()
+            });
+        }
+
+        Ok(legacy_root_key)
     }
 
-    fn try_unlock_with_passphrase_internal(&mut self, passphrase: &str) -> Result<Vec<u8>, VaultError> {
+    fn try_unlock_with_passphrase_internal(
+        &mut self,
+        passphrase: &str,
+    ) -> Result<Vec<u8>, VaultError> {
         if !self.passphrase.enabled {
             return Err(VaultError::PassphraseNotConfigured);
         }
@@ -3355,7 +3579,10 @@ impl SecretVaultRouter {
         if let Some(layout) = self.storage_layout.as_ref() {
             let path = layout.path_for_blob_uri(locator)?;
             let payload = fs::read(&path).map_err(|err| {
-                VaultError::StorageIo(format!("failed to read wrap blob {}: {err}", path.display()))
+                VaultError::StorageIo(format!(
+                    "failed to read wrap blob {}: {err}",
+                    path.display()
+                ))
             })?;
             self.wrap_blob_cache
                 .insert(locator.to_string(), payload.clone());
@@ -3406,6 +3633,46 @@ impl SecretVaultRouter {
         self.upsert_wrap_manifest(ProtectorWrapManifest {
             wrapped_key_digest: short_digest(&wrapped),
             last_verified_at: Some(now),
+            ..os_manifest
+        });
+        Ok(())
+    }
+
+    fn bootstrap_root_key_for_protectors_without_keyring(
+        &mut self,
+        root_key: &[u8],
+    ) -> Result<(), VaultError> {
+        let now = SystemTime::now();
+        let os_manifest = self
+            .wrap_manifests
+            .iter()
+            .find(|manifest| {
+                manifest.vault_key_id == self.key_envelope.vault_key_id
+                    && normalize_vault_method_label(&manifest.protector_binding) == "os-native"
+            })
+            .cloned()
+            .unwrap_or(ProtectorWrapManifest {
+                format_version: VAULT_OBJECT_FORMAT_VERSION,
+                wrap_id: "wrap-000001".into(),
+                vault_key_id: self.key_envelope.vault_key_id.clone(),
+                protector_binding: "os-native".into(),
+                wrap_format: "sha256-stream-aead-v1".into(),
+                wrapped_key_locator: "blob://vault/wrap/wrap-000001.vrk.bin".into(),
+                wrapped_key_digest: String::new(),
+                created_at: now,
+                last_verified_at: None,
+                status: ProtectorWrapStatus::Degraded,
+            });
+        let wrapped = seal_aead(
+            &fallback_protector_kek("os-native"),
+            format!("root:{}:{}", os_manifest.vault_key_id, os_manifest.wrap_id).as_bytes(),
+            root_key,
+        );
+        self.write_wrap_blob(&os_manifest.wrapped_key_locator, wrapped.clone())?;
+        self.upsert_wrap_manifest(ProtectorWrapManifest {
+            wrapped_key_digest: short_digest(&wrapped),
+            last_verified_at: None,
+            status: ProtectorWrapStatus::Degraded,
             ..os_manifest
         });
         Ok(())
@@ -3573,7 +3840,10 @@ impl SecretVaultRouter {
                 .map(|session| session.method.clone())
                 .unwrap_or_else(|| self.unlock_policy.preferred_method.clone());
             let _ = self.try_unlock_with_method(&unlock_method);
-        } else if matches!(self.unlock_policy.trigger_policy, VaultUnlockTriggerPolicy::OnCoreStart) {
+        } else if matches!(
+            self.unlock_policy.trigger_policy,
+            VaultUnlockTriggerPolicy::OnCoreStart
+        ) {
             let preferred = self.unlock_policy.preferred_method.clone();
             if self.try_unlock_with_method(&preferred).is_err() {
                 self.lock_state = VaultLockState::Unavailable;
@@ -3677,9 +3947,7 @@ impl SecretVaultRouter {
                         active_scope_version: record.active_scope_version,
                         created_by: record.created_by,
                         created_at: unix_secs_to_system_time(record.created_at_unix_sec),
-                        last_used_at: record
-                            .last_used_at_unix_sec
-                            .map(unix_secs_to_system_time),
+                        last_used_at: record.last_used_at_unix_sec.map(unix_secs_to_system_time),
                         expires_at: record.expires_at_unix_sec.map(unix_secs_to_system_time),
                         idle_timeout_sec: record.idle_timeout_sec,
                         revoked_at: record.revoked_at_unix_sec.map(unix_secs_to_system_time),
@@ -3783,21 +4051,21 @@ impl SecretVaultRouter {
             } else {
                 normalize_vault_method_label(&manifest.protector_binding)
             };
-            let canonical_wrapped = if canonical_binding != normalize_vault_method_label(&manifest.protector_binding)
-            {
-                let root_key = open_aead(
-                    &protector_kek(&manifest.protector_binding),
-                    format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id).as_bytes(),
-                    &wrapped_key,
-                )?;
-                seal_aead(
-                    &protector_kek(&canonical_binding),
-                    format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id).as_bytes(),
-                    &root_key,
-                )
-            } else {
-                wrapped_key
-            };
+            let canonical_wrapped =
+                if canonical_binding != normalize_vault_method_label(&manifest.protector_binding) {
+                    let root_key = open_aead(
+                        &protector_kek(&manifest.protector_binding),
+                        format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id).as_bytes(),
+                        &wrapped_key,
+                    )?;
+                    seal_aead(
+                        &protector_kek(&canonical_binding),
+                        format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id).as_bytes(),
+                        &root_key,
+                    )
+                } else {
+                    wrapped_key
+                };
             let locator = layout.wrap_uri_for_manifest(&manifest.wrap_id);
             write_blob(layout.path_for_blob_uri(&locator)?, &canonical_wrapped)?;
             wrap_manifests_v2.push(PersistedProtectorWrapManifestV2 {
@@ -3818,8 +4086,10 @@ impl SecretVaultRouter {
         for state in db_v1.secrets {
             let mut versions_v2 = Vec::new();
             for version in state.versions {
-                let (cipher_uri, wrap_uri) =
-                    layout.blob_uri_for_secret_version(&state.record.reference, &version.version.version_id);
+                let (cipher_uri, wrap_uri) = layout.blob_uri_for_secret_version(
+                    &state.record.reference,
+                    &version.version.version_id,
+                );
                 let ciphertext = hex_decode(&version.ciphertext_hex).map_err(|err| {
                     VaultError::StorageIo(format!(
                         "failed to decode ciphertext hex for version {}: {err}",
@@ -3931,7 +4201,10 @@ impl SecretVaultRouter {
                 status: ProtectorWrapStatus::Degraded,
             });
         }
-        if !self.wrap_blob_cache.contains_key(&self.passphrase.salt_locator) {
+        if !self
+            .wrap_blob_cache
+            .contains_key(&self.passphrase.salt_locator)
+        {
             self.wrap_blob_cache.insert(
                 self.passphrase.salt_locator.clone(),
                 pseudo_random_bytes(16, "passphrase-salt-seed"),
@@ -3956,7 +4229,8 @@ impl SecretVaultRouter {
             self.rewrap_root_key_for_protectors(&root_key_bytes)?;
         }
         if self.passphrase.enabled {
-            let passphrase_wrap_locator = format!("blob://vault/wrap/{}.vrk.bin", self.passphrase.wrap_id);
+            let passphrase_wrap_locator =
+                format!("blob://vault/wrap/{}.vrk.bin", self.passphrase.wrap_id);
             if !self
                 .wrap_manifests
                 .iter()
@@ -3987,7 +4261,10 @@ impl SecretVaultRouter {
             }
         }
         if let Some(salt) = self.wrap_blob_cache.get(&self.passphrase.salt_locator) {
-            write_blob(layout.path_for_blob_uri(&self.passphrase.salt_locator)?, salt)?;
+            write_blob(
+                layout.path_for_blob_uri(&self.passphrase.salt_locator)?,
+                salt,
+            )?;
         }
         for manifest in &mut self.wrap_manifests {
             if let Some(payload) = self.wrap_blob_cache.get(&manifest.wrapped_key_locator) {
@@ -4003,7 +4280,10 @@ impl SecretVaultRouter {
                 let (cipher_uri, wrapped_uri) =
                     layout.blob_uri_for_secret_version(reference, &material.version.version_id);
                 write_blob(layout.path_for_blob_uri(&cipher_uri)?, &material.ciphertext)?;
-                write_blob(layout.path_for_blob_uri(&wrapped_uri)?, &material.wrapped_dek)?;
+                write_blob(
+                    layout.path_for_blob_uri(&wrapped_uri)?,
+                    &material.wrapped_dek,
+                )?;
                 versions.push(PersistedSecretVersionMaterialV2 {
                     version: PersistedVaultSecretVersionRecordV2 {
                         format_version: if material.version.format_version == 0 {
@@ -4029,7 +4309,10 @@ impl SecretVaultRouter {
                             .version
                             .superseded_at
                             .map(system_time_to_unix_secs),
-                        revoked_at_unix_sec: material.version.revoked_at.map(system_time_to_unix_secs),
+                        revoked_at_unix_sec: material
+                            .version
+                            .revoked_at
+                            .map(system_time_to_unix_secs),
                         destroy_after_unix_sec: material
                             .version
                             .destroy_after
@@ -4109,9 +4392,7 @@ impl SecretVaultRouter {
                 allowed_methods: self.unlock_policy.allowed_methods.clone(),
                 preferred_method: self.unlock_policy.preferred_method.clone(),
                 cache_ttl_sec: self.unlock_policy.cache_ttl_sec,
-                require_fresh_user_verification: self
-                    .unlock_policy
-                    .require_fresh_user_verification,
+                require_fresh_user_verification: self.unlock_policy.require_fresh_user_verification,
             },
             unlock_session: self.unlock_session.as_ref().map(|session| {
                 PersistedVaultUnlockSessionV2 {
@@ -4797,6 +5078,7 @@ fn short_digest(data: &[u8]) -> String {
 
 const OS_NATIVE_PROTECTOR_SERVICE: &str = "io.bridgingio.vault";
 const OS_NATIVE_PROTECTOR_ACCOUNT: &str = "os-native-protector-kek-v1";
+const OS_NATIVE_VERIFIED_TIMEOUT_SECS: u64 = 120;
 static OS_NATIVE_PROTECTOR_KEK_CACHE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
 fn os_native_platform_binding_ready() -> bool {
@@ -4807,6 +5089,32 @@ fn os_native_protector_kek() -> Option<Vec<u8>> {
     OS_NATIVE_PROTECTOR_KEK_CACHE
         .get_or_init(os_native_protector_kek_inner)
         .clone()
+}
+
+fn os_native_protector_kek_verified() -> Option<Vec<u8>> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        if env_flag_enabled("BRIDGINGIO_DISABLE_OS_NATIVE_KEYRING") {
+            return None;
+        }
+        let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(1);
+        let spawned = std::thread::Builder::new()
+            .name("bridgingio-os-native-kek-verified".into())
+            .spawn(move || {
+                let _ = tx.send(os_native_protector_kek_blocking());
+            });
+        if spawned.is_err() {
+            return None;
+        }
+        match rx.recv_timeout(Duration::from_secs(OS_NATIVE_VERIFIED_TIMEOUT_SECS)) {
+            Ok(value) => value,
+            Err(_) => None,
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 fn os_native_protector_kek_inner() -> Option<Vec<u8>> {
@@ -4857,7 +5165,12 @@ fn os_native_protector_kek_blocking() -> Option<Vec<u8>> {
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .ok()
-        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -4867,6 +5180,10 @@ fn protector_kek(binding: &str) -> Vec<u8> {
             return platform_kek;
         }
     }
+    fallback_protector_kek(binding)
+}
+
+fn fallback_protector_kek(binding: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"bridgingio-protector-kek-v1");
     hasher.update(binding.as_bytes());
@@ -4892,12 +5209,10 @@ fn hex_decode(raw: &str) -> Result<Vec<u8>, String> {
     let bytes = raw.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
-        let hi = decode_hex_nibble(bytes[index]).ok_or_else(|| {
-            format!("invalid hex character at byte {}", index)
-        })?;
-        let lo = decode_hex_nibble(bytes[index + 1]).ok_or_else(|| {
-            format!("invalid hex character at byte {}", index + 1)
-        })?;
+        let hi = decode_hex_nibble(bytes[index])
+            .ok_or_else(|| format!("invalid hex character at byte {}", index))?;
+        let lo = decode_hex_nibble(bytes[index + 1])
+            .ok_or_else(|| format!("invalid hex character at byte {}", index + 1))?;
         out.push((hi << 4) | lo);
         index += 2;
     }
@@ -4915,7 +5230,9 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
 
 fn detect_schema_version(raw: &str) -> Result<u32, VaultError> {
     let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|err| {
-        VaultError::StorageIo(format!("failed to parse metadata json for schema probe: {err}"))
+        VaultError::StorageIo(format!(
+            "failed to parse metadata json for schema probe: {err}"
+        ))
     })?;
     let Some(schema) = parsed
         .get("schema_version")
@@ -4926,9 +5243,7 @@ fn detect_schema_version(raw: &str) -> Result<u32, VaultError> {
         ));
     };
     u32::try_from(schema).map_err(|_| {
-        VaultError::StorageIo(format!(
-            "metadata schema_version {schema} overflows u32"
-        ))
+        VaultError::StorageIo(format!("metadata schema_version {schema} overflows u32"))
     })
 }
 
@@ -4960,11 +5275,12 @@ fn unix_secs_to_system_time(value: u64) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_audit_preview, normalize_credential_ref, AgentTokenStatus, CreateAgentTokenRequest,
-        LocalAdminActionKind, SecretBytes, SecretVaultRouter, SshAgentBrokerPrepareRequest,
-        SshAgentBrokerSessionState, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
-        UpdateAgentTokenScopeRequest, VaultError, VaultLockState, VaultReadinessState,
-        VaultUnlockPolicy, VaultUnlockTriggerPolicy,
+        command_audit_preview, normalize_credential_ref, read_passive_vault_projection,
+        AgentTokenStatus, CreateAgentTokenRequest, LocalAdminActionKind, SecretBytes,
+        SecretVaultRouter, SshAgentBrokerPrepareRequest, SshAgentBrokerSessionState,
+        SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput, UpdateAgentTokenScopeRequest,
+        VaultError, VaultLockState, VaultReadinessState, VaultUnlockPolicy,
+        VaultUnlockTriggerPolicy,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -5162,6 +5478,47 @@ mod tests {
     }
 
     #[test]
+    fn verified_unlock_migrates_legacy_fallback_wrap_to_verified_kek() {
+        let mut router = SecretVaultRouter::default();
+        let manifest = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.protector_binding == "os-native")
+            .cloned()
+            .expect("os-native wrap manifest");
+        let aad = format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id);
+        let legacy_root_key = super::pseudo_random_bytes(32, "legacy-root-key");
+        let legacy_wrapped = super::seal_aead(
+            &super::fallback_protector_kek("os-native"),
+            aad.as_bytes(),
+            &legacy_root_key,
+        );
+        router
+            .write_wrap_blob(&manifest.wrapped_key_locator, legacy_wrapped.clone())
+            .expect("write legacy wrap");
+
+        let verified_kek = super::pseudo_random_bytes(32, "verified-kek");
+        let unlocked = router
+            .unwrap_os_native_root_key_with_verified_kek(&manifest, &legacy_wrapped, &verified_kek)
+            .expect("verified unlock with legacy fallback wrap");
+        assert_eq!(unlocked, legacy_root_key);
+
+        let migrated_wrapped = router
+            .read_wrap_blob(&manifest.wrapped_key_locator)
+            .expect("read migrated wrap");
+        let migrated_root_key = super::open_aead(&verified_kek, aad.as_bytes(), &migrated_wrapped)
+            .expect("migrated wrap uses verified os-native key");
+        assert_eq!(migrated_root_key, legacy_root_key);
+
+        let manifest_after = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.wrap_id == manifest.wrap_id)
+            .expect("updated manifest");
+        assert_eq!(manifest_after.status, super::ProtectorWrapStatus::Ready);
+    }
+
+    #[test]
     fn manual_unlock_policy_blocks_secret_access_until_explicit_unlock() {
         let mut router = SecretVaultRouter::default();
         router
@@ -5188,8 +5545,8 @@ mod tests {
         let lease = router
             .use_for_http_auth("vault:ssh-key:manual", "scope")
             .expect("lease");
-        let revealed =
-            lease.with_secret_bytes(|bytes| std::str::from_utf8(bytes).unwrap_or_default().to_string());
+        let revealed = lease
+            .with_secret_bytes(|bytes| std::str::from_utf8(bytes).unwrap_or_default().to_string());
         assert_eq!(revealed, "manual-key");
     }
 
@@ -5217,7 +5574,9 @@ mod tests {
             .use_for_http_auth("vault:ssh-key:every", "scope")
             .expect("lease");
         assert_eq!(
-            lease.with_secret_bytes(|bytes| std::str::from_utf8(bytes).unwrap_or_default().to_string()),
+            lease.with_secret_bytes(|bytes| std::str::from_utf8(bytes)
+                .unwrap_or_default()
+                .to_string()),
             "every-key"
         );
         assert_eq!(router.vault_lock_state(), VaultLockState::Locked);
@@ -5510,9 +5869,7 @@ mod tests {
             attestation_id: None,
         };
         request.attestation_id = Some(mint_create_token_attestation(&mut router, &request));
-        let created = router
-            .create_agent_token(request)
-            .expect("create token");
+        let created = router.create_agent_token(request).expect("create token");
         assert!(created.plaintext_token.starts_with("agt_"));
         assert_eq!(created.summary.status, AgentTokenStatus::Active);
 
@@ -5587,9 +5944,7 @@ mod tests {
             attestation_id: None,
         };
         request.attestation_id = Some(mint_create_token_attestation(&mut router, &request));
-        let created = router
-            .create_agent_token(request)
-            .expect("create token");
+        let created = router.create_agent_token(request).expect("create token");
 
         let listed = router.list_agent_tokens();
         assert_eq!(listed.len(), 1);
@@ -5620,7 +5975,8 @@ mod tests {
             },
             attestation_id: None,
         };
-        create_request.attestation_id = Some(mint_create_token_attestation(&mut router, &create_request));
+        create_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &create_request));
         let created = router
             .create_agent_token(create_request)
             .expect("create token");
@@ -5642,7 +5998,8 @@ mod tests {
             reason: Some("expand targets".into()),
             attestation_id: None,
         };
-        update_request.attestation_id = Some(mint_scope_update_attestation(&mut router, &update_request));
+        update_request.attestation_id =
+            Some(mint_scope_update_attestation(&mut router, &update_request));
         let updated = router
             .update_agent_token_scope(update_request)
             .expect("update scope");
@@ -5681,7 +6038,8 @@ mod tests {
             },
             attestation_id: None,
         };
-        create_request.attestation_id = Some(mint_create_token_attestation(&mut router, &create_request));
+        create_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &create_request));
         let created = router
             .create_agent_token(create_request)
             .expect("create token");
@@ -5703,7 +6061,8 @@ mod tests {
             reason: Some("expand scope".into()),
             attestation_id: None,
         };
-        update_request.attestation_id = Some(mint_scope_update_attestation(&mut router, &update_request));
+        update_request.attestation_id =
+            Some(mint_scope_update_attestation(&mut router, &update_request));
         router
             .update_agent_token_scope(update_request)
             .expect("update scope");
@@ -5716,10 +6075,8 @@ mod tests {
         assert_eq!(listed[0].active_scope_version, 2);
         let history = reloaded.token_scope_history(&listed[0].token_id);
         assert_eq!(history.len(), 2);
-        assert!(history
-            .iter()
-            .any(|scope| scope.version == 1
-                && matches!(scope.status, super::TokenScopeStatus::Superseded)));
+        assert!(history.iter().any(|scope| scope.version == 1
+            && matches!(scope.status, super::TokenScopeStatus::Superseded)));
         assert!(history
             .iter()
             .any(|scope| scope.version == 2
@@ -5750,7 +6107,8 @@ mod tests {
             },
             attestation_id: None,
         };
-        root_request.attestation_id = Some(mint_create_token_attestation(&mut router, &root_request));
+        root_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &root_request));
         let root = router
             .create_agent_token(root_request)
             .expect("create root token");
@@ -5773,7 +6131,8 @@ mod tests {
             },
             attestation_id: None,
         };
-        child_request.attestation_id = Some(mint_create_token_attestation(&mut router, &child_request));
+        child_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &child_request));
         let child = router
             .create_agent_token(child_request)
             .expect("create child token");
@@ -5818,9 +6177,7 @@ mod tests {
             attestation_id: None,
         };
         request.attestation_id = Some(mint_create_token_attestation(&mut router, &request));
-        let created = router
-            .create_agent_token(request)
-            .expect("create token");
+        let created = router.create_agent_token(request).expect("create token");
         std::thread::sleep(Duration::from_millis(5));
         assert!(router
             .authenticate_agent_token(&created.plaintext_token)
@@ -5851,8 +6208,8 @@ mod tests {
             attestation_id: None,
         };
         let attestation_id = {
-            let mut router =
-                SecretVaultRouter::with_persistent_store(&vault_dir).expect("open persistent store");
+            let mut router = SecretVaultRouter::with_persistent_store(&vault_dir)
+                .expect("open persistent store");
             mint_create_token_attestation(&mut router, &request)
         };
 
@@ -5903,8 +6260,8 @@ mod tests {
         let lease = reloaded
             .use_for_ssh_auth("vault:ssh-key:persisted", "target:persist")
             .expect("lease");
-        let value =
-            lease.with_secret_bytes(|bytes| std::str::from_utf8(bytes).unwrap_or_default().to_string());
+        let value = lease
+            .with_secret_bytes(|bytes| std::str::from_utf8(bytes).unwrap_or_default().to_string());
         assert_eq!(value, "PERSISTED-KEY");
 
         let metadata_path = vault_dir.join("metadata.db");
@@ -5922,6 +6279,48 @@ mod tests {
         assert!(secret_blob_count > 0);
         assert!(wrap_blob_count > 0);
 
+        let _ = fs::remove_dir_all(vault_dir);
+    }
+
+    #[test]
+    fn passive_projection_defaults_when_no_metadata_exists() {
+        let vault_dir = new_temp_vault_dir("passive-default");
+        let projection = read_passive_vault_projection(&vault_dir).expect("read projection");
+        assert_eq!(projection.lock_state, VaultLockState::Locked);
+        assert_eq!(projection.secret_count, 0);
+        assert_eq!(projection.token_count, 0);
+        let _ = fs::remove_dir_all(vault_dir);
+    }
+
+    #[test]
+    fn passive_projection_reads_v2_metadata_without_unlock_side_effects() {
+        let vault_dir = new_temp_vault_dir("passive-v2");
+        let metadata = r#"{
+  "schema_version": 2,
+  "lock_state": "Unlocked",
+  "secrets": [{}, {}],
+  "agent_tokens": [{}]
+}"#;
+        fs::write(vault_dir.join("metadata.db"), metadata).expect("write v2 metadata");
+        let projection = read_passive_vault_projection(&vault_dir).expect("read projection");
+        assert_eq!(projection.lock_state, VaultLockState::Unlocked);
+        assert_eq!(projection.secret_count, 2);
+        assert_eq!(projection.token_count, 1);
+        let _ = fs::remove_dir_all(vault_dir);
+    }
+
+    #[test]
+    fn passive_projection_reads_legacy_v1_metadata_counts() {
+        let vault_dir = new_temp_vault_dir("passive-v1");
+        let metadata = r#"{
+  "schema_version": 1,
+  "secrets": [{}, {}, {}]
+}"#;
+        fs::write(vault_dir.join("legacy-vault-state.json"), metadata).expect("write v1 metadata");
+        let projection = read_passive_vault_projection(&vault_dir).expect("read projection");
+        assert_eq!(projection.lock_state, VaultLockState::Locked);
+        assert_eq!(projection.secret_count, 3);
+        assert_eq!(projection.token_count, 0);
         let _ = fs::remove_dir_all(vault_dir);
     }
 
@@ -5982,8 +6381,8 @@ mod tests {
         let lease = migrated
             .use_for_ssh_auth(reference, "target:legacy")
             .expect("lease after migration");
-        let value =
-            lease.with_secret_bytes(|bytes| std::str::from_utf8(bytes).unwrap_or_default().to_string());
+        let value = lease
+            .with_secret_bytes(|bytes| std::str::from_utf8(bytes).unwrap_or_default().to_string());
         assert_eq!(value, "LEGACY-KEY");
 
         let metadata_path = vault_dir.join("metadata.db");
@@ -5997,8 +6396,8 @@ mod tests {
 
     #[test]
     fn vault_error_maps_to_shared_error_contract() {
-        let shared = VaultError::LocalAdminVerificationRequired("fresh verification".into())
-            .shared_error();
+        let shared =
+            VaultError::LocalAdminVerificationRequired("fresh verification".into()).shared_error();
         assert_eq!(shared.status.as_str(), "locked");
         assert_eq!(shared.domain.as_str(), "vault");
         assert_eq!(shared.common_code.as_str(), "verification_required");

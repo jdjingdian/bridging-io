@@ -1,17 +1,20 @@
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use bridgingio_domain::TargetKind;
 use bridgingio_engine::{
-    i18n::Catalog,
-    CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile, StandaloneTerminalSection,
-    TerminalProviderSection,
+    i18n::Catalog, CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile,
+    StandaloneTerminalSection, TerminalProviderSection,
 };
-use bridgingio_secrets::SecretVaultRouter;
 #[cfg(test)]
 use bridgingio_secrets::VaultUnlockTriggerPolicy;
+use bridgingio_secrets::{
+    read_passive_vault_projection, SecretVaultRouter, VaultPassiveProjection,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -131,14 +134,34 @@ enum SelectionHighlightMode {
     Fallback,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UnlockFlowState {
+    Idle,
+    Waiting,
+    Success,
+    Failed { reason: String },
+}
+
 const MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT_ENV: &str =
     "BRIDGINGIO_MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT";
+const MENU_UNLOCK_REASON_REQUIRES_OS_NATIVE: &str = "__menu_unlock_requires_os_native__";
+const FOOTER_LOCK_STATE_TOKEN: &str = "__bridgingio_footer_lock_state_token__";
+
+struct UnlockWorkerOutcome {
+    router: SecretVaultRouter,
+    result: Result<(), String>,
+}
+
+struct UnlockWorkerHandle {
+    receiver: mpsc::Receiver<UnlockWorkerOutcome>,
+    cancel_requested: bool,
+}
 
 pub struct MenuConfigApp {
     config_path: PathBuf,
     settings: CoreSettings,
     catalog: Catalog,
-    vault_router: SecretVaultRouter,
+    vault_router: Option<SecretVaultRouter>,
     security_summary: SecuritySummary,
     screen: Screen,
     selected: usize,
@@ -157,6 +180,9 @@ pub struct MenuConfigApp {
     show_help: bool,
     exit_confirm_mode: bool,
     exit_confirm_selected: usize,
+    unlock_flow_state: UnlockFlowState,
+    unlock_flow_pending: bool,
+    unlock_worker: Option<UnlockWorkerHandle>,
     selection_highlight_mode: SelectionHighlightMode,
     last_status: String,
     last_apply_strategy: Option<String>,
@@ -174,13 +200,12 @@ impl MenuConfigApp {
             )
         })?;
         let initial_status = catalog.t("menu.status.initial");
-        let mut vault_router = load_vault_router(&settings);
-        let security_summary = build_security_summary(&settings, &mut vault_router);
+        let security_summary = build_security_summary_passive(&settings);
         Ok(Self {
             config_path,
             settings,
             catalog,
-            vault_router,
+            vault_router: None,
             security_summary,
             screen: Screen::Root,
             selected: 0,
@@ -199,6 +224,9 @@ impl MenuConfigApp {
             show_help: false,
             exit_confirm_mode: false,
             exit_confirm_selected: 0,
+            unlock_flow_state: UnlockFlowState::Idle,
+            unlock_flow_pending: false,
+            unlock_worker: None,
             selection_highlight_mode: detect_selection_highlight_mode(),
             last_status: initial_status,
             last_apply_strategy: None,
@@ -217,9 +245,16 @@ impl MenuConfigApp {
         let mut ui =
             TerminalUi::enter().map_err(|err| format!("enter menuconfig ui failed: {err}"))?;
         loop {
+            self.poll_unlock_worker();
             ui.terminal
                 .draw(|frame| render(frame, self))
                 .map_err(|err| format!("draw menuconfig failed: {err}"))?;
+
+            if self.unlock_flow_pending {
+                self.unlock_flow_pending = false;
+                self.start_unlock_worker();
+                continue;
+            }
 
             if !event::poll(Duration::from_millis(100))
                 .map_err(|err| format!("poll menuconfig event failed: {err}"))?
@@ -235,6 +270,10 @@ impl MenuConfigApp {
                 continue;
             }
 
+            if !matches!(self.unlock_flow_state, UnlockFlowState::Idle) {
+                self.handle_unlock_flow_key(key.code);
+                continue;
+            }
             if self.exit_confirm_mode {
                 if let Some(outcome) = self.handle_exit_confirm_key(key.code)? {
                     return Ok(outcome);
@@ -274,7 +313,7 @@ impl MenuConfigApp {
                     self.last_status = self.t("menu.status.search_prompt");
                 }
                 KeyCode::Char('?') | KeyCode::F(1) => self.show_help = !self.show_help,
-                KeyCode::Char('u') => self.unlock_vault_shortcut()?,
+                KeyCode::Char('u') => self.begin_unlock_flow(),
                 KeyCode::Char('s') => self.save()?,
                 KeyCode::Char(' ') => self.handle_space_on_selected()?,
                 KeyCode::Enter => {
@@ -328,7 +367,10 @@ impl MenuConfigApp {
                 self.last_status = if self.search_input.trim().is_empty() {
                     self.t("menu.status.search_empty")
                 } else {
-                    self.tf("menu.status.search_results", &[("query", self.search_input.as_str())])
+                    self.tf(
+                        "menu.status.search_results",
+                        &[("query", self.search_input.as_str())],
+                    )
                 };
             }
             KeyCode::Backspace => {
@@ -349,7 +391,8 @@ impl MenuConfigApp {
                 self.screen = screen;
                 self.selected = 0;
                 let screen_title = screen.title(&self.catalog);
-                self.last_status = self.tf("menu.status.opened_screen", &[("screen", &screen_title)]);
+                self.last_status =
+                    self.tf("menu.status.opened_screen", &[("screen", &screen_title)]);
             }
             MenuEntryKind::EditField(field) => {
                 self.begin_edit(field)?;
@@ -428,8 +471,12 @@ impl MenuConfigApp {
     fn apply_edit_value(&mut self, field: &str, value: &str) -> Result<(), String> {
         let mut next = self.settings.clone();
         apply_field_edit(&mut next, field, value)?;
-        next.validate()
-            .map_err(|err| self.tf("menu.error.validate_edited", &[("error", &format!("{err:?}"))]))?;
+        next.validate().map_err(|err| {
+            self.tf(
+                "menu.error.validate_edited",
+                &[("error", &format!("{err:?}"))],
+            )
+        })?;
         self.settings = next;
         self.catalog = Catalog::load(&self.settings.core.operator_locale).map_err(|err| {
             format!(
@@ -440,7 +487,7 @@ impl MenuConfigApp {
         if !self.dirty_paths.contains(&field.to_string()) {
             self.dirty_paths.push(field.to_string());
         }
-        self.security_summary = build_security_summary(&self.settings, &mut self.vault_router);
+        self.refresh_security_summary();
         Ok(())
     }
 
@@ -505,8 +552,10 @@ impl MenuConfigApp {
                     .map_err(|_| self.tf("menu.error.bool_toggle", &[("field", &field)]))?;
                 let toggled = (!parsed).to_string();
                 self.apply_edit_value(&field, &toggled)?;
-                self.last_status =
-                    self.tf("menu.status.toggle", &[("field", &field), ("value", &toggled)]);
+                self.last_status = self.tf(
+                    "menu.status.toggle",
+                    &[("field", &field), ("value", &toggled)],
+                );
             } else if field_options(&field).is_some() {
                 self.begin_edit(field)?;
             }
@@ -515,14 +564,20 @@ impl MenuConfigApp {
     }
 
     fn save(&mut self) -> Result<(), String> {
-        self.settings
-            .validate()
-            .map_err(|err| self.tf("menu.error.validate_settings", &[("error", &format!("{err:?}"))]))?;
+        self.settings.validate().map_err(|err| {
+            self.tf(
+                "menu.error.validate_settings",
+                &[("error", &format!("{err:?}"))],
+            )
+        })?;
         if let Some(parent) = self.config_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 self.tf(
                     "menu.error.create_config_parent",
-                    &[("path", &parent.display().to_string()), ("error", &err.to_string())],
+                    &[
+                        ("path", &parent.display().to_string()),
+                        ("error", &err.to_string()),
+                    ],
                 )
             })?;
         }
@@ -544,54 +599,230 @@ impl MenuConfigApp {
         Ok(())
     }
 
-    fn unlock_vault_shortcut(&mut self) -> Result<(), String> {
+    fn begin_unlock_flow(&mut self) {
         if self.security_summary.lock_state == "unlocked" {
             self.last_status = self.t("menu.status.vault_already_unlocked");
-            return Ok(());
+            return;
         }
+        if self.unlock_worker.is_some() {
+            self.last_status = self.t("menu.status.vault_unlock_inflight");
+            return;
+        }
+        self.unlock_flow_state = UnlockFlowState::Waiting;
+        self.unlock_flow_pending = true;
+        self.last_status = self.t("menu.status.vault_unlock_waiting");
+    }
 
-        let methods = ordered_unlock_methods(&self.settings);
-        let mut last_error = None::<String>;
-        for method in methods {
-            match method.as_str() {
-                "os-native" => match self.vault_router.unlock_with_os_native() {
-                    Ok(()) => {
-                        self.security_summary =
-                            build_security_summary(&self.settings, &mut self.vault_router);
-                        self.last_status = self.t("menu.status.vault_unlocked_os_native");
-                        return Ok(());
+    fn start_unlock_worker(&mut self) {
+        let mut router = match self.ensure_vault_router_loaded() {
+            Ok(_) => self
+                .vault_router
+                .take()
+                .unwrap_or_else(|| load_vault_router(&self.settings)),
+            Err(err) => {
+                self.unlock_flow_state = UnlockFlowState::Failed {
+                    reason: err.clone(),
+                };
+                self.last_status = self.tf(
+                    "menu.status.vault_unlock_failed",
+                    &[
+                        ("reason", &err),
+                        ("methods", &ordered_unlock_methods(&self.settings).join(",")),
+                    ],
+                );
+                return;
+            }
+        };
+        let settings = self.settings.clone();
+        let (tx, rx) = mpsc::channel::<UnlockWorkerOutcome>();
+        thread::Builder::new()
+            .name("menuconfig-unlock-worker".into())
+            .spawn(move || {
+                let methods = ordered_unlock_methods(&settings);
+                let mut last_error = None::<String>;
+                let mut attempted_os_native = false;
+                for method in methods {
+                    if method.as_str() != "os-native" {
+                        continue;
                     }
-                    Err(err) => last_error = Some(format!("{err:?}")),
-                },
-                "passphrase" => {
-                    let passphrase = rpassword::prompt_password(&self.t("menu.prompt.passphrase")).map_err(
-                        |err| self.tf("menu.error.read_passphrase", &[("error", &err.to_string())]),
-                    )?;
-                    match self.vault_router.unlock_with_passphrase(&passphrase) {
+                    attempted_os_native = true;
+                    match router.unlock_with_os_native_verified() {
                         Ok(()) => {
-                            self.security_summary =
-                                build_security_summary(&self.settings, &mut self.vault_router);
-                            self.last_status = self.t("menu.status.vault_unlocked_passphrase");
-                            return Ok(());
+                            let _ = tx.send(UnlockWorkerOutcome {
+                                router,
+                                result: Ok(()),
+                            });
+                            return;
                         }
-                        Err(err) => last_error = Some(format!("{err:?}")),
+                        Err(err) => {
+                            last_error = Some(format!("{err:?}"));
+                        }
                     }
                 }
-                other => {
-                    last_error = Some(
-                        self.tf("menu.error.unsupported_unlock_method", &[("method", other)]),
-                    );
+                if !attempted_os_native {
+                    last_error = Some(MENU_UNLOCK_REASON_REQUIRES_OS_NATIVE.to_string());
+                }
+                let _ = tx.send(UnlockWorkerOutcome {
+                    router,
+                    result: Err(
+                        last_error.unwrap_or_else(|| "No allowed unlock method succeeded.".into())
+                    ),
+                });
+            })
+            .expect("spawn menuconfig unlock worker");
+        self.unlock_worker = Some(UnlockWorkerHandle {
+            receiver: rx,
+            cancel_requested: false,
+        });
+    }
+
+    fn poll_unlock_worker(&mut self) {
+        let mut completed = None::<(UnlockWorkerOutcome, bool)>;
+        let mut disconnected = false;
+        if let Some(worker) = self.unlock_worker.as_mut() {
+            match worker.receiver.try_recv() {
+                Ok(outcome) => {
+                    completed = Some((outcome, worker.cancel_requested));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
                 }
             }
         }
+
+        if let Some((mut outcome, cancel_requested)) = completed {
+            self.unlock_worker = None;
+            if cancel_requested {
+                let _ = outcome.router.lock_vault("menuconfig unlock cancelled");
+                self.vault_router = Some(outcome.router);
+                self.refresh_security_summary();
+                self.last_status = self.t("menu.status.vault_unlock_cancelled");
+                return;
+            }
+            self.vault_router = Some(outcome.router);
+            match outcome.result {
+                Ok(()) => {
+                    self.refresh_security_summary();
+                    self.unlock_flow_state = UnlockFlowState::Success;
+                    self.last_status = self.t("menu.status.vault_unlocked_os_native");
+                }
+                Err(reason) => {
+                    let reason = if reason == MENU_UNLOCK_REASON_REQUIRES_OS_NATIVE {
+                        self.t("menu.error.menu_unlock_requires_os_native")
+                    } else {
+                        reason
+                    };
+                    self.unlock_flow_state = UnlockFlowState::Failed {
+                        reason: reason.clone(),
+                    };
+                    let methods = ordered_unlock_methods(&self.settings);
+                    self.last_status = self.tf(
+                        "menu.status.vault_unlock_failed",
+                        &[("reason", &reason), ("methods", &methods.join(","))],
+                    );
+                }
+            }
+            return;
+        }
+
+        if disconnected {
+            self.unlock_worker = None;
+            self.unlock_flow_state = UnlockFlowState::Failed {
+                reason: self.t("menu.error.unlock_worker_disconnected"),
+            };
+            let methods = ordered_unlock_methods(&self.settings);
+            self.last_status = self.tf(
+                "menu.status.vault_unlock_failed",
+                &[
+                    ("reason", &self.t("menu.error.unlock_worker_disconnected")),
+                    ("methods", &methods.join(",")),
+                ],
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn execute_pending_unlock_flow(&mut self) {
+        let methods = ordered_unlock_methods(&self.settings);
+        let mut last_error = None::<String>;
+        let mut attempted_os_native = false;
+        for method in methods {
+            match method.as_str() {
+                "os-native" => {
+                    attempted_os_native = true;
+                    let unlock_result = self.ensure_vault_router_loaded().and_then(|router| {
+                        router
+                            .unlock_with_os_native_verified()
+                            .map_err(|err| format!("{err:?}"))
+                    });
+                    match unlock_result {
+                        Ok(()) => {
+                            self.refresh_security_summary();
+                            self.unlock_flow_state = UnlockFlowState::Success;
+                            self.last_status = self.t("menu.status.vault_unlocked_os_native");
+                            return;
+                        }
+                        Err(err) => last_error = Some(err),
+                    }
+                }
+                _ => continue,
+            }
+        }
+        if !attempted_os_native {
+            last_error = Some(self.t("menu.error.menu_unlock_requires_os_native"));
+        }
+        let reason = last_error.unwrap_or_else(|| self.t("menu.error.no_unlock_method_succeeded"));
+        self.unlock_flow_state = UnlockFlowState::Failed {
+            reason: reason.clone(),
+        };
+        let methods = ordered_unlock_methods(&self.settings);
         self.last_status = self.tf(
             "menu.status.vault_unlock_failed",
-            &[(
-                "reason",
-                &last_error.unwrap_or_else(|| self.t("menu.error.no_unlock_method_succeeded")),
-            )],
+            &[("reason", &reason), ("methods", &methods.join(","))],
         );
-        Ok(())
+    }
+
+    fn handle_unlock_flow_key(&mut self, code: KeyCode) {
+        match (&self.unlock_flow_state, code) {
+            (UnlockFlowState::Waiting, KeyCode::Esc) => {
+                self.unlock_flow_state = UnlockFlowState::Idle;
+                if let Some(worker) = self.unlock_worker.as_mut() {
+                    worker.cancel_requested = true;
+                }
+                self.last_status = self.t("menu.status.vault_unlock_cancel_requested");
+            }
+            (UnlockFlowState::Waiting, _) => {}
+            (UnlockFlowState::Success, KeyCode::Enter)
+            | (UnlockFlowState::Success, KeyCode::Esc)
+            | (UnlockFlowState::Success, KeyCode::Char(' ')) => {
+                self.unlock_flow_state = UnlockFlowState::Idle;
+                self.last_status = self.t("menu.status.vault_unlocked_notice");
+            }
+            (UnlockFlowState::Failed { .. }, KeyCode::Enter)
+            | (UnlockFlowState::Failed { .. }, KeyCode::Esc)
+            | (UnlockFlowState::Failed { .. }, KeyCode::Char(' ')) => {
+                self.unlock_flow_state = UnlockFlowState::Idle;
+            }
+            _ => {}
+        }
+    }
+
+    fn ensure_vault_router_loaded(&mut self) -> Result<&mut SecretVaultRouter, String> {
+        if self.vault_router.is_none() {
+            self.vault_router = Some(load_vault_router(&self.settings));
+        }
+        self.vault_router
+            .as_mut()
+            .ok_or_else(|| "vault router is unavailable".to_string())
+    }
+
+    fn refresh_security_summary(&mut self) {
+        if let Some(router) = self.vault_router.as_mut() {
+            self.security_summary = build_security_summary_from_router(&self.settings, router);
+        } else {
+            self.security_summary = build_security_summary_passive(&self.settings);
+        }
     }
 
     fn run_action(&mut self, action: ActionKind) -> Result<(), String> {
@@ -613,7 +844,7 @@ impl MenuConfigApp {
                 self.last_status = self.t("menu.status.added_adb_target");
             }
             ActionKind::UnlockVault => {
-                self.unlock_vault_shortcut()?;
+                self.begin_unlock_flow();
             }
         }
         Ok(())
@@ -756,8 +987,12 @@ impl MenuConfigApp {
             Screen::Vault => vault_entries(&self.settings, &self.catalog),
             Screen::Targets => targets_entries(&self.settings, &self.catalog),
             Screen::Security => security_entries(&self.security_summary, &self.catalog),
-            Screen::TargetEditor(index) => target_editor_entries(&self.settings, index, &self.catalog),
-            Screen::SearchResults => search_entries(&self.settings, &self.search_input, &self.catalog),
+            Screen::TargetEditor(index) => {
+                target_editor_entries(&self.settings, index, &self.catalog)
+            }
+            Screen::SearchResults => {
+                search_entries(&self.settings, &self.search_input, &self.catalog)
+            }
         }
     }
 }
@@ -811,7 +1046,12 @@ fn detect_selection_highlight_mode_from_values(
     no_color: bool,
     term: Option<&str>,
 ) -> SelectionHighlightMode {
-    if force_fallback || no_color || term.map(|value| value.trim().eq_ignore_ascii_case("dumb")).unwrap_or(false) {
+    if force_fallback
+        || no_color
+        || term
+            .map(|value| value.trim().eq_ignore_ascii_case("dumb"))
+            .unwrap_or(false)
+    {
         SelectionHighlightMode::Fallback
     } else {
         SelectionHighlightMode::Reverse
@@ -887,6 +1127,9 @@ fn render(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     if app.exit_confirm_mode {
         render_exit_confirm(frame, app);
     }
+    if !matches!(app.unlock_flow_state, UnlockFlowState::Idle) {
+        render_unlock_flow_popup(frame, app);
+    }
 }
 
 fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
@@ -896,7 +1139,7 @@ fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp)
         .enumerate()
         .map(|(index, entry)| {
             let visual_state = menu_entry_visual_state(app.selected, index, entry);
-            let line = format_menu_entry_line(app, index, entry);
+            let line = format_menu_entry_styled_line(app, index, entry);
             let style = menu_entry_style(visual_state, app.selection_highlight_mode);
             (line, style)
         })
@@ -924,7 +1167,12 @@ fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp)
         .split(inner);
     let content_width = rendered_rows
         .iter()
-        .map(|(line, _)| line.chars().count())
+        .map(|(line, _)| {
+            line.spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum()
+        })
         .max()
         .unwrap_or(0);
     let list_width = chunks[0].width as usize;
@@ -936,7 +1184,12 @@ fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp)
     let left_pad = " ".repeat(left_padding);
     let items = rendered_rows
         .into_iter()
-        .map(|(line, style)| ListItem::new(Line::from(format!("{left_pad}{line}"))).style(style))
+        .map(|(line, style)| {
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::raw(left_pad.clone()));
+            spans.extend(line.spans.clone());
+            ListItem::new(Line::from(spans)).style(style)
+        })
         .collect::<Vec<_>>();
     let list = List::new(items);
     frame.render_widget(list, chunks[0]);
@@ -964,16 +1217,11 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
         app.search_input.clone()
     };
     let footer = Paragraph::new(vec![
+        render_footer_path_line(app, &screen_title, &search_value),
         Line::from(app.tf(
-            "menu.render.path",
-            &[
-                ("path", &screen_title),
-                ("dirty", &app.is_dirty().to_string()),
-                ("lock_state", &app.security_summary.lock_state),
-                ("search", &search_value),
-            ],
+            "menu.render.description",
+            &[("description", &selected_description)],
         )),
-        Line::from(app.tf("menu.render.description", &[("description", &selected_description)])),
         Line::from(if app.edit_mode {
             match app.edit_mode_kind {
                 EditModeKind::Text => app.tf("menu.render.edit", &[("value", &app.edit_input)]),
@@ -990,6 +1238,12 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
             }
         } else if app.exit_confirm_mode {
             app.t("menu.render.exit_hint")
+        } else if matches!(app.unlock_flow_state, UnlockFlowState::Waiting) {
+            app.t("menu.render.unlock_waiting")
+        } else if matches!(app.unlock_flow_state, UnlockFlowState::Success) {
+            app.t("menu.render.unlock_success_hint")
+        } else if let UnlockFlowState::Failed { reason } = &app.unlock_flow_state {
+            app.tf("menu.render.unlock_failed_hint", &[("reason", reason)])
         } else if app.search_mode {
             app.tf("menu.render.search", &[("query", &app.search_input)])
         } else {
@@ -997,8 +1251,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
                 "menu.render.keys",
                 &[(
                     "apply",
-                    &app
-                        .last_apply_strategy
+                    &app.last_apply_strategy
                         .as_deref()
                         .map(|value| format!(", apply_strategy={value}"))
                         .unwrap_or_default(),
@@ -1013,6 +1266,42 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
     )
     .wrap(Wrap { trim: false });
     frame.render_widget(footer, area);
+}
+
+fn render_footer_path_line(
+    app: &MenuConfigApp,
+    screen_title: &str,
+    search_value: &str,
+) -> Line<'static> {
+    let formatted = app.tf(
+        "menu.render.path",
+        &[
+            ("path", screen_title),
+            ("dirty", &app.is_dirty().to_string()),
+            ("lock_state", FOOTER_LOCK_STATE_TOKEN),
+            ("search", search_value),
+        ],
+    );
+    if let Some((prefix, suffix)) = formatted.split_once(FOOTER_LOCK_STATE_TOKEN) {
+        return Line::from(vec![
+            Span::raw(prefix.to_string()),
+            Span::styled(
+                app.security_summary.lock_state.clone(),
+                lock_state_highlight_style(&app.security_summary.lock_state),
+            ),
+            Span::raw(suffix.to_string()),
+        ]);
+    }
+    Line::from(formatted)
+}
+
+fn lock_state_highlight_style(lock_state: &str) -> Style {
+    let color = match lock_state.trim().to_ascii_lowercase().as_str() {
+        "unlocked" => Color::Green,
+        "locked" => Color::Red,
+        _ => Color::Yellow,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
 fn render_help(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
@@ -1073,6 +1362,48 @@ fn render_exit_confirm(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     frame.render_widget(popup, area);
 }
 
+fn render_unlock_flow_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
+    let area = centered_rect(62, 34, frame.area());
+    frame.render_widget(Clear, area);
+    let popup = match &app.unlock_flow_state {
+        UnlockFlowState::Waiting => Paragraph::new(vec![
+            Line::from(app.t("menu.unlock.waiting.message")),
+            Line::from(""),
+            Line::from(app.t("menu.unlock.waiting.hint")),
+        ])
+        .block(
+            Block::default()
+                .title(app.t("menu.unlock.waiting.title"))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false }),
+        UnlockFlowState::Success => Paragraph::new(vec![
+            Line::from(app.t("menu.unlock.success.message")),
+            Line::from(""),
+            Line::from(app.t("menu.unlock.success.hint")),
+        ])
+        .block(
+            Block::default()
+                .title(app.t("menu.unlock.success.title"))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false }),
+        UnlockFlowState::Failed { reason } => Paragraph::new(vec![
+            Line::from(app.tf("menu.unlock.failed.message", &[("reason", reason)])),
+            Line::from(""),
+            Line::from(app.t("menu.unlock.failed.hint")),
+        ])
+        .block(
+            Block::default()
+                .title(app.t("menu.unlock.failed.title"))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false }),
+        UnlockFlowState::Idle => return,
+    };
+    frame.render_widget(popup, area);
+}
+
 fn render_footer_buttons_line(
     selected: usize,
     catalog: &Catalog,
@@ -1099,16 +1430,10 @@ fn render_footer_buttons_line(
 }
 
 fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) -> String {
-    let visual_state = menu_entry_visual_state(app.selected, index, entry);
-    let selector = if index != app.selected {
-        " "
-    } else if app.selection_highlight_mode == SelectionHighlightMode::Fallback
-        && visual_state == MenuEntryVisualState::Selected
-    {
-        ">>"
-    } else {
-        ">"
-    };
+    let selector = menu_entry_selector(app, index, entry);
+    if is_security_unlocked_notice_entry(app, entry) {
+        return format!("{selector} -*- {}", entry.label);
+    }
     match &entry.kind {
         MenuEntryKind::Navigate(screen) => {
             if let Screen::TargetEditor(target_index) = screen {
@@ -1159,8 +1484,60 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
             Some(value) => format!("{selector} --- {} = {}", entry.label, value),
             None => format!("{selector} --- {}", entry.label),
         },
+        MenuEntryKind::Action(ActionKind::UnlockVault) => {
+            format!("{selector}     {} --->", entry.label)
+        }
         MenuEntryKind::Action(_) => format!("{selector} *** {} ****", entry.label),
     }
+}
+
+fn format_menu_entry_styled_line(
+    app: &MenuConfigApp,
+    index: usize,
+    entry: &MenuEntry,
+) -> Line<'static> {
+    if is_security_lock_state_entry(app, entry) {
+        let selector = menu_entry_selector(app, index, entry);
+        let lock_state = entry.value.clone().unwrap_or_default();
+        return Line::from(vec![
+            Span::raw(format!("{selector} --- {} = ", entry.label)),
+            Span::styled(lock_state.clone(), lock_state_highlight_style(&lock_state)),
+        ]);
+    }
+    if is_security_unlocked_notice_entry(app, entry) {
+        let selector = menu_entry_selector(app, index, entry);
+        return Line::from(vec![
+            Span::raw(format!("{selector} -*- ")),
+            Span::styled(entry.label.clone(), lock_state_highlight_style("unlocked")),
+        ]);
+    }
+    Line::from(format_menu_entry_line(app, index, entry))
+}
+
+fn menu_entry_selector(app: &MenuConfigApp, index: usize, entry: &MenuEntry) -> &'static str {
+    let visual_state = menu_entry_visual_state(app.selected, index, entry);
+    if index != app.selected {
+        " "
+    } else if app.selection_highlight_mode == SelectionHighlightMode::Fallback
+        && visual_state == MenuEntryVisualState::Selected
+    {
+        ">>"
+    } else {
+        ">"
+    }
+}
+
+fn is_security_lock_state_entry(app: &MenuConfigApp, entry: &MenuEntry) -> bool {
+    matches!(app.screen, Screen::Security)
+        && matches!(entry.kind, MenuEntryKind::Info)
+        && entry.label == app.t("menu.security.lock_state")
+}
+
+fn is_security_unlocked_notice_entry(app: &MenuConfigApp, entry: &MenuEntry) -> bool {
+    matches!(app.screen, Screen::Security)
+        && matches!(entry.kind, MenuEntryKind::Info)
+        && entry.label == app.t("menu.security.unlocked_notice")
+        && entry.value.is_none()
 }
 
 fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
@@ -1386,7 +1763,7 @@ fn vault_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
 }
 
 fn security_entries(summary: &SecuritySummary, catalog: &Catalog) -> Vec<MenuEntry> {
-    vec![
+    let mut entries = vec![
         info_entry(
             &catalog.t("menu.security.lock_state"),
             Some(summary.lock_state.clone()),
@@ -1412,12 +1789,21 @@ fn security_entries(summary: &SecuritySummary, catalog: &Catalog) -> Vec<MenuEnt
             Some(summary.token_count.to_string()),
             &catalog.t("menu.security.token_count.desc"),
         ),
-        action_entry(
+    ];
+    if summary.lock_state == "unlocked" {
+        entries.push(info_entry(
+            &catalog.t("menu.security.unlocked_notice"),
+            None,
+            &catalog.t("menu.security.unlocked_notice.desc"),
+        ));
+    } else {
+        entries.push(action_entry(
             &catalog.t("menu.security.unlock_action"),
             &catalog.t("menu.security.unlock_action.desc"),
             ActionKind::UnlockVault,
-        ),
-    ]
+        ));
+    }
+    entries
 }
 
 fn targets_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
@@ -1450,7 +1836,11 @@ fn targets_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry>
     entries
 }
 
-fn target_editor_entries(settings: &CoreSettings, index: usize, catalog: &Catalog) -> Vec<MenuEntry> {
+fn target_editor_entries(
+    settings: &CoreSettings,
+    index: usize,
+    catalog: &Catalog,
+) -> Vec<MenuEntry> {
     let Some(target) = settings.targets.get(index) else {
         return vec![info_entry(
             &catalog.t("menu.target.missing"),
@@ -1879,7 +2269,7 @@ fn screen_for_field(field: &str) -> Screen {
 }
 
 fn load_vault_router(settings: &CoreSettings) -> SecretVaultRouter {
-    let vault_root = Path::new(&settings.core.data_dir).join("vault");
+    let vault_root = vault_root_path(settings);
     let mut router = if vault_root.exists() {
         SecretVaultRouter::with_persistent_store(&vault_root).unwrap_or_default()
     } else {
@@ -1889,7 +2279,34 @@ fn load_vault_router(settings: &CoreSettings) -> SecretVaultRouter {
     router
 }
 
-fn build_security_summary(
+fn vault_root_path(settings: &CoreSettings) -> PathBuf {
+    Path::new(&settings.core.data_dir).join("vault")
+}
+
+fn load_passive_projection(settings: &CoreSettings) -> VaultPassiveProjection {
+    read_passive_vault_projection(vault_root_path(settings)).unwrap_or_default()
+}
+
+fn build_security_summary_passive(settings: &CoreSettings) -> SecuritySummary {
+    let projection = load_passive_projection(settings);
+    build_security_summary_from_projection(settings, &projection)
+}
+
+fn build_security_summary_from_projection(
+    settings: &CoreSettings,
+    projection: &VaultPassiveProjection,
+) -> SecuritySummary {
+    SecuritySummary {
+        backend: settings.vault.backend.clone(),
+        lock_state: projection.lock_state.as_str().to_string(),
+        trigger_policy: settings.vault.unlock.trigger_policy.clone(),
+        preferred_method: settings.vault.unlock.preferred_method.clone(),
+        secret_count: projection.secret_count,
+        token_count: projection.token_count,
+    }
+}
+
+fn build_security_summary_from_router(
     settings: &CoreSettings,
     router: &mut SecretVaultRouter,
 ) -> SecuritySummary {
@@ -2007,7 +2424,7 @@ mod tests {
     use bridgingio_engine::CoreSettings;
     use bridgingio_secrets::VaultUnlockTriggerPolicy;
     use crossterm::event::KeyCode;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2069,7 +2486,8 @@ mod tests {
         let config_path = temp_config_path("locked");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         app.settings.vault.unlock.trigger_policy = "on-core-start".into();
-        app.security_summary = super::build_security_summary(&app.settings, &mut app.vault_router);
+        app.refresh_security_summary();
+        assert!(app.vault_router.is_none());
         assert_ne!(app.security_summary.lock_state, "unlocked");
         assert_eq!(
             super::parse_trigger_policy(&app.settings.vault.unlock.trigger_policy),
@@ -2222,11 +2640,17 @@ mod tests {
             super::MenuEntryVisualState::Selected,
             super::SelectionHighlightMode::Reverse,
         );
-        let footer_line =
-            super::render_footer_buttons_line(0, &app.catalog, super::SelectionHighlightMode::Reverse);
+        let footer_line = super::render_footer_buttons_line(
+            0,
+            &app.catalog,
+            super::SelectionHighlightMode::Reverse,
+        );
         let footer_selected = &footer_line.spans[0];
         assert_eq!(footer_selected.style, menu_selected);
-        assert!(footer_selected.style.add_modifier.contains(Modifier::REVERSED));
+        assert!(footer_selected
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -2244,7 +2668,11 @@ mod tests {
             super::SelectionHighlightMode::Fallback
         );
         assert_eq!(
-            super::detect_selection_highlight_mode_from_values(false, false, Some("xterm-256color")),
+            super::detect_selection_highlight_mode_from_values(
+                false,
+                false,
+                Some("xterm-256color")
+            ),
             super::SelectionHighlightMode::Reverse
         );
     }
@@ -2271,6 +2699,32 @@ mod tests {
     }
 
     #[test]
+    fn lock_state_uses_strong_color_hint() {
+        let config_path = temp_config_path("lock-state-color");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+
+        app.security_summary.lock_state = "locked".into();
+        let locked = super::render_footer_path_line(&app, "Main Menu", "<none>");
+        let locked_span = locked
+            .spans
+            .iter()
+            .find(|span| span.content == "locked")
+            .expect("locked span");
+        assert_eq!(locked_span.style.fg, Some(Color::Red));
+        assert!(locked_span.style.add_modifier.contains(Modifier::BOLD));
+
+        app.security_summary.lock_state = "unlocked".into();
+        let unlocked = super::render_footer_path_line(&app, "Main Menu", "<none>");
+        let unlocked_span = unlocked
+            .spans
+            .iter()
+            .find(|span| span.content == "unlocked")
+            .expect("unlocked span");
+        assert_eq!(unlocked_span.style.fg, Some(Color::Green));
+        assert!(unlocked_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn disabled_state_takes_priority_over_selected_highlight() {
         let config_path = temp_config_path("disabled-priority");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
@@ -2288,5 +2742,153 @@ mod tests {
         let line = super::format_menu_entry_line(&app, 1, &entries[1]);
         assert!(line.starts_with(">"));
         assert!(!line.starts_with(">>"));
+    }
+
+    #[test]
+    fn navigating_vault_and_security_screens_keeps_passive_projection() {
+        let config_path = temp_config_path("passive-security");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        assert!(app.vault_router.is_none());
+
+        app.screen = Screen::Vault;
+        let _ = app.entries();
+        assert!(app.vault_router.is_none());
+
+        app.screen = Screen::Security;
+        let _ = app.entries();
+        assert!(app.vault_router.is_none());
+    }
+
+    #[test]
+    fn unlock_flow_enters_waiting_and_fails_for_unsupported_method() {
+        let config_path = temp_config_path("unlock-failure");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.settings.vault.unlock.preferred_method = "unsupported-local-method".into();
+        app.settings.vault.unlock.allowed_methods = vec!["unsupported-local-method".into()];
+
+        app.begin_unlock_flow();
+        assert_eq!(app.unlock_flow_state, super::UnlockFlowState::Waiting);
+        assert!(app.unlock_flow_pending);
+
+        app.unlock_flow_pending = false;
+        app.execute_pending_unlock_flow();
+        assert!(matches!(
+            app.unlock_flow_state,
+            super::UnlockFlowState::Failed { .. }
+        ));
+
+        app.handle_unlock_flow_key(KeyCode::Enter);
+        assert_eq!(app.unlock_flow_state, super::UnlockFlowState::Idle);
+    }
+
+    #[test]
+    fn unlock_flow_does_not_block_on_passphrase_fallback() {
+        let config_path = temp_config_path("unlock-passphrase-fallback");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.settings.vault.unlock.preferred_method = "passphrase".into();
+        app.settings.vault.unlock.allowed_methods = vec!["passphrase".into()];
+
+        app.begin_unlock_flow();
+        assert_eq!(app.unlock_flow_state, super::UnlockFlowState::Waiting);
+        assert!(app.unlock_flow_pending);
+
+        app.unlock_flow_pending = false;
+        app.execute_pending_unlock_flow();
+        assert!(matches!(
+            app.unlock_flow_state,
+            super::UnlockFlowState::Failed { .. }
+        ));
+        assert!(app
+            .last_status
+            .contains(&app.t("menu.error.menu_unlock_requires_os_native")));
+    }
+
+    #[test]
+    fn waiting_unlock_flow_supports_esc_cancel() {
+        let config_path = temp_config_path("unlock-cancel");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.unlock_flow_state = super::UnlockFlowState::Waiting;
+
+        app.handle_unlock_flow_key(KeyCode::Esc);
+        assert_eq!(app.unlock_flow_state, super::UnlockFlowState::Idle);
+        assert_eq!(
+            app.last_status,
+            app.t("menu.status.vault_unlock_cancel_requested")
+        );
+    }
+
+    #[test]
+    fn unlock_success_popup_dismiss_updates_status_notice() {
+        let config_path = temp_config_path("unlock-success-dismiss");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.unlock_flow_state = super::UnlockFlowState::Success;
+        app.handle_unlock_flow_key(KeyCode::Enter);
+        assert_eq!(app.unlock_flow_state, super::UnlockFlowState::Idle);
+        assert_eq!(app.last_status, app.t("menu.status.vault_unlocked_notice"));
+    }
+
+    #[test]
+    fn security_screen_hides_unlock_action_when_unlocked() {
+        let config_path = temp_config_path("security-unlocked");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "unlocked".into();
+        let entries = app.entries();
+        assert!(entries
+            .iter()
+            .all(|entry| !matches!(entry.kind, MenuEntryKind::Action(ActionKind::UnlockVault))));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == app.t("menu.security.unlocked_notice")));
+    }
+
+    #[test]
+    fn security_lock_state_line_uses_colored_status_value() {
+        let config_path = temp_config_path("security-lock-state-color");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "locked".into();
+        app.selected = 0;
+        let entries = app.entries();
+        let lock_line = super::format_menu_entry_styled_line(&app, 0, &entries[0]);
+        let lock_state_span = lock_line
+            .spans
+            .iter()
+            .find(|span| span.content == "locked")
+            .expect("lock_state span");
+        assert_eq!(lock_state_span.style.fg, Some(Color::Red));
+        assert!(lock_state_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn security_unlock_action_uses_arrow_style() {
+        let config_path = temp_config_path("security-unlock-arrow");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "locked".into();
+        let entries = app.entries();
+        let action_index = entries
+            .iter()
+            .position(|entry| matches!(entry.kind, MenuEntryKind::Action(ActionKind::UnlockVault)))
+            .expect("unlock action entry");
+        let line = super::format_menu_entry_line(&app, action_index, &entries[action_index]);
+        assert!(line.contains(&format!("{} --->", entries[action_index].label)));
+        assert!(!line.contains("***"));
+    }
+
+    #[test]
+    fn security_unlocked_notice_uses_notice_marker() {
+        let config_path = temp_config_path("security-unlocked-marker");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "unlocked".into();
+        let entries = app.entries();
+        let notice_index = entries
+            .iter()
+            .position(|entry| entry.label == app.t("menu.security.unlocked_notice"))
+            .expect("unlocked notice entry");
+        let line = super::format_menu_entry_line(&app, notice_index, &entries[notice_index]);
+        assert!(line.contains("-*-"));
+        assert!(line.contains(&entries[notice_index].label));
     }
 }
