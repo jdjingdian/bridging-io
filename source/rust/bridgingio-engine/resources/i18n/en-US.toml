@@ -58,6 +58,7 @@ menu.status.select_cancelled = "Selection cancelled."
 menu.status.opened_screen = "Opened {screen}."
 menu.status.focused_field = "Focused `{field}`."
 menu.status.read_only = "`{field}` is read-only in menuconfig."
+menu.status.bool_toggle_space_only = "Use Space to toggle this option."
 menu.status.selecting = "Selecting `{field}`. Up/Down move, Space or Enter selects, Esc cancels."
 menu.status.editing = "Editing `{field}`. Enter saves, Esc cancels."
 menu.status.updated = "Updated `{field}`."
@@ -119,6 +120,10 @@ menu.render.unlock_success_hint = "unlock> success; press Enter or Esc to contin
 menu.render.unlock_failed_hint = "unlock> failed: {reason} (press Enter or Esc)"
 menu.render.no_search = "<none>"
 menu.render.dirty_suffix = " [*]"
+
+menu.resize.title = "Resize Required"
+menu.resize.message = "Current terminal size is {width}x{height}. menuconfig needs at least {min_width}x{min_height}."
+menu.resize.hint = "Resize terminal, then continue. While blocked, only Esc/q can exit or go back."
 
 menu.help.title = "Help"
 menu.help.h1 = "menuconfig keys"

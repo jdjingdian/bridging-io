@@ -45,6 +45,10 @@ surfaces:
 - Core version truth is `source/rust/Cargo.toml` `[workspace.package].version`.
   CLI/version metadata must stay aligned with it; do not add duplicate version
   constants in code.
+- `bridgingio-core menuconfig` visual grammar, focusability, popup behavior,
+  key semantics, and viewport rules must stay aligned with
+  `docs/matrix/MENUCONFIG_STYLE_MATRIX.md`; feature changes that alter these
+  behaviors must update that matrix together with the relevant OpenSpec spec.
 - `method_not_implemented`, `not_ready`, `restart_required`, and equivalent
   formal states must be captured here instead of only in prose docs.
 - This matrix must stay aligned with the shared error/status contract and the

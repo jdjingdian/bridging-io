@@ -58,6 +58,7 @@ menu.status.select_cancelled = "已取消选择。"
 menu.status.opened_screen = "已打开 {screen}。"
 menu.status.focused_field = "已定位到 `{field}`。"
 menu.status.read_only = "`{field}` 在 menuconfig 中只读。"
+menu.status.bool_toggle_space_only = "请使用空格键切换该开关。"
 menu.status.selecting = "正在选择 `{field}`。上下移动，Space 或 Enter 选择，Esc 取消。"
 menu.status.editing = "正在编辑 `{field}`。Enter 保存，Esc 取消。"
 menu.status.updated = "已更新 `{field}`。"
@@ -119,6 +120,10 @@ menu.render.unlock_success_hint = "unlock> 解锁成功，按 Enter 或 Esc 继�
 menu.render.unlock_failed_hint = "unlock> 解锁失败：{reason}（按 Enter 或 Esc）"
 menu.render.no_search = "<none>"
 menu.render.dirty_suffix = " [*]"
+
+menu.resize.title = "需要调整终端大小"
+menu.resize.message = "当前终端大小为 {width}x{height}，menuconfig 至少需要 {min_width}x{min_height}。"
+menu.resize.hint = "请先放大终端后继续。在此状态下仅允许 Esc/q 返回或退出。"
 
 menu.help.title = "帮助"
 menu.help.h1 = "menuconfig 按键"

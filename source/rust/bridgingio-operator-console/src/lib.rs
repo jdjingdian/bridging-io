@@ -23,7 +23,8 @@ use bridgingio_secrets::{
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, size as terminal_size, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -186,6 +187,8 @@ const FOOTER_LOCK_STATE_TOKEN: &str = "__bridgingio_footer_lock_state_token__";
 const TOKEN_CREATE_LABEL_FIELD: &str = "__token_create_label__";
 const TOKEN_CREATE_EXPIRY_MODE_FIELD: &str = "__token_create_expiry_mode__";
 const TOKEN_CREATE_EXPIRY_AT_FIELD: &str = "__token_create_expiry_at_unix_sec__";
+const MENUCONFIG_MIN_VIEWPORT_WIDTH: u16 = 80;
+const MENUCONFIG_MIN_VIEWPORT_HEIGHT: u16 = 24;
 
 struct UnlockWorkerOutcome {
     router: SecretVaultRouter,
@@ -296,6 +299,7 @@ impl MenuConfigApp {
             TerminalUi::enter().map_err(|err| format!("enter menuconfig ui failed: {err}"))?;
         loop {
             self.poll_unlock_worker();
+            self.sync_selection_to_focusable();
             ui.terminal
                 .draw(|frame| render(frame, self))
                 .map_err(|err| format!("draw menuconfig failed: {err}"))?;
@@ -317,6 +321,18 @@ impl MenuConfigApp {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            if runtime_viewport_too_small() {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if let Some(outcome) = self.request_exit_or_back()? {
+                            return Ok(outcome);
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
 
@@ -422,6 +438,7 @@ impl MenuConfigApp {
                 self.push_navigation_state();
                 self.screen = Screen::SearchResults;
                 self.selected = 0;
+                self.sync_selection_to_focusable();
                 self.last_status = if self.search_input.trim().is_empty() {
                     self.t("menu.status.search_empty")
                 } else {
@@ -449,10 +466,15 @@ impl MenuConfigApp {
                 let screen_title = screen.title(&self.catalog);
                 self.screen = screen;
                 self.selected = 0;
+                self.sync_selection_to_focusable();
                 self.last_status =
                     self.tf("menu.status.opened_screen", &[("screen", &screen_title)]);
             }
             MenuEntryKind::EditField(field) => {
+                if is_boolean_toggle_field(&field) {
+                    self.last_status = self.t("menu.status.bool_toggle_space_only");
+                    return Ok(());
+                }
                 self.begin_edit(field)?;
             }
             MenuEntryKind::FocusField { screen, field } => {
@@ -1051,6 +1073,7 @@ impl MenuConfigApp {
                 self.push_navigation_state();
                 self.screen = Screen::TargetEditor(index);
                 self.selected = 0;
+                self.sync_selection_to_focusable();
                 self.last_status = self.t("menu.status.added_ssh_target");
             }
             ActionKind::AddAdbTarget => {
@@ -1059,6 +1082,7 @@ impl MenuConfigApp {
                 self.push_navigation_state();
                 self.screen = Screen::TargetEditor(index);
                 self.selected = 0;
+                self.sync_selection_to_focusable();
                 self.last_status = self.t("menu.status.added_adb_target");
             }
             ActionKind::UnlockVault => {
@@ -1101,12 +1125,14 @@ impl MenuConfigApp {
                 self.push_navigation_state();
                 self.screen = Screen::TokenManagement;
                 self.selected = 0;
+                self.sync_selection_to_focusable();
                 self.last_status = self.t("menu.status.opened_token_management");
             }
             ActionKind::OpenTokenDetail(token_id) => {
                 self.push_navigation_state();
                 self.screen = Screen::TokenDetail(token_id);
                 self.selected = 0;
+                self.sync_selection_to_focusable();
                 self.last_status = self.t("menu.status.opened_token_detail");
             }
             ActionKind::EditTokenLabel(token_id) => {
@@ -1327,6 +1353,7 @@ impl MenuConfigApp {
         self.screen = Screen::Security;
         self.selected = 0;
         self.refresh_security_summary();
+        self.sync_selection_to_focusable();
         self.last_status = self.t("menu.status.vault_deleted");
         Ok(())
     }
@@ -1335,6 +1362,7 @@ impl MenuConfigApp {
         if let Some((screen, selected)) = self.navigation_stack.pop() {
             self.screen = screen;
             self.selected = selected;
+            self.sync_selection_to_focusable();
             let screen_title = self.screen.title(&self.catalog);
             self.last_status = self.tf("menu.status.returned", &[("screen", &screen_title)]);
         } else {
@@ -1343,7 +1371,8 @@ impl MenuConfigApp {
     }
 
     fn push_navigation_state(&mut self) {
-        self.navigation_stack.push((self.screen.clone(), self.selected));
+        self.navigation_stack
+            .push((self.screen.clone(), self.selected));
     }
 
     fn move_footer_selection(&mut self, delta: isize) {
@@ -1440,8 +1469,8 @@ impl MenuConfigApp {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let total = self.entries().len();
-        self.selected = wrap_selection_index(self.selected, delta, total);
+        let entries = self.entries();
+        self.selected = wrap_focusable_selection_index(self.selected, delta, &entries);
     }
 
     fn select_field(&mut self, field: &str) {
@@ -1452,6 +1481,12 @@ impl MenuConfigApp {
         } else {
             self.selected = 0;
         }
+        self.sync_selection_to_focusable();
+    }
+
+    fn sync_selection_to_focusable(&mut self) {
+        let entries = self.entries();
+        self.selected = normalize_selected_index(self.selected, &entries);
     }
 
     fn entries(&self) -> Vec<MenuEntry> {
@@ -1464,7 +1499,9 @@ impl MenuConfigApp {
             Screen::Targets => targets_entries(&self.settings, &self.catalog),
             Screen::Security => security_entries(&self.security_summary, &self.catalog),
             Screen::TokenManagement => token_management_entries(self, &self.catalog),
-            Screen::TokenDetail(ref token_id) => token_detail_entries(self, &self.catalog, token_id),
+            Screen::TokenDetail(ref token_id) => {
+                token_detail_entries(self, &self.catalog, token_id)
+            }
             Screen::TargetEditor(index) => {
                 target_editor_entries(&self.settings, index, &self.catalog)
             }
@@ -1569,6 +1606,42 @@ fn wrap_selection_index(current: usize, delta: isize, total: usize) -> usize {
     next as usize
 }
 
+fn first_focusable_index(entries: &[MenuEntry]) -> Option<usize> {
+    entries
+        .iter()
+        .position(|entry| !menu_entry_is_disabled(entry))
+}
+
+fn normalize_selected_index(selected: usize, entries: &[MenuEntry]) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    let bounded = selected.min(entries.len().saturating_sub(1));
+    if !menu_entry_is_disabled(&entries[bounded]) {
+        bounded
+    } else {
+        first_focusable_index(entries).unwrap_or(0)
+    }
+}
+
+fn wrap_focusable_selection_index(current: usize, delta: isize, entries: &[MenuEntry]) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    if first_focusable_index(entries).is_none() {
+        return 0;
+    }
+    let total = entries.len();
+    let mut index = current.min(total.saturating_sub(1));
+    for _ in 0..total {
+        index = wrap_selection_index(index, delta, total);
+        if !menu_entry_is_disabled(&entries[index]) {
+            return index;
+        }
+    }
+    normalize_selected_index(current, entries)
+}
+
 fn menu_entry_style(state: MenuEntryVisualState, mode: SelectionHighlightMode) -> Style {
     match state {
         MenuEntryVisualState::Normal => Style::default(),
@@ -1598,6 +1671,11 @@ fn menu_entry_visual_state(
 }
 
 fn render(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
+    if menuconfig_viewport_too_small(frame.area()) {
+        render_resize_popup(frame, app);
+        return;
+    }
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(5)])
@@ -1659,14 +1737,19 @@ fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp)
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
+    let available_row_width = chunks[0].width.saturating_sub(1) as usize;
+    let rendered_rows = rendered_rows
+        .into_iter()
+        .map(|(line, style)| {
+            (
+                normalize_menu_line_for_width(line, available_row_width),
+                style,
+            )
+        })
+        .collect::<Vec<_>>();
     let content_width = rendered_rows
         .iter()
-        .map(|(line, _)| {
-            line.spans
-                .iter()
-                .map(|span| span.content.chars().count())
-                .sum()
-        })
+        .map(|(line, _)| line_char_width(line))
         .max()
         .unwrap_or(0);
     let list_width = chunks[0].width as usize;
@@ -1766,6 +1849,121 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
     frame.render_widget(footer, area);
 }
 
+fn line_char_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
+}
+
+fn line_to_plain_text(line: &Line<'_>) -> String {
+    let mut combined = String::new();
+    for span in &line.spans {
+        combined.push_str(span.content.as_ref());
+    }
+    combined
+}
+
+fn normalize_menu_line_for_width(line: Line<'static>, max_width: usize) -> Line<'static> {
+    if max_width == 0 {
+        return Line::from(String::new());
+    }
+    let text = line_to_plain_text(&line);
+    if text.chars().count() <= max_width {
+        line
+    } else {
+        Line::from(truncate_menu_row_text(&text, max_width))
+    }
+}
+
+fn detect_menu_prefix_width(text: &str) -> usize {
+    if text.starts_with(">> ") {
+        7
+    } else {
+        6
+    }
+}
+
+fn truncate_menu_row_text(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return chars.into_iter().take(max_width).collect();
+    }
+
+    let has_arrow_suffix = text.ends_with("--->");
+    let suffix = if has_arrow_suffix { " --->" } else { "" };
+    let suffix_len = suffix.chars().count().min(max_width);
+    let prefix_len = detect_menu_prefix_width(text).min(max_width.saturating_sub(suffix_len));
+    let body_start = prefix_len.min(chars.len());
+    let body_end = chars.len().saturating_sub(suffix_len);
+    if body_end <= body_start {
+        return chars.into_iter().take(max_width).collect();
+    }
+
+    let body_budget = max_width.saturating_sub(prefix_len + suffix_len);
+    if body_budget <= 3 {
+        return chars.into_iter().take(max_width).collect();
+    }
+    let body_keep = body_budget.saturating_sub(3);
+
+    let mut out = String::new();
+    out.extend(chars[..prefix_len].iter());
+    let body_len = body_end.saturating_sub(body_start);
+    if body_len > body_budget {
+        out.extend(chars[body_start..body_start + body_keep].iter());
+        out.push_str("...");
+    } else {
+        out.extend(chars[body_start..body_end].iter());
+    }
+    if suffix_len > 0 {
+        out.extend(chars[chars.len() - suffix_len..].iter());
+    }
+    out.chars().take(max_width).collect()
+}
+
+fn menuconfig_viewport_too_small(area: Rect) -> bool {
+    area.width < MENUCONFIG_MIN_VIEWPORT_WIDTH || area.height < MENUCONFIG_MIN_VIEWPORT_HEIGHT
+}
+
+fn runtime_viewport_too_small() -> bool {
+    terminal_size()
+        .map(|(width, height)| {
+            width < MENUCONFIG_MIN_VIEWPORT_WIDTH || height < MENUCONFIG_MIN_VIEWPORT_HEIGHT
+        })
+        .unwrap_or(false)
+}
+
+fn render_resize_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
+    let area = centered_rect(72, 34, frame.area());
+    frame.render_widget(Clear, area);
+    let popup = Paragraph::new(vec![
+        Line::from(app.tf(
+            "menu.resize.message",
+            &[
+                ("width", &frame.area().width.to_string()),
+                ("height", &frame.area().height.to_string()),
+                ("min_width", &MENUCONFIG_MIN_VIEWPORT_WIDTH.to_string()),
+                ("min_height", &MENUCONFIG_MIN_VIEWPORT_HEIGHT.to_string()),
+            ],
+        )),
+        Line::from(""),
+        Line::from(app.t("menu.resize.hint")),
+    ])
+    .block(
+        Block::default()
+            .title(app.t("menu.resize.title"))
+            .borders(Borders::ALL),
+    )
+    .wrap(Wrap { trim: false });
+    frame.render_widget(popup, area);
+}
+
 fn render_footer_path_line(
     app: &MenuConfigApp,
     screen_title: &str,
@@ -1833,23 +2031,20 @@ fn render_help(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
 fn render_exit_confirm(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     let area = centered_rect(56, 30, frame.area());
     frame.render_widget(Clear, area);
-    let option = |index: usize, label: &str| -> String {
-        if app.exit_confirm_selected == index {
-            format!("< {label} >")
-        } else {
-            format!("  {label}  ")
-        }
-    };
+    let options = vec![
+        app.t("menu.exit.yes"),
+        app.t("menu.exit.no"),
+        app.t("menu.exit.cancel"),
+    ];
     let popup = Paragraph::new(vec![
         Line::from(app.t("menu.exit.q1")),
         Line::from(app.t("menu.exit.q2")),
         Line::from(""),
-        Line::from(format!(
-            "{}   {}   {}",
-            option(0, &app.t("menu.exit.yes")),
-            option(1, &app.t("menu.exit.no")),
-            option(2, &app.t("menu.exit.cancel"))
-        )),
+        render_popup_button_line(
+            &options,
+            app.exit_confirm_selected,
+            app.selection_highlight_mode,
+        ),
     ])
     .block(
         Block::default()
@@ -1917,23 +2112,13 @@ fn render_confirm_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     };
     let area = centered_rect(62, 32, frame.area());
     frame.render_widget(Clear, area);
-    let option = |index: usize, label: &str| -> String {
-        if app.confirm_selected == index {
-            format!("< {label} >")
-        } else {
-            format!("  {label}  ")
-        }
-    };
+    let options = vec![app.t("menu.confirm.confirm"), app.t("menu.confirm.cancel")];
     let popup = Paragraph::new(vec![
         Line::from(action_text),
         Line::from(""),
         Line::from(app.t("menu.confirm.message")),
         Line::from(""),
-        Line::from(format!(
-            "{}   {}",
-            option(0, &app.t("menu.confirm.confirm")),
-            option(1, &app.t("menu.confirm.cancel"))
-        )),
+        render_popup_button_line(&options, app.confirm_selected, app.selection_highlight_mode),
     ])
     .block(
         Block::default()
@@ -1991,6 +2176,37 @@ fn render_footer_buttons_line(
     Line::from(spans)
 }
 
+fn render_popup_button_line(
+    labels: &[String],
+    selected: usize,
+    mode: SelectionHighlightMode,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(render_popup_button_span(label, index == selected, mode));
+    }
+    Line::from(spans)
+}
+
+fn render_popup_button_span(
+    label: &str,
+    selected: bool,
+    mode: SelectionHighlightMode,
+) -> Span<'static> {
+    if !selected {
+        return Span::raw(format!("  {label}  "));
+    }
+    let selected_label = if mode == SelectionHighlightMode::Fallback {
+        format!(">>{label}<<")
+    } else {
+        format!(" {label} ")
+    };
+    Span::styled(selected_label, selected_highlight_style(mode))
+}
+
 fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) -> String {
     let selector = menu_entry_selector(app, index, entry);
     if is_security_unlocked_notice_entry(app, entry) {
@@ -2021,7 +2237,17 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
                 let enabled = field_value(&app.settings, field)
                     .and_then(|value| value.parse::<bool>().ok())
                     .unwrap_or(false);
-                let marker = if enabled { "[*]" } else { "[ ]" };
+                let marker = if is_single_choice_toggle_field(field) {
+                    if enabled {
+                        "<*>"
+                    } else {
+                        "< >"
+                    }
+                } else if enabled {
+                    "[*]"
+                } else {
+                    "[ ]"
+                };
                 format!("{selector} {marker} {}", entry.label)
             } else if let Some(value) = entry.value.as_deref() {
                 format!("{selector}     {} ({value}) --->", entry.label)
@@ -2034,7 +2260,17 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
                 let enabled = field_value(&app.settings, field)
                     .and_then(|value| value.parse::<bool>().ok())
                     .unwrap_or(false);
-                let marker = if enabled { "[*]" } else { "[ ]" };
+                let marker = if is_single_choice_toggle_field(field) {
+                    if enabled {
+                        "<*>"
+                    } else {
+                        "< >"
+                    }
+                } else if enabled {
+                    "[*]"
+                } else {
+                    "[ ]"
+                };
                 format!("{selector} {marker} {} --->", entry.label)
             } else if let Some(value) = entry.value.as_deref() {
                 format!("{selector}     {} ({value}) --->", entry.label)
@@ -2054,24 +2290,7 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
                 };
                 return format!("{selector} {marker} {}", entry.label);
             }
-            let uses_navigation_style = matches!(
-                action,
-                ActionKind::UnlockVault
-                    | ActionKind::CreateToken
-                    | ActionKind::OpenTokenManagement
-                    | ActionKind::OpenTokenDetail(_)
-                    | ActionKind::DeleteVault
-                    | ActionKind::EditTokenLabel(_)
-                    | ActionKind::ToggleTokenAccess(_)
-                    | ActionKind::OpenTokenPermissions(_)
-                    | ActionKind::RevokeToken(_)
-                    | ActionKind::DeleteToken(_)
-            );
-            if uses_navigation_style {
-                format!("{selector}     {} --->", entry.label)
-            } else {
-                format!("{selector} *** {} ****", entry.label)
-            }
+            format!("{selector}     {} --->", entry.label)
         }
     }
 }
@@ -2101,7 +2320,7 @@ fn format_menu_entry_styled_line(
 
 fn menu_entry_selector(app: &MenuConfigApp, index: usize, entry: &MenuEntry) -> &'static str {
     let visual_state = menu_entry_visual_state(app.selected, index, entry);
-    if index != app.selected {
+    if index != app.selected || menu_entry_is_disabled(entry) {
         " "
     } else if app.selection_highlight_mode == SelectionHighlightMode::Fallback
         && visual_state == MenuEntryVisualState::Selected
@@ -2197,23 +2416,41 @@ fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
                 .iter()
                 .enumerate()
                 .map(|(index, option)| {
-                    let cursor = if index == app.edit_option_selected {
-                        ">"
-                    } else {
-                        " "
-                    };
                     let marker = if index == app.edit_option_selected {
                         "*"
                     } else {
                         " "
                     };
-                    ListItem::new(Line::from(format!("{cursor} ({marker}) {option}")))
+                    ListItem::new(render_choice_option_line(
+                        option,
+                        marker,
+                        index == app.edit_option_selected,
+                        app.selection_highlight_mode,
+                    ))
                 })
                 .collect::<Vec<_>>();
             let list = List::new(items).block(Block::default().borders(Borders::ALL));
             frame.render_widget(list, chunks[1]);
         }
     }
+}
+
+fn render_choice_option_line(
+    option: &str,
+    marker: &str,
+    selected: bool,
+    mode: SelectionHighlightMode,
+) -> Line<'static> {
+    let base = format!("  ({marker}) {option}");
+    if !selected {
+        return Line::from(base);
+    }
+    let selected_label = if mode == SelectionHighlightMode::Fallback {
+        format!(">>({marker}) {option}<<")
+    } else {
+        format!("  ({marker}) {option}")
+    };
+    Line::from(Span::styled(selected_label, selected_highlight_style(mode)))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2564,7 +2801,10 @@ fn token_detail_entries(app: &MenuConfigApp, catalog: &Catalog, token_id: &str) 
 
     if item.status.to_ascii_lowercase() == "revoked" {
         entries.push(action_entry(
-            &catalog.tf("menu.token_management.delete_action", &[("id", &item.token_id)]),
+            &catalog.tf(
+                "menu.token_management.delete_action",
+                &[("id", &item.token_id)],
+            ),
             &catalog.t("menu.token_management.delete_action.desc"),
             ActionKind::DeleteToken(item.token_id.clone()),
         ));
@@ -2617,7 +2857,12 @@ fn format_short_utc_date(value: SystemTime) -> Option<String> {
     let secs = value.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
     let days = i64::try_from(secs / 86_400).ok()?;
     let (year, month, day) = civil_from_days(days);
-    Some(format!("{:02}-{:02}-{:02}", year.rem_euclid(100), month, day))
+    Some(format!(
+        "{:02}-{:02}-{:02}",
+        year.rem_euclid(100),
+        month,
+        day
+    ))
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -2919,6 +3164,10 @@ fn is_boolean_toggle_field(field: &str) -> bool {
         || parse_target_field(field)
             .map(|(_, suffix)| suffix == "enabled")
             .unwrap_or(false)
+}
+
+fn is_single_choice_toggle_field(field: &str) -> bool {
+    matches!(field, "model_plane.http.allow_non_loopback")
 }
 
 fn char_to_byte_index(input: &str, char_index: usize) -> usize {
@@ -3293,6 +3542,7 @@ mod tests {
     use bridgingio_engine::CoreSettings;
     use bridgingio_secrets::{SecretVaultRouter, VaultUnlockTriggerPolicy};
     use crossterm::event::KeyCode;
+    use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3314,7 +3564,10 @@ mod tests {
     fn set_config_data_dir(config_path: &Path, data_dir: &Path) {
         let config = fs::read_to_string(config_path).expect("read config");
         let toml_data_dir = data_dir.to_string_lossy().replace('\\', "\\\\");
-        let updated = config.replace("data_dir = \"auto\"", &format!("data_dir = \"{toml_data_dir}\""));
+        let updated = config.replace(
+            "data_dir = \"auto\"",
+            &format!("data_dir = \"{toml_data_dir}\""),
+        );
         fs::write(config_path, updated).expect("write config with custom data dir");
     }
 
@@ -3423,7 +3676,10 @@ mod tests {
 
         assert_eq!(app.security_summary.lock_state, "locked");
         assert!(!app.edit_mode);
-        assert_eq!(app.last_status, app.t("menu.status.vault_locked_for_token_action"));
+        assert_eq!(
+            app.last_status,
+            app.t("menu.status.vault_locked_for_token_action")
+        );
     }
 
     #[test]
@@ -3467,6 +3723,44 @@ mod tests {
         app.handle_edit_key(KeyCode::Char(' '))
             .expect("commit with space");
         assert_eq!(app.settings.core.log_level, "warn");
+        assert!(!app.edit_mode);
+    }
+
+    #[test]
+    fn allow_non_loopback_uses_single_choice_toggle_marker() {
+        let config_path = temp_config_path("model-allow-non-loopback-marker");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::ModelPlane;
+        app.settings.model_plane.http.allow_non_loopback = false;
+        let entries = app.entries();
+        let index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::EditField(ref field) if field == "model_plane.http.allow_non_loopback"
+                )
+            })
+            .expect("allow_non_loopback entry");
+        let off_line = super::format_menu_entry_line(&app, index, &entries[index]);
+        assert!(off_line.contains("< >"));
+        assert!(!off_line.contains("[ ]"));
+
+        app.settings.model_plane.http.allow_non_loopback = true;
+        let entries = app.entries();
+        let on_line = super::format_menu_entry_line(&app, index, &entries[index]);
+        assert!(on_line.contains("<*>"));
+        assert!(!on_line.contains("[*]"));
+    }
+
+    #[test]
+    fn enter_on_boolean_toggle_requires_space() {
+        let config_path = temp_config_path("enter-boolean-space-only");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::ModelPlane;
+        app.select_field("model_plane.http.allow_non_loopback");
+        app.activate_selected().expect("activate selected toggle");
+        assert_eq!(app.last_status, app.t("menu.status.bool_toggle_space_only"));
         assert!(!app.edit_mode);
     }
 
@@ -3617,6 +3911,21 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_navigation_skips_non_focusable_rows() {
+        let config_path = temp_config_path("selected-skip-disabled");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Core;
+        app.selected = 0;
+
+        // core_entries index 1 is an Info row; selection should jump to index 2.
+        app.move_selection(1);
+        assert_eq!(app.selected, 2);
+
+        app.move_selection(-1);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
     fn wrap_selection_index_handles_empty_and_single_item_lists() {
         assert_eq!(super::wrap_selection_index(7, 1, 0), 0);
         assert_eq!(super::wrap_selection_index(0, 1, 1), 0);
@@ -3731,8 +4040,67 @@ mod tests {
         assert!(!style.add_modifier.contains(Modifier::REVERSED));
 
         let line = super::format_menu_entry_line(&app, 1, &entries[1]);
-        assert!(line.starts_with(">"));
+        assert!(line.starts_with(" "));
         assert!(!line.starts_with(">>"));
+    }
+
+    #[test]
+    fn popup_buttons_share_selected_highlight_style() {
+        let labels = vec!["Confirm".to_string(), "Cancel".to_string()];
+        let line =
+            super::render_popup_button_line(&labels, 0, super::SelectionHighlightMode::Reverse);
+        assert_eq!(
+            line.spans[0].style,
+            super::selected_highlight_style(super::SelectionHighlightMode::Reverse)
+        );
+        assert!(line.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+
+        let fallback =
+            super::render_popup_button_line(&labels, 1, super::SelectionHighlightMode::Fallback);
+        assert!(fallback.spans[2].content.contains(">>"));
+    }
+
+    #[test]
+    fn choice_popup_line_uses_shared_selected_style() {
+        let selected = super::render_choice_option_line(
+            "warn",
+            "*",
+            true,
+            super::SelectionHighlightMode::Reverse,
+        );
+        assert_eq!(
+            selected.spans[0].style,
+            super::selected_highlight_style(super::SelectionHighlightMode::Reverse)
+        );
+        assert!(selected.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn long_menu_row_truncation_preserves_prefix_and_arrow() {
+        let text = "> [*] this-is-a-very-long-label-for-overflow-check --->";
+        let truncated = super::truncate_menu_row_text(text, 24);
+        assert!(truncated.starts_with("> [*] "));
+        assert!(truncated.ends_with(" --->"));
+        assert!(truncated.contains("..."));
+    }
+
+    #[test]
+    fn viewport_guard_detects_minimum_size() {
+        assert!(super::menuconfig_viewport_too_small(Rect::new(
+            0, 0, 79, 24
+        )));
+        assert!(super::menuconfig_viewport_too_small(Rect::new(
+            0, 0, 80, 23
+        )));
+        assert!(!super::menuconfig_viewport_too_small(Rect::new(
+            0, 0, 80, 24
+        )));
     }
 
     #[test]
@@ -4089,7 +4457,10 @@ mod tests {
             })
             .expect("access switch entry");
         app.activate_selected().expect("enter on access switch");
-        assert_eq!(app.last_status, app.t("menu.status.token_access_space_only"));
+        assert_eq!(
+            app.last_status,
+            app.t("menu.status.token_access_space_only")
+        );
     }
 
     #[test]

@@ -17,6 +17,11 @@ Highlight behavior:
 - if `NO_COLOR` is set or `TERM=dumb`, menuconfig switches to fallback highlight.
 - set `BRIDGINGIO_MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT=1` to force fallback-only
   selected markers during troubleshooting.
+- confirm/choice popups use the same selected highlight contract as menu rows.
 
 The operator console intentionally reuses the core-owned settings schema and
 field descriptions instead of defining a TUI-private schema.
+
+Canonical style source of truth:
+
+- `docs/matrix/MENUCONFIG_STYLE_MATRIX.md`

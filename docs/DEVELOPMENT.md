@@ -179,6 +179,9 @@ cargo run -p bridgingio-mcp --bin bridgingio-core -- menuconfig --config /absolu
 `menuconfig` is the common configuration mode for `bridgingio-core`; it is not
 standalone-specific. Existing `vault ...` and `auth ...` subcommands remain
 available as compatibility management routes for now.
+Menu style and interaction contract is canonicalized at
+`docs/matrix/MENUCONFIG_STYLE_MATRIX.md`; future menuconfig feature changes must
+stay aligned with that matrix.
 
 2. Optional: prepare a standalone config (TOML) manually. You can start from:
 
