@@ -21,6 +21,7 @@ const LOCAL_ADMIN_INTENT_ID_PREFIX: &str = "intent-";
 const LOCAL_ADMIN_ATTESTATION_ID_PREFIX: &str = "attest-";
 const LOCAL_ADMIN_CREATE_TOKEN_TARGET: &str = "token-authority://create-agent-token";
 const LOCAL_ADMIN_UNLOCK_VAULT_TARGET: &str = "vault://runtime/unlock";
+const LOCAL_ADMIN_DELETE_VAULT_TARGET: &str = "vault://runtime/delete";
 
 pub fn local_admin_create_token_target() -> &'static str {
     LOCAL_ADMIN_CREATE_TOKEN_TARGET
@@ -28,6 +29,10 @@ pub fn local_admin_create_token_target() -> &'static str {
 
 pub fn local_admin_unlock_vault_target() -> &'static str {
     LOCAL_ADMIN_UNLOCK_VAULT_TARGET
+}
+
+pub fn local_admin_delete_vault_target() -> &'static str {
+    LOCAL_ADMIN_DELETE_VAULT_TARGET
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,6 +308,7 @@ pub enum AgentTokenStatus {
     Active,
     Revoked,
     Expired,
+    Deleted,
 }
 
 impl AgentTokenStatus {
@@ -311,6 +317,7 @@ impl AgentTokenStatus {
             Self::Active => "active",
             Self::Revoked => "revoked",
             Self::Expired => "expired",
+            Self::Deleted => "deleted",
         }
     }
 }
@@ -338,6 +345,7 @@ pub struct AgentTokenRecord {
     pub idle_timeout_sec: Option<u64>,
     pub revoked_at: Option<SystemTime>,
     pub revoke_reason: Option<String>,
+    pub deleted_at: Option<SystemTime>,
     pub parent_token_id: Option<String>,
     pub issued_via_attestation_id: Option<String>,
 }
@@ -376,6 +384,7 @@ pub struct AgentTokenSummary {
     pub expires_at: Option<SystemTime>,
     pub revoked_at: Option<SystemTime>,
     pub revoke_reason: Option<String>,
+    pub deleted_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -411,9 +420,29 @@ pub struct UpdateAgentTokenScopeRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteAgentTokenRequest {
+    pub token_id: String,
+    pub requested_by: String,
+    pub attestation_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateAgentTokenLabelRequest {
+    pub token_id: String,
+    pub label: String,
+    pub changed_by: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnlockVaultRequest {
     pub method: String,
     pub passphrase: Option<String>,
+    pub requested_by: String,
+    pub attestation_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteVaultRequest {
     pub requested_by: String,
     pub attestation_id: String,
 }
@@ -563,7 +592,7 @@ pub struct VaultPassiveProjection {
 impl Default for VaultPassiveProjection {
     fn default() -> Self {
         Self {
-            lock_state: VaultLockState::Locked,
+            lock_state: VaultLockState::Uninitialized,
             secret_count: 0,
             token_count: 0,
         }
@@ -751,7 +780,9 @@ impl BrokeredSecretLease {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalAdminActionKind {
     UnlockVault,
+    DeleteVault,
     CreateAgentToken,
+    DeleteAgentToken,
     UpdateAgentTokenScope,
     RevealSecret,
     ExportSecret,
@@ -761,7 +792,9 @@ impl LocalAdminActionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::UnlockVault => "unlock-vault",
+            Self::DeleteVault => "delete-vault",
             Self::CreateAgentToken => "create-agent-token",
+            Self::DeleteAgentToken => "delete-agent-token",
             Self::UpdateAgentTokenScope => "update-agent-token-scope",
             Self::RevealSecret => "reveal-secret",
             Self::ExportSecret => "export-secret",
@@ -772,7 +805,9 @@ impl LocalAdminActionKind {
         let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
         match normalized.as_str() {
             "unlock-vault" => Some(Self::UnlockVault),
+            "delete-vault" => Some(Self::DeleteVault),
             "create-agent-token" => Some(Self::CreateAgentToken),
+            "delete-agent-token" => Some(Self::DeleteAgentToken),
             "update-agent-token-scope" => Some(Self::UpdateAgentTokenScope),
             "reveal-secret" => Some(Self::RevealSecret),
             "export-secret" => Some(Self::ExportSecret),
@@ -1224,6 +1259,8 @@ struct VaultMetadataDbV2 {
     next_intent_seq: u64,
     next_attestation_seq: u64,
     next_ssh_broker_seq: u64,
+    #[serde(default = "default_clock_watermark_unix_sec")]
+    clock_watermark_unix_sec: u64,
     key_envelope: PersistedVaultKeyEnvelopeRecordV2,
     wrap_manifests: Vec<PersistedProtectorWrapManifestV2>,
     secrets: Vec<PersistedSecretStateV2>,
@@ -1343,6 +1380,7 @@ struct PersistedAgentTokenRecordV2 {
     idle_timeout_sec: Option<u64>,
     revoked_at_unix_sec: Option<u64>,
     revoke_reason: Option<String>,
+    deleted_at_unix_sec: Option<u64>,
     parent_token_id: Option<String>,
     issued_via_attestation_id: Option<String>,
 }
@@ -1402,6 +1440,8 @@ struct VaultMetadataDbV1 {
     next_intent_seq: u64,
     next_attestation_seq: u64,
     next_ssh_broker_seq: u64,
+    #[serde(default = "default_clock_watermark_unix_sec")]
+    clock_watermark_unix_sec: u64,
     key_envelope: PersistedVaultKeyEnvelopeRecordV1,
     wrap_manifests: Vec<PersistedProtectorWrapManifestV1>,
     secrets: Vec<PersistedSecretStateV1>,
@@ -1490,6 +1530,10 @@ fn default_persisted_lock_state() -> VaultLockState {
     VaultLockState::Locked
 }
 
+fn default_clock_watermark_unix_sec() -> u64 {
+    0
+}
+
 fn default_persisted_unlock_policy() -> PersistedVaultUnlockPolicyV2 {
     PersistedVaultUnlockPolicyV2 {
         trigger_policy: VaultUnlockTriggerPolicy::OnFirstSecretAccess,
@@ -1562,7 +1606,19 @@ fn passive_projection_from_v2_payload(payload: &serde_json::Value) -> VaultPassi
     let token_count = payload
         .get("agent_tokens")
         .and_then(serde_json::Value::as_array)
-        .map(|items| items.len())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    let status = item
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("active")
+                        .to_ascii_lowercase();
+                    status != "deleted"
+                })
+                .count()
+        })
         .unwrap_or(0);
     VaultPassiveProjection {
         lock_state,
@@ -1635,6 +1691,7 @@ pub struct SecretVaultRouter {
     next_intent_seq: u64,
     next_attestation_seq: u64,
     next_ssh_broker_seq: u64,
+    clock_watermark: SystemTime,
     key_envelope: VaultKeyEnvelopeRecord,
     wrap_manifests: Vec<ProtectorWrapManifest>,
     intents: HashMap<String, LocalAdminActionIntent>,
@@ -1666,6 +1723,7 @@ impl Default for SecretVaultRouter {
             next_intent_seq: 0,
             next_attestation_seq: 0,
             next_ssh_broker_seq: 0,
+            clock_watermark: SystemTime::UNIX_EPOCH,
             key_envelope: VaultKeyEnvelopeRecord {
                 format_version: VAULT_OBJECT_FORMAT_VERSION,
                 vault_key_id: "vrk-000001".into(),
@@ -1757,6 +1815,10 @@ impl SecretVaultRouter {
 
     pub fn set_unlock_policy(&mut self, policy: VaultUnlockPolicy) -> Result<(), VaultError> {
         self.unlock_policy = normalize_unlock_policy(policy);
+        if matches!(self.lock_state, VaultLockState::Uninitialized) {
+            self.persist_metadata_db()?;
+            return Ok(());
+        }
         if matches!(
             self.unlock_policy.trigger_policy,
             VaultUnlockTriggerPolicy::OnCoreStart
@@ -2035,6 +2097,29 @@ impl SecretVaultRouter {
         )
     }
 
+    fn token_effective_now(&mut self) -> (SystemTime, bool) {
+        let observed_now = SystemTime::now();
+        if observed_now > self.clock_watermark {
+            self.clock_watermark = observed_now;
+            return (observed_now, false);
+        }
+        if observed_now < self.clock_watermark {
+            return (self.clock_watermark, true);
+        }
+        (observed_now, false)
+    }
+
+    fn token_now_for_create(&mut self, has_expiry: bool) -> Result<SystemTime, VaultError> {
+        let (effective_now, rollback_detected) = self.token_effective_now();
+        if rollback_detected && has_expiry {
+            return Err(VaultError::AgentTokenRejected(
+                "system clock rollback detected; expiring token create is temporarily blocked"
+                    .into(),
+            ));
+        }
+        Ok(effective_now)
+    }
+
     pub fn create_agent_token(
         &mut self,
         request: CreateAgentTokenRequest,
@@ -2071,7 +2156,7 @@ impl SecretVaultRouter {
         let seq = self.next_agent_token_seq;
         let token_id = format!("token-{seq:06}");
         let principal_id = format!("principal-{seq:06}");
-        let now = SystemTime::now();
+        let now = self.token_now_for_create(request.expires_in.is_some())?;
         let expires_at = request.expires_in.map(|ttl| now + ttl);
         let scope_profile =
             normalized_scope_profile(request.scope.scope_profile.as_deref(), Some("default-deny"));
@@ -2123,6 +2208,7 @@ impl SecretVaultRouter {
                 idle_timeout_sec: request.idle_timeout_sec,
                 revoked_at: None,
                 revoke_reason: None,
+                deleted_at: None,
                 parent_token_id: None,
                 issued_via_attestation_id: Some(attestation_id.to_string()),
             },
@@ -2140,12 +2226,76 @@ impl SecretVaultRouter {
         })
     }
 
+    pub fn init_vault_store(&mut self) -> Result<VaultLockState, VaultError> {
+        if matches!(self.lock_state, VaultLockState::Uninitialized) {
+            self.root_key_cache = None;
+            self.unlock_session = None;
+            self.lock_state = VaultLockState::Locked;
+            self.persist_metadata_db()?;
+        }
+        Ok(self.lock_state.clone())
+    }
+
+    pub fn delete_vault_with_attestation(
+        &mut self,
+        request: DeleteVaultRequest,
+    ) -> Result<VaultLockState, VaultError> {
+        let requested_by = request.requested_by.trim();
+        if requested_by.is_empty() {
+            return Err(VaultError::LocalAdminIntentMismatch(
+                "requested_by principal must be non-empty".into(),
+            ));
+        }
+        let payload_digest = payload_digest_for_delete_vault_request();
+        let validated = self.validate_local_admin_attestation(
+            LocalAdminActionKind::DeleteVault,
+            LOCAL_ADMIN_DELETE_VAULT_TARGET,
+            &payload_digest,
+            requested_by,
+            &request.attestation_id,
+            None,
+        )?;
+        self.consume_local_admin_attestation(&validated)?;
+
+        let Some(layout) = self.storage_layout.clone() else {
+            return Err(VaultError::VaultUnavailable(
+                "vault delete requires a persistent vault store".into(),
+            ));
+        };
+        if layout.root_dir.exists() {
+            fs::remove_dir_all(&layout.root_dir).map_err(|err| {
+                VaultError::StorageIo(format!(
+                    "failed to delete vault root {}: {err}",
+                    layout.root_dir.display()
+                ))
+            })?;
+        }
+        let rebuilt_layout = VaultStorageLayout::open(&layout.root_dir)?;
+        let active_backend = self.active_backend.clone();
+        let allow_degraded_mode = self.allow_degraded_mode;
+        let unlock_policy = self.unlock_policy.clone();
+        *self = SecretVaultRouter::default();
+        self.storage_layout = Some(rebuilt_layout);
+        self.active_backend = active_backend;
+        self.allow_degraded_mode = allow_degraded_mode;
+        self.unlock_policy = normalize_unlock_policy(unlock_policy);
+        self.lock_state = VaultLockState::Uninitialized;
+        self.persist_metadata_db()?;
+        Ok(self.lock_state.clone())
+    }
+
     pub fn list_agent_tokens(&mut self) -> Vec<AgentTokenSummary> {
         let mut token_ids = self.agent_tokens.keys().cloned().collect::<Vec<_>>();
         token_ids.sort();
+        let (now, _) = self.token_effective_now();
         token_ids
             .iter()
-            .filter_map(|token_id| self.agent_token_summary(token_id).ok().flatten())
+            .filter_map(|token_id| {
+                self.agent_token_summary_with_now(token_id, now)
+                    .ok()
+                    .flatten()
+            })
+            .filter(|summary| !matches!(summary.status, AgentTokenStatus::Deleted))
             .collect()
     }
 
@@ -2154,7 +2304,7 @@ impl SecretVaultRouter {
         token_id: &str,
         reason: Option<String>,
     ) -> Result<AgentTokenSummary, VaultError> {
-        let now = SystemTime::now();
+        let (now, _) = self.token_effective_now();
         let mut propagate_reason = None;
         {
             let record = self
@@ -2162,6 +2312,11 @@ impl SecretVaultRouter {
                 .get_mut(token_id)
                 .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))?;
             refresh_agent_token_status(record, now);
+            if matches!(record.status, AgentTokenStatus::Deleted) {
+                return Err(VaultError::AgentTokenRejected(
+                    "cannot revoke a deleted token".into(),
+                ));
+            }
             if !matches!(record.status, AgentTokenStatus::Revoked) {
                 record.status = AgentTokenStatus::Revoked;
                 record.revoked_at = Some(now);
@@ -2177,11 +2332,96 @@ impl SecretVaultRouter {
             .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))
     }
 
+    pub fn update_agent_token_label(
+        &mut self,
+        request: UpdateAgentTokenLabelRequest,
+    ) -> Result<AgentTokenSummary, VaultError> {
+        let token_id = request.token_id.trim();
+        if token_id.is_empty() {
+            return Err(VaultError::AgentTokenRejected(
+                "token_id must be non-empty".into(),
+            ));
+        }
+        let changed_by = request.changed_by.trim();
+        if changed_by.is_empty() {
+            return Err(VaultError::AgentTokenRejected(
+                "changed_by principal must be non-empty".into(),
+            ));
+        }
+        let label = request.label.trim();
+        if label.is_empty() {
+            return Err(VaultError::AgentTokenRejected(
+                "token label must be non-empty".into(),
+            ));
+        }
+        let (now, _) = self.token_effective_now();
+        let token = self
+            .agent_tokens
+            .get_mut(token_id)
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))?;
+        refresh_agent_token_status(token, now);
+        if matches!(token.status, AgentTokenStatus::Deleted) {
+            return Err(VaultError::AgentTokenRejected(
+                "cannot update label for a deleted token".into(),
+            ));
+        }
+        token.label = label.to_string();
+        self.persist_metadata_db()?;
+        self.agent_token_summary_with_now(token_id, now)?
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))
+    }
+
+    pub fn delete_agent_token_with_attestation(
+        &mut self,
+        request: DeleteAgentTokenRequest,
+    ) -> Result<AgentTokenSummary, VaultError> {
+        let token_id = request.token_id.trim().to_string();
+        if token_id.is_empty() {
+            return Err(VaultError::AgentTokenRejected(
+                "token_id must be non-empty".into(),
+            ));
+        }
+        let requested_by = request.requested_by.trim();
+        if requested_by.is_empty() {
+            return Err(VaultError::LocalAdminIntentMismatch(
+                "requested_by principal must be non-empty".into(),
+            ));
+        }
+        let payload_digest = payload_digest_for_token_delete_request(&token_id);
+        let validated = self.validate_local_admin_attestation(
+            LocalAdminActionKind::DeleteAgentToken,
+            &token_id,
+            &payload_digest,
+            requested_by,
+            &request.attestation_id,
+            None,
+        )?;
+        self.consume_local_admin_attestation(&validated)?;
+
+        let (now, _) = self.token_effective_now();
+        let token = self
+            .agent_tokens
+            .get_mut(&token_id)
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.clone()))?;
+        refresh_agent_token_status(token, now);
+        if !matches!(token.status, AgentTokenStatus::Revoked) {
+            return Err(VaultError::AgentTokenRejected(
+                "token delete requires token status revoked".into(),
+            ));
+        }
+        token.status = AgentTokenStatus::Deleted;
+        token.deleted_at = Some(now);
+        self.token_hash_index.remove(&token.token_hash);
+        self.persist_metadata_db()?;
+        self.agent_token_summary_with_now(&token_id, now)?
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id))
+    }
+
     pub fn update_agent_token_scope(
         &mut self,
         request: UpdateAgentTokenScopeRequest,
     ) -> Result<AgentTokenSummary, VaultError> {
-        let now = SystemTime::now();
+        let (now, _) = self.token_effective_now();
         let token_id = request.token_id.clone();
         let changed_by = request.changed_by.trim();
         if changed_by.is_empty() {
@@ -2272,7 +2512,7 @@ impl SecretVaultRouter {
     pub fn authenticate_agent_token(&mut self, token: &str) -> Option<AuthenticatedAgentToken> {
         let token_hash = short_digest(token.as_bytes());
         let token_id = self.token_hash_index.get(&token_hash)?.clone();
-        let now = SystemTime::now();
+        let (now, _) = self.token_effective_now();
         let (label, principal_id, active_scope_version, scope_profile) = {
             let record = self.agent_tokens.get_mut(&token_id)?;
             refresh_agent_token_status(record, now);
@@ -2345,7 +2585,10 @@ impl SecretVaultRouter {
             for token_id in descendants {
                 if let Some(token) = self.agent_tokens.get_mut(&token_id) {
                     refresh_agent_token_status(token, revoked_at);
-                    if matches!(token.status, AgentTokenStatus::Revoked) {
+                    if matches!(
+                        token.status,
+                        AgentTokenStatus::Revoked | AgentTokenStatus::Deleted
+                    ) {
                         queue.push(token_id.clone());
                         continue;
                     }
@@ -2362,7 +2605,15 @@ impl SecretVaultRouter {
         &mut self,
         token_id: &str,
     ) -> Result<Option<AgentTokenSummary>, VaultError> {
-        let now = SystemTime::now();
+        let (now, _) = self.token_effective_now();
+        self.agent_token_summary_with_now(token_id, now)
+    }
+
+    fn agent_token_summary_with_now(
+        &mut self,
+        token_id: &str,
+        now: SystemTime,
+    ) -> Result<Option<AgentTokenSummary>, VaultError> {
         let record = match self.agent_tokens.get_mut(token_id) {
             Some(record) => {
                 refresh_agent_token_status(record, now);
@@ -2386,6 +2637,7 @@ impl SecretVaultRouter {
             expires_at: record.expires_at,
             revoked_at: record.revoked_at,
             revoke_reason: record.revoke_reason,
+            deleted_at: record.deleted_at,
         }))
     }
 
@@ -3373,6 +3625,11 @@ impl SecretVaultRouter {
         secret: Option<&str>,
         require_verified_os_native: bool,
     ) -> Result<(), VaultError> {
+        if matches!(self.lock_state, VaultLockState::Uninitialized) {
+            return Err(VaultError::VaultUnavailable(
+                "vault is uninitialized; run vault init before unlock".into(),
+            ));
+        }
         let method = normalize_vault_method_label(method);
         if !self
             .unlock_policy
@@ -3735,7 +3992,11 @@ impl SecretVaultRouter {
             })?;
             let upgraded = self.migrate_v1_to_v2(&layout, db_v1)?;
             self.apply_metadata_db_v2(&layout, upgraded)?;
+            return Ok(());
         }
+        self.lock_state = VaultLockState::Uninitialized;
+        self.root_key_cache = None;
+        self.unlock_session = None;
         Ok(())
     }
 
@@ -3758,6 +4019,7 @@ impl SecretVaultRouter {
             next_intent_seq,
             next_attestation_seq,
             next_ssh_broker_seq,
+            clock_watermark_unix_sec,
             key_envelope,
             wrap_manifests,
             secrets,
@@ -3788,6 +4050,7 @@ impl SecretVaultRouter {
         self.next_intent_seq = next_intent_seq;
         self.next_attestation_seq = next_attestation_seq;
         self.next_ssh_broker_seq = next_ssh_broker_seq;
+        self.clock_watermark = unix_secs_to_system_time(clock_watermark_unix_sec);
         self.key_envelope = VaultKeyEnvelopeRecord {
             format_version: key_envelope.format_version,
             vault_key_id: key_envelope.vault_key_id,
@@ -3833,7 +4096,10 @@ impl SecretVaultRouter {
         }
         self.root_key_cache = None;
         self.refresh_unlock_session_ttl();
-        if matches!(self.lock_state, VaultLockState::Unlocked) {
+        if matches!(self.lock_state, VaultLockState::Uninitialized) {
+            self.root_key_cache = None;
+            self.unlock_session = None;
+        } else if matches!(self.lock_state, VaultLockState::Unlocked) {
             let unlock_method = self
                 .unlock_session
                 .as_ref()
@@ -3952,6 +4218,7 @@ impl SecretVaultRouter {
                         idle_timeout_sec: record.idle_timeout_sec,
                         revoked_at: record.revoked_at_unix_sec.map(unix_secs_to_system_time),
                         revoke_reason: record.revoke_reason,
+                        deleted_at: record.deleted_at_unix_sec.map(unix_secs_to_system_time),
                         parent_token_id: record.parent_token_id,
                         issued_via_attestation_id: record.issued_via_attestation_id,
                     },
@@ -4164,6 +4431,7 @@ impl SecretVaultRouter {
             next_intent_seq: db_v1.next_intent_seq,
             next_attestation_seq: db_v1.next_attestation_seq,
             next_ssh_broker_seq: db_v1.next_ssh_broker_seq,
+            clock_watermark_unix_sec: db_v1.clock_watermark_unix_sec,
             key_envelope: PersistedVaultKeyEnvelopeRecordV2 {
                 format_version: VAULT_OBJECT_FORMAT_VERSION,
                 vault_key_id: db_v1.key_envelope.vault_key_id,
@@ -4408,6 +4676,7 @@ impl SecretVaultRouter {
             next_intent_seq: self.next_intent_seq,
             next_attestation_seq: self.next_attestation_seq,
             next_ssh_broker_seq: self.next_ssh_broker_seq,
+            clock_watermark_unix_sec: system_time_to_unix_secs(self.clock_watermark),
             key_envelope: PersistedVaultKeyEnvelopeRecordV2 {
                 format_version: self.key_envelope.format_version,
                 vault_key_id: self.key_envelope.vault_key_id.clone(),
@@ -4457,6 +4726,7 @@ impl SecretVaultRouter {
                     idle_timeout_sec: token.idle_timeout_sec,
                     revoked_at_unix_sec: token.revoked_at.map(system_time_to_unix_secs),
                     revoke_reason: token.revoke_reason,
+                    deleted_at_unix_sec: token.deleted_at.map(system_time_to_unix_secs),
                     parent_token_id: token.parent_token_id,
                     issued_via_attestation_id: token.issued_via_attestation_id,
                 })
@@ -4587,7 +4857,8 @@ fn normalize_local_admin_target(
         }
         LocalAdminActionKind::CreateAgentToken => Ok(LOCAL_ADMIN_CREATE_TOKEN_TARGET.to_string()),
         LocalAdminActionKind::UnlockVault => Ok(LOCAL_ADMIN_UNLOCK_VAULT_TARGET.to_string()),
-        LocalAdminActionKind::UpdateAgentTokenScope => {
+        LocalAdminActionKind::DeleteVault => Ok(LOCAL_ADMIN_DELETE_VAULT_TARGET.to_string()),
+        LocalAdminActionKind::UpdateAgentTokenScope | LocalAdminActionKind::DeleteAgentToken => {
             let normalized = target_object_ref.trim().to_ascii_lowercase();
             if normalized.is_empty() {
                 return Err(VaultError::LocalAdminIntentMismatch(
@@ -4610,8 +4881,11 @@ fn payload_digest_for_local_admin_action(
     match action_kind {
         LocalAdminActionKind::RevealSecret
         | LocalAdminActionKind::ExportSecret
-        | LocalAdminActionKind::UpdateAgentTokenScope => short_digest(target_object_ref.as_bytes()),
-        LocalAdminActionKind::CreateAgentToken | LocalAdminActionKind::UnlockVault => {
+        | LocalAdminActionKind::UpdateAgentTokenScope
+        | LocalAdminActionKind::DeleteAgentToken => short_digest(target_object_ref.as_bytes()),
+        LocalAdminActionKind::CreateAgentToken
+        | LocalAdminActionKind::UnlockVault
+        | LocalAdminActionKind::DeleteVault => {
             short_digest(format!("{}:{target_object_ref}", action_kind.as_str()).as_bytes())
         }
     }
@@ -4622,6 +4896,14 @@ fn payload_digest_for_unlock_request(method: &str) -> String {
         "action": LocalAdminActionKind::UnlockVault.as_str(),
         "target": LOCAL_ADMIN_UNLOCK_VAULT_TARGET,
         "method": normalize_vault_method_label(method),
+    });
+    short_digest(payload.to_string().as_bytes())
+}
+
+fn payload_digest_for_delete_vault_request() -> String {
+    let payload = serde_json::json!({
+        "action": LocalAdminActionKind::DeleteVault.as_str(),
+        "target": LOCAL_ADMIN_DELETE_VAULT_TARGET,
     });
     short_digest(payload.to_string().as_bytes())
 }
@@ -4640,6 +4922,14 @@ pub fn local_admin_payload_digest_for_update_agent_token_scope(
 
 pub fn local_admin_payload_digest_for_unlock_vault(method: &str) -> String {
     payload_digest_for_unlock_request(method)
+}
+
+pub fn local_admin_payload_digest_for_delete_vault() -> String {
+    payload_digest_for_delete_vault_request()
+}
+
+pub fn local_admin_payload_digest_for_delete_agent_token(token_id: &str) -> String {
+    payload_digest_for_token_delete_request(token_id)
 }
 
 fn normalize_unlock_policy(mut policy: VaultUnlockPolicy) -> VaultUnlockPolicy {
@@ -4745,6 +5035,14 @@ fn payload_digest_for_token_scope_update_request(request: &UpdateAgentTokenScope
         "allow_delegation": request.scope.allow_delegation.unwrap_or(false),
         "allow_admin_actions": request.scope.allow_admin_actions.unwrap_or(false),
         "reason": request.reason.as_deref().map(|value| value.trim()),
+    });
+    short_digest(payload.to_string().as_bytes())
+}
+
+fn payload_digest_for_token_delete_request(token_id: &str) -> String {
+    let payload = serde_json::json!({
+        "action": LocalAdminActionKind::DeleteAgentToken.as_str(),
+        "target": token_id.trim().to_ascii_lowercase(),
     });
     short_digest(payload.to_string().as_bytes())
 }
@@ -5276,11 +5574,11 @@ fn unix_secs_to_system_time(value: u64) -> SystemTime {
 mod tests {
     use super::{
         command_audit_preview, normalize_credential_ref, read_passive_vault_projection,
-        AgentTokenStatus, CreateAgentTokenRequest, LocalAdminActionKind, SecretBytes,
-        SecretVaultRouter, SshAgentBrokerPrepareRequest, SshAgentBrokerSessionState,
-        SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput, UpdateAgentTokenScopeRequest,
-        VaultError, VaultLockState, VaultReadinessState, VaultUnlockPolicy,
-        VaultUnlockTriggerPolicy,
+        AgentTokenStatus, CreateAgentTokenRequest, DeleteAgentTokenRequest, DeleteVaultRequest,
+        LocalAdminActionKind, SecretBytes, SecretVaultRouter, SshAgentBrokerPrepareRequest,
+        SshAgentBrokerSessionState, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
+        UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
+        VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -5343,6 +5641,56 @@ mod tests {
                 Duration::from_secs(30),
             )
             .expect("scope attestation")
+            .attestation_id
+    }
+
+    fn mint_delete_token_attestation(
+        router: &mut SecretVaultRouter,
+        request: &DeleteAgentTokenRequest,
+    ) -> String {
+        let digest = super::payload_digest_for_token_delete_request(&request.token_id);
+        let intent = router
+            .create_local_admin_intent_with_digest(
+                LocalAdminActionKind::DeleteAgentToken,
+                &request.token_id,
+                &digest,
+                &request.requested_by,
+                Duration::from_secs(60),
+            )
+            .expect("create delete-token intent");
+        router
+            .complete_local_admin_attestation(
+                &intent.intent_id,
+                &request.requested_by,
+                "passkey",
+                Duration::from_secs(30),
+            )
+            .expect("delete-token attestation")
+            .attestation_id
+    }
+
+    fn mint_delete_vault_attestation(
+        router: &mut SecretVaultRouter,
+        request: &DeleteVaultRequest,
+    ) -> String {
+        let digest = super::payload_digest_for_delete_vault_request();
+        let intent = router
+            .create_local_admin_intent_with_digest(
+                LocalAdminActionKind::DeleteVault,
+                super::LOCAL_ADMIN_DELETE_VAULT_TARGET,
+                &digest,
+                &request.requested_by,
+                Duration::from_secs(60),
+            )
+            .expect("create delete-vault intent");
+        router
+            .complete_local_admin_attestation(
+                &intent.intent_id,
+                &request.requested_by,
+                "passkey",
+                Duration::from_secs(30),
+            )
+            .expect("delete-vault attestation")
             .attestation_id
     }
 
@@ -6187,6 +6535,171 @@ mod tests {
     }
 
     #[test]
+    fn expired_token_must_be_revoked_before_delete() {
+        let mut router = SecretVaultRouter::default();
+        let mut create_request = CreateAgentTokenRequest {
+            label: "expires-then-delete".into(),
+            created_by: "local-operator".into(),
+            expires_in: Some(Duration::from_millis(1)),
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: Some("strict-default".into()),
+                target_ids: vec!["target-a".into()],
+                tool_ids: Vec::new(),
+                max_risk_envelope: None,
+                allow_open_shell: None,
+                allow_write_shell_input: None,
+                allow_artifact_cross_principal: None,
+                allow_delegation: None,
+                allow_admin_actions: None,
+            },
+            attestation_id: None,
+        };
+        create_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &create_request));
+        let created = router
+            .create_agent_token(create_request)
+            .expect("create expiring token");
+        std::thread::sleep(Duration::from_millis(5));
+        let listed = router.list_agent_tokens();
+        assert_eq!(listed[0].status, AgentTokenStatus::Expired);
+
+        let mut delete_request = DeleteAgentTokenRequest {
+            token_id: created.summary.token_id.clone(),
+            requested_by: "local-operator".into(),
+            attestation_id: String::new(),
+        };
+        delete_request.attestation_id = mint_delete_token_attestation(&mut router, &delete_request);
+        let direct_delete = router.delete_agent_token_with_attestation(delete_request.clone());
+        assert!(matches!(
+            direct_delete,
+            Err(VaultError::AgentTokenRejected(_))
+        ));
+
+        router
+            .revoke_agent_token(&created.summary.token_id, Some("revoke before delete".into()))
+            .expect("revoke expired token");
+        delete_request.attestation_id = mint_delete_token_attestation(&mut router, &delete_request);
+        let deleted = router
+            .delete_agent_token_with_attestation(delete_request)
+            .expect("delete revoked token");
+        assert_eq!(deleted.status, AgentTokenStatus::Deleted);
+        assert!(deleted.deleted_at.is_some());
+        assert!(router.list_agent_tokens().is_empty());
+    }
+
+    #[test]
+    fn token_label_update_is_allowed_until_deleted() {
+        let mut router = SecretVaultRouter::default();
+        let mut create_request = CreateAgentTokenRequest {
+            label: "initial-label".into(),
+            created_by: "local-operator".into(),
+            expires_in: None,
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: Some("strict-default".into()),
+                target_ids: vec!["target-a".into()],
+                tool_ids: Vec::new(),
+                max_risk_envelope: None,
+                allow_open_shell: None,
+                allow_write_shell_input: None,
+                allow_artifact_cross_principal: None,
+                allow_delegation: None,
+                allow_admin_actions: None,
+            },
+            attestation_id: None,
+        };
+        create_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &create_request));
+        let created = router
+            .create_agent_token(create_request)
+            .expect("create token");
+
+        let updated = router
+            .update_agent_token_label(UpdateAgentTokenLabelRequest {
+                token_id: created.summary.token_id.clone(),
+                label: "Codex".into(),
+                changed_by: "local-operator".into(),
+            })
+            .expect("update label");
+        assert_eq!(updated.label, "Codex");
+
+        router
+            .revoke_agent_token(&created.summary.token_id, Some("cleanup".into()))
+            .expect("revoke token");
+        let mut delete_request = DeleteAgentTokenRequest {
+            token_id: created.summary.token_id.clone(),
+            requested_by: "local-operator".into(),
+            attestation_id: String::new(),
+        };
+        delete_request.attestation_id = mint_delete_token_attestation(&mut router, &delete_request);
+        router
+            .delete_agent_token_with_attestation(delete_request)
+            .expect("delete token");
+        let update_deleted = router.update_agent_token_label(UpdateAgentTokenLabelRequest {
+            token_id: created.summary.token_id,
+            label: "after-delete".into(),
+            changed_by: "local-operator".into(),
+        });
+        assert!(matches!(
+            update_deleted,
+            Err(VaultError::AgentTokenRejected(_))
+        ));
+    }
+
+    #[test]
+    fn rollback_detection_blocks_expiring_token_create_but_allows_long_lived() {
+        let mut router = SecretVaultRouter::default();
+        router.clock_watermark = std::time::SystemTime::now() + Duration::from_secs(120);
+
+        let mut expiring = CreateAgentTokenRequest {
+            label: "expiring-under-rollback".into(),
+            created_by: "local-operator".into(),
+            expires_in: Some(Duration::from_secs(60)),
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: Some("strict-default".into()),
+                target_ids: vec!["target-a".into()],
+                tool_ids: Vec::new(),
+                max_risk_envelope: None,
+                allow_open_shell: None,
+                allow_write_shell_input: None,
+                allow_artifact_cross_principal: None,
+                allow_delegation: None,
+                allow_admin_actions: None,
+            },
+            attestation_id: None,
+        };
+        expiring.attestation_id = Some(mint_create_token_attestation(&mut router, &expiring));
+        let blocked = router.create_agent_token(expiring);
+        assert!(matches!(blocked, Err(VaultError::AgentTokenRejected(_))));
+
+        let mut long_lived = CreateAgentTokenRequest {
+            label: "long-lived-under-rollback".into(),
+            created_by: "local-operator".into(),
+            expires_in: None,
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: Some("strict-default".into()),
+                target_ids: vec!["target-a".into()],
+                tool_ids: Vec::new(),
+                max_risk_envelope: None,
+                allow_open_shell: None,
+                allow_write_shell_input: None,
+                allow_artifact_cross_principal: None,
+                allow_delegation: None,
+                allow_admin_actions: None,
+            },
+            attestation_id: None,
+        };
+        long_lived.attestation_id = Some(mint_create_token_attestation(&mut router, &long_lived));
+        let created = router
+            .create_agent_token(long_lived)
+            .expect("long-lived token should still be creatable");
+        assert_eq!(created.summary.status, AgentTokenStatus::Active);
+    }
+
+    #[test]
     fn local_admin_intent_and_attestation_are_persisted_in_metadata_store() {
         let vault_dir = new_temp_vault_dir("local-admin-persist");
         let mut request = CreateAgentTokenRequest {
@@ -6247,6 +6760,7 @@ mod tests {
     fn persistent_store_round_trip_restores_secret_state_and_blobs() {
         let vault_dir = new_temp_vault_dir("persist-roundtrip");
         let mut router = SecretVaultRouter::with_persistent_store(&vault_dir).expect("open store");
+        router.init_vault_store().expect("init vault store");
         router
             .set_active_backend("builtin-encrypted")
             .expect("switch backend");
@@ -6286,9 +6800,37 @@ mod tests {
     fn passive_projection_defaults_when_no_metadata_exists() {
         let vault_dir = new_temp_vault_dir("passive-default");
         let projection = read_passive_vault_projection(&vault_dir).expect("read projection");
-        assert_eq!(projection.lock_state, VaultLockState::Locked);
+        assert_eq!(projection.lock_state, VaultLockState::Uninitialized);
         assert_eq!(projection.secret_count, 0);
         assert_eq!(projection.token_count, 0);
+        let _ = fs::remove_dir_all(vault_dir);
+    }
+
+    #[test]
+    fn vault_init_and_delete_returns_to_uninitialized_state() {
+        let vault_dir = new_temp_vault_dir("vault-init-delete");
+        let mut router = SecretVaultRouter::with_persistent_store(&vault_dir).expect("open store");
+        assert_eq!(router.lock_state, VaultLockState::Uninitialized);
+
+        let lock_state = router.init_vault_store().expect("init vault");
+        assert_eq!(lock_state, VaultLockState::Locked);
+
+        let mut delete_request = DeleteVaultRequest {
+            requested_by: "local-operator".into(),
+            attestation_id: String::new(),
+        };
+        delete_request.attestation_id = mint_delete_vault_attestation(&mut router, &delete_request);
+        let deleted_state = router
+            .delete_vault_with_attestation(delete_request)
+            .expect("delete vault");
+        assert_eq!(deleted_state, VaultLockState::Uninitialized);
+
+        let projection = read_passive_vault_projection(&vault_dir).expect("read projection");
+        assert_eq!(projection.lock_state, VaultLockState::Uninitialized);
+
+        let unlock = router.unlock_with_os_native_verified();
+        assert!(matches!(unlock, Err(VaultError::VaultUnavailable(_))));
+
         let _ = fs::remove_dir_all(vault_dir);
     }
 

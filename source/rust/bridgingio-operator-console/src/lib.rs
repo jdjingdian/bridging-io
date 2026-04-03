@@ -3,7 +3,7 @@ use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bridgingio_domain::TargetKind;
 use bridgingio_engine::{
@@ -13,7 +13,12 @@ use bridgingio_engine::{
 #[cfg(test)]
 use bridgingio_secrets::VaultUnlockTriggerPolicy;
 use bridgingio_secrets::{
-    read_passive_vault_projection, SecretVaultRouter, VaultPassiveProjection,
+    local_admin_create_token_target, local_admin_delete_vault_target,
+    local_admin_payload_digest_for_create_agent_token,
+    local_admin_payload_digest_for_delete_agent_token, local_admin_payload_digest_for_delete_vault,
+    read_passive_vault_projection, CreateAgentTokenRequest, DeleteAgentTokenRequest,
+    DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter, TokenScopeInput,
+    UpdateAgentTokenLabelRequest, VaultPassiveProjection,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -52,6 +57,7 @@ enum Screen {
     Vault,
     Targets,
     Security,
+    TokenManagement,
     TargetEditor(usize),
     SearchResults,
 }
@@ -66,6 +72,7 @@ impl Screen {
             Screen::Vault => catalog.t("menu.vault.title"),
             Screen::Targets => catalog.t("menu.targets.title"),
             Screen::Security => catalog.t("menu.security.title"),
+            Screen::TokenManagement => catalog.t("menu.token_management.title"),
             Screen::TargetEditor(_) => catalog.t("menu.target.title"),
             Screen::SearchResults => catalog.t("menu.search_results.title"),
         }
@@ -90,11 +97,18 @@ enum MenuEntryKind {
     Info,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ActionKind {
     AddSshTarget,
     AddAdbTarget,
     UnlockVault,
+    InitVault,
+    DeleteVault,
+    CreateToken,
+    OpenTokenManagement,
+    EditTokenLabel(String),
+    RevokeToken(String),
+    DeleteToken(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,10 +156,28 @@ enum UnlockFlowState {
     Failed { reason: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TokenManagementRow {
+    token_id: String,
+    label: String,
+    status: String,
+    expires_at: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConfirmAction {
+    DeleteVault,
+    RevokeToken(String),
+    DeleteToken(String),
+}
+
 const MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT_ENV: &str =
     "BRIDGINGIO_MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT";
 const MENU_UNLOCK_REASON_REQUIRES_OS_NATIVE: &str = "__menu_unlock_requires_os_native__";
 const FOOTER_LOCK_STATE_TOKEN: &str = "__bridgingio_footer_lock_state_token__";
+const TOKEN_CREATE_LABEL_FIELD: &str = "__token_create_label__";
+const TOKEN_CREATE_EXPIRY_MODE_FIELD: &str = "__token_create_expiry_mode__";
+const TOKEN_CREATE_EXPIRY_AT_FIELD: &str = "__token_create_expiry_at_unix_sec__";
 
 struct UnlockWorkerOutcome {
     router: SecretVaultRouter,
@@ -183,6 +215,11 @@ pub struct MenuConfigApp {
     unlock_flow_state: UnlockFlowState,
     unlock_flow_pending: bool,
     unlock_worker: Option<UnlockWorkerHandle>,
+    token_rows: Vec<TokenManagementRow>,
+    confirm_action: Option<ConfirmAction>,
+    confirm_selected: usize,
+    token_reveal: Option<String>,
+    pending_token_label: Option<String>,
     selection_highlight_mode: SelectionHighlightMode,
     last_status: String,
     last_apply_strategy: Option<String>,
@@ -227,6 +264,11 @@ impl MenuConfigApp {
             unlock_flow_state: UnlockFlowState::Idle,
             unlock_flow_pending: false,
             unlock_worker: None,
+            token_rows: Vec::new(),
+            confirm_action: None,
+            confirm_selected: 0,
+            token_reveal: None,
+            pending_token_label: None,
             selection_highlight_mode: detect_selection_highlight_mode(),
             last_status: initial_status,
             last_apply_strategy: None,
@@ -272,6 +314,14 @@ impl MenuConfigApp {
 
             if !matches!(self.unlock_flow_state, UnlockFlowState::Idle) {
                 self.handle_unlock_flow_key(key.code);
+                continue;
+            }
+            if self.token_reveal.is_some() {
+                self.handle_token_reveal_key(key.code);
+                continue;
+            }
+            if self.confirm_action.is_some() {
+                self.handle_confirm_key(key.code)?;
                 continue;
             }
             if self.exit_confirm_mode {
@@ -412,6 +462,64 @@ impl MenuConfigApp {
     }
 
     fn begin_edit(&mut self, field: String) -> Result<(), String> {
+        if field == TOKEN_CREATE_LABEL_FIELD {
+            self.edit_mode = true;
+            self.edit_mode_kind = EditModeKind::Text;
+            self.edit_field = Some(field);
+            self.edit_input = self.pending_token_label.clone().unwrap_or_default();
+            self.edit_cursor = self.edit_input.chars().count();
+            self.edit_options.clear();
+            self.edit_option_selected = 0;
+            self.last_status = self.t("menu.status.token_create_label_prompt");
+            return Ok(());
+        }
+        if field == TOKEN_CREATE_EXPIRY_MODE_FIELD {
+            self.edit_mode = true;
+            self.edit_mode_kind = EditModeKind::Choice;
+            self.edit_field = Some(field);
+            self.edit_options = vec!["long-lived".to_string(), "expires-at-time".to_string()];
+            self.edit_option_selected = 0;
+            self.edit_input = self
+                .edit_options
+                .get(self.edit_option_selected)
+                .cloned()
+                .unwrap_or_default();
+            self.edit_cursor = 0;
+            self.last_status = self.t("menu.status.token_create_expiry_mode_prompt");
+            return Ok(());
+        }
+        if field == TOKEN_CREATE_EXPIRY_AT_FIELD {
+            self.edit_mode = true;
+            self.edit_mode_kind = EditModeKind::Text;
+            self.edit_field = Some(field);
+            let default_expiry = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_secs().saturating_add(3600))
+                .unwrap_or(3600);
+            self.edit_input = default_expiry.to_string();
+            self.edit_cursor = self.edit_input.chars().count();
+            self.edit_options.clear();
+            self.edit_option_selected = 0;
+            self.last_status = self.t("menu.status.token_create_expiry_at_prompt");
+            return Ok(());
+        }
+        if let Some(token_id) = field.strip_prefix("__token_label_edit__:") {
+            let current_label = self
+                .token_rows
+                .iter()
+                .find(|item| item.token_id == token_id)
+                .map(|item| item.label.clone())
+                .unwrap_or_default();
+            self.edit_mode = true;
+            self.edit_mode_kind = EditModeKind::Text;
+            self.edit_field = Some(field);
+            self.edit_input = current_label;
+            self.edit_cursor = self.edit_input.chars().count();
+            self.edit_options.clear();
+            self.edit_option_selected = 0;
+            self.last_status = self.t("menu.status.token_label_edit_prompt");
+            return Ok(());
+        }
         let Some(value) = field_value(&self.settings, &field) else {
             self.last_status = self.tf("menu.status.read_only", &[("field", &field)]);
             return Ok(());
@@ -462,6 +570,54 @@ impl MenuConfigApp {
                 .cloned()
                 .ok_or_else(|| self.t("menu.error.no_available_option"))?,
         };
+        if field == TOKEN_CREATE_LABEL_FIELD {
+            let label = value.trim();
+            if label.is_empty() {
+                return Err(self.t("menu.error.token_label_required"));
+            }
+            self.pending_token_label = Some(label.to_string());
+            self.reset_edit_state();
+            self.begin_edit(TOKEN_CREATE_EXPIRY_MODE_FIELD.to_string())?;
+            return Ok(());
+        }
+        if field == TOKEN_CREATE_EXPIRY_MODE_FIELD {
+            let label = self
+                .pending_token_label
+                .clone()
+                .ok_or_else(|| self.t("menu.error.token_label_required"))?;
+            self.reset_edit_state();
+            if value == "long-lived" {
+                self.create_token_with_flow(label, None)?;
+            } else {
+                self.begin_edit(TOKEN_CREATE_EXPIRY_AT_FIELD.to_string())?;
+            }
+            return Ok(());
+        }
+        if field == TOKEN_CREATE_EXPIRY_AT_FIELD {
+            let label = self
+                .pending_token_label
+                .clone()
+                .ok_or_else(|| self.t("menu.error.token_label_required"))?;
+            let expires_at_unix_sec = value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| self.t("menu.error.token_expiry_at_invalid"))?;
+            let now_unix_sec = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            if expires_at_unix_sec <= now_unix_sec {
+                return Err(self.t("menu.error.token_expiry_at_invalid"));
+            }
+            self.reset_edit_state();
+            self.create_token_with_flow(label, Some(expires_at_unix_sec - now_unix_sec))?;
+            return Ok(());
+        }
+        if let Some(token_id) = field.strip_prefix("__token_label_edit__:") {
+            self.reset_edit_state();
+            self.update_token_label(token_id, value.trim())?;
+            return Ok(());
+        }
         self.apply_edit_value(&field, &value)?;
         self.reset_edit_state();
         self.last_status = self.tf("menu.status.updated", &[("field", &field)]);
@@ -618,7 +774,7 @@ impl MenuConfigApp {
             Ok(_) => self
                 .vault_router
                 .take()
-                .unwrap_or_else(|| load_vault_router(&self.settings)),
+                .expect("vault router should exist after ensure_vault_router_loaded"),
             Err(err) => {
                 self.unlock_flow_state = UnlockFlowState::Failed {
                     reason: err.clone(),
@@ -810,7 +966,7 @@ impl MenuConfigApp {
 
     fn ensure_vault_router_loaded(&mut self) -> Result<&mut SecretVaultRouter, String> {
         if self.vault_router.is_none() {
-            self.vault_router = Some(load_vault_router(&self.settings));
+            self.vault_router = Some(load_vault_router(&self.settings)?);
         }
         self.vault_router
             .as_mut()
@@ -820,8 +976,23 @@ impl MenuConfigApp {
     fn refresh_security_summary(&mut self) {
         if let Some(router) = self.vault_router.as_mut() {
             self.security_summary = build_security_summary_from_router(&self.settings, router);
+            if self.security_summary.lock_state == "unlocked" {
+                self.token_rows = router
+                    .list_agent_tokens()
+                    .into_iter()
+                    .map(|item| TokenManagementRow {
+                        token_id: item.token_id,
+                        label: item.label,
+                        status: item.status.as_str().to_string(),
+                        expires_at: item.expires_at,
+                    })
+                    .collect();
+            } else {
+                self.token_rows.clear();
+            }
         } else {
             self.security_summary = build_security_summary_passive(&self.settings);
+            self.token_rows.clear();
         }
     }
 
@@ -846,7 +1017,226 @@ impl MenuConfigApp {
             ActionKind::UnlockVault => {
                 self.begin_unlock_flow();
             }
+            ActionKind::InitVault => {
+                let router = self.ensure_vault_router_loaded()?;
+                router
+                    .init_vault_store()
+                    .map_err(|err| format!("init vault failed: {err:?}"))?;
+                self.refresh_security_summary();
+                self.last_status = self.t("menu.status.vault_initialized");
+            }
+            ActionKind::DeleteVault => {
+                self.confirm_action = Some(ConfirmAction::DeleteVault);
+                self.confirm_selected = 0;
+                self.last_status = self.t("menu.status.vault_delete_confirm_pending");
+            }
+            ActionKind::CreateToken => {
+                if self.vault_router.is_none() {
+                    let _ = self.ensure_vault_router_loaded()?;
+                }
+                self.refresh_security_summary();
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_token_action");
+                    return Ok(());
+                }
+                self.pending_token_label = None;
+                self.begin_edit(TOKEN_CREATE_LABEL_FIELD.to_string())?;
+            }
+            ActionKind::OpenTokenManagement => {
+                if self.vault_router.is_none() {
+                    let _ = self.ensure_vault_router_loaded()?;
+                }
+                self.refresh_security_summary();
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_token_action");
+                    return Ok(());
+                }
+                self.push_navigation_state();
+                self.screen = Screen::TokenManagement;
+                self.selected = 0;
+                self.last_status = self.t("menu.status.opened_token_management");
+            }
+            ActionKind::EditTokenLabel(token_id) => {
+                self.begin_edit(format!("__token_label_edit__:{token_id}"))?;
+            }
+            ActionKind::RevokeToken(token_id) => {
+                self.confirm_action = Some(ConfirmAction::RevokeToken(token_id));
+                self.confirm_selected = 0;
+                self.last_status = self.t("menu.status.token_revoke_confirm_pending");
+            }
+            ActionKind::DeleteToken(token_id) => {
+                self.confirm_action = Some(ConfirmAction::DeleteToken(token_id));
+                self.confirm_selected = 0;
+                self.last_status = self.t("menu.status.token_delete_confirm_pending");
+            }
         }
+        Ok(())
+    }
+
+    fn handle_token_reveal_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                self.token_reveal = None;
+                self.last_status = self.t("menu.status.token_reveal_closed");
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_confirm_key(&mut self, code: KeyCode) -> Result<(), String> {
+        match code {
+            KeyCode::Left => {
+                let next = self.confirm_selected as isize - 1;
+                self.confirm_selected = next.clamp(0, 1) as usize;
+            }
+            KeyCode::Right => {
+                let next = self.confirm_selected as isize + 1;
+                self.confirm_selected = next.clamp(0, 1) as usize;
+            }
+            KeyCode::Esc => {
+                self.confirm_action = None;
+                self.confirm_selected = 0;
+                self.last_status = self.t("menu.status.confirm_cancelled");
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if self.confirm_selected == 1 {
+                    self.confirm_action = None;
+                    self.confirm_selected = 0;
+                    self.last_status = self.t("menu.status.confirm_cancelled");
+                    return Ok(());
+                }
+                let action = self.confirm_action.clone();
+                self.confirm_action = None;
+                self.confirm_selected = 0;
+                match action {
+                    Some(ConfirmAction::DeleteVault) => self.delete_vault_confirmed()?,
+                    Some(ConfirmAction::RevokeToken(token_id)) => {
+                        self.revoke_token_confirmed(&token_id)?
+                    }
+                    Some(ConfirmAction::DeleteToken(token_id)) => {
+                        self.delete_token_confirmed(&token_id)?
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn create_token_with_flow(
+        &mut self,
+        label: String,
+        expires_in_seconds: Option<u64>,
+    ) -> Result<(), String> {
+        let operator_principal = "menuconfig:local-operator".to_string();
+        let mut request = CreateAgentTokenRequest {
+            label,
+            created_by: operator_principal.clone(),
+            expires_in: expires_in_seconds.map(Duration::from_secs),
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: Some("strict-default".to_string()),
+                target_ids: Vec::new(),
+                tool_ids: Vec::new(),
+                max_risk_envelope: Some("deny-all".to_string()),
+                allow_open_shell: Some(false),
+                allow_write_shell_input: Some(false),
+                allow_artifact_cross_principal: Some(false),
+                allow_delegation: Some(false),
+                allow_admin_actions: Some(false),
+            },
+            attestation_id: None,
+        };
+        let digest = local_admin_payload_digest_for_create_agent_token(&request);
+        let router = self.ensure_vault_router_loaded()?;
+        let attestation_id = mint_local_admin_attestation(
+            router,
+            LocalAdminActionKind::CreateAgentToken,
+            local_admin_create_token_target(),
+            &digest,
+            &operator_principal,
+        )?;
+        request.attestation_id = Some(attestation_id);
+        let created = router
+            .create_agent_token(request)
+            .map_err(|err| format!("create token failed: {err:?}"))?;
+        self.pending_token_label = None;
+        self.token_reveal = Some(created.plaintext_token);
+        self.refresh_security_summary();
+        self.last_status = self.t("menu.status.token_created");
+        Ok(())
+    }
+
+    fn update_token_label(&mut self, token_id: &str, label: &str) -> Result<(), String> {
+        let operator_principal = "menuconfig:local-operator".to_string();
+        let router = self.ensure_vault_router_loaded()?;
+        router
+            .update_agent_token_label(UpdateAgentTokenLabelRequest {
+                token_id: token_id.to_string(),
+                label: label.to_string(),
+                changed_by: operator_principal,
+            })
+            .map_err(|err| format!("update token label failed: {err:?}"))?;
+        self.refresh_security_summary();
+        self.last_status = self.t("menu.status.token_label_updated");
+        Ok(())
+    }
+
+    fn revoke_token_confirmed(&mut self, token_id: &str) -> Result<(), String> {
+        let router = self.ensure_vault_router_loaded()?;
+        router
+            .revoke_agent_token(token_id, Some("menuconfig revoke".to_string()))
+            .map_err(|err| format!("revoke token failed: {err:?}"))?;
+        self.refresh_security_summary();
+        self.last_status = self.t("menu.status.token_revoked");
+        Ok(())
+    }
+
+    fn delete_token_confirmed(&mut self, token_id: &str) -> Result<(), String> {
+        let operator_principal = "menuconfig:local-operator".to_string();
+        let digest = local_admin_payload_digest_for_delete_agent_token(token_id);
+        let router = self.ensure_vault_router_loaded()?;
+        let attestation_id = mint_local_admin_attestation(
+            router,
+            LocalAdminActionKind::DeleteAgentToken,
+            token_id,
+            &digest,
+            &operator_principal,
+        )?;
+        router
+            .delete_agent_token_with_attestation(DeleteAgentTokenRequest {
+                token_id: token_id.to_string(),
+                requested_by: operator_principal,
+                attestation_id,
+            })
+            .map_err(|err| format!("delete token failed: {err:?}"))?;
+        self.refresh_security_summary();
+        self.last_status = self.t("menu.status.token_deleted");
+        Ok(())
+    }
+
+    fn delete_vault_confirmed(&mut self) -> Result<(), String> {
+        let operator_principal = "menuconfig:local-operator".to_string();
+        let digest = local_admin_payload_digest_for_delete_vault();
+        let router = self.ensure_vault_router_loaded()?;
+        let attestation_id = mint_local_admin_attestation(
+            router,
+            LocalAdminActionKind::DeleteVault,
+            local_admin_delete_vault_target(),
+            &digest,
+            &operator_principal,
+        )?;
+        router
+            .delete_vault_with_attestation(DeleteVaultRequest {
+                requested_by: operator_principal,
+                attestation_id,
+            })
+            .map_err(|err| format!("delete vault failed: {err:?}"))?;
+        self.screen = Screen::Security;
+        self.selected = 0;
+        self.refresh_security_summary();
+        self.last_status = self.t("menu.status.vault_deleted");
         Ok(())
     }
 
@@ -982,6 +1372,7 @@ impl MenuConfigApp {
             Screen::Vault => vault_entries(&self.settings, &self.catalog),
             Screen::Targets => targets_entries(&self.settings, &self.catalog),
             Screen::Security => security_entries(&self.security_summary, &self.catalog),
+            Screen::TokenManagement => token_management_entries(self, &self.catalog),
             Screen::TargetEditor(index) => {
                 target_editor_entries(&self.settings, index, &self.catalog)
             }
@@ -1135,6 +1526,12 @@ fn render(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     if !matches!(app.unlock_flow_state, UnlockFlowState::Idle) {
         render_unlock_flow_popup(frame, app);
     }
+    if app.confirm_action.is_some() {
+        render_confirm_popup(frame, app);
+    }
+    if app.token_reveal.is_some() {
+        render_token_reveal_popup(frame, app);
+    }
 }
 
 fn render_main_menu(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
@@ -1243,6 +1640,10 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
             }
         } else if app.exit_confirm_mode {
             app.t("menu.render.exit_hint")
+        } else if app.confirm_action.is_some() {
+            app.t("menu.render.confirm_hint")
+        } else if app.token_reveal.is_some() {
+            app.t("menu.render.token_reveal_hint")
         } else if matches!(app.unlock_flow_state, UnlockFlowState::Waiting) {
             app.t("menu.render.unlock_waiting")
         } else if matches!(app.unlock_flow_state, UnlockFlowState::Success) {
@@ -1409,6 +1810,70 @@ fn render_unlock_flow_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     frame.render_widget(popup, area);
 }
 
+fn render_confirm_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
+    let Some(action) = app.confirm_action.clone() else {
+        return;
+    };
+    let action_text = match action {
+        ConfirmAction::DeleteVault => app.t("menu.confirm.delete_vault"),
+        ConfirmAction::RevokeToken(token_id) => {
+            app.tf("menu.confirm.revoke_token", &[("id", token_id.as_str())])
+        }
+        ConfirmAction::DeleteToken(token_id) => {
+            app.tf("menu.confirm.delete_token", &[("id", token_id.as_str())])
+        }
+    };
+    let area = centered_rect(62, 32, frame.area());
+    frame.render_widget(Clear, area);
+    let option = |index: usize, label: &str| -> String {
+        if app.confirm_selected == index {
+            format!("< {label} >")
+        } else {
+            format!("  {label}  ")
+        }
+    };
+    let popup = Paragraph::new(vec![
+        Line::from(action_text),
+        Line::from(""),
+        Line::from(app.t("menu.confirm.message")),
+        Line::from(""),
+        Line::from(format!(
+            "{}   {}",
+            option(0, &app.t("menu.confirm.confirm")),
+            option(1, &app.t("menu.confirm.cancel"))
+        )),
+    ])
+    .block(
+        Block::default()
+            .title(app.t("menu.confirm.title"))
+            .borders(Borders::ALL),
+    )
+    .wrap(Wrap { trim: false });
+    frame.render_widget(popup, area);
+}
+
+fn render_token_reveal_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
+    let Some(token) = app.token_reveal.clone() else {
+        return;
+    };
+    let area = centered_rect(76, 38, frame.area());
+    frame.render_widget(Clear, area);
+    let popup = Paragraph::new(vec![
+        Line::from(app.t("menu.token_reveal.message")),
+        Line::from(""),
+        Line::from(token),
+        Line::from(""),
+        Line::from(app.t("menu.token_reveal.hint")),
+    ])
+    .block(
+        Block::default()
+            .title(app.t("menu.token_reveal.title"))
+            .borders(Borders::ALL),
+    )
+    .wrap(Wrap { trim: false });
+    frame.render_widget(popup, area);
+}
+
 fn render_footer_buttons_line(
     selected: usize,
     catalog: &Catalog,
@@ -1489,10 +1954,23 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
             Some(value) => format!("{selector} --- {} = {}", entry.label, value),
             None => format!("{selector} --- {}", entry.label),
         },
-        MenuEntryKind::Action(ActionKind::UnlockVault) => {
-            format!("{selector}     {} --->", entry.label)
+        MenuEntryKind::Action(action) => {
+            let uses_navigation_style = matches!(
+                action,
+                ActionKind::UnlockVault
+                    | ActionKind::CreateToken
+                    | ActionKind::OpenTokenManagement
+                    | ActionKind::DeleteVault
+                    | ActionKind::EditTokenLabel(_)
+                    | ActionKind::RevokeToken(_)
+                    | ActionKind::DeleteToken(_)
+            );
+            if uses_navigation_style {
+                format!("{selector}     {} --->", entry.label)
+            } else {
+                format!("{selector} *** {} ****", entry.label)
+            }
         }
-        MenuEntryKind::Action(_) => format!("{selector} *** {} ****", entry.label),
     }
 }
 
@@ -1545,17 +2023,34 @@ fn is_security_unlocked_notice_entry(app: &MenuConfigApp, entry: &MenuEntry) -> 
         && entry.value.is_none()
 }
 
+fn display_edit_field_label(app: &MenuConfigApp, field: &str) -> String {
+    if field == TOKEN_CREATE_LABEL_FIELD {
+        return app.t("menu.edit.field.token_create_label");
+    }
+    if field == TOKEN_CREATE_EXPIRY_MODE_FIELD {
+        return app.t("menu.edit.field.token_create_expiry_mode");
+    }
+    if field == TOKEN_CREATE_EXPIRY_AT_FIELD {
+        return app.t("menu.edit.field.token_create_expiry_at");
+    }
+    if let Some(token_id) = field.strip_prefix("__token_label_edit__:") {
+        return app.tf("menu.edit.field.token_label_edit", &[("id", token_id)]);
+    }
+    field.to_string()
+}
+
 fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     let Some(field) = app.edit_field.as_deref() else {
         return;
     };
+    let field_label = display_edit_field_label(app, field);
     match app.edit_mode_kind {
         EditModeKind::Text => {
             let area = centered_rect(70, 28, frame.area());
             frame.render_widget(Clear, area);
             let input_prefix = app.t("menu.edit.input_prefix");
             let popup = Paragraph::new(vec![
-                Line::from(app.tf("menu.edit.field", &[("field", field)])),
+                Line::from(app.tf("menu.edit.field", &[("field", &field_label)])),
                 Line::from(app.t("menu.edit.hint")),
                 Line::from(""),
                 Line::from(format!("{input_prefix}{}", app.edit_input)),
@@ -1584,7 +2079,7 @@ fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
                 .constraints([Constraint::Length(3), Constraint::Min(4)])
                 .split(area);
             let header = Paragraph::new(vec![
-                Line::from(app.tf("menu.choice.field", &[("field", field)])),
+                Line::from(app.tf("menu.choice.field", &[("field", &field_label)])),
                 Line::from(app.t("menu.choice.hint")),
             ])
             .block(
@@ -1795,17 +2290,97 @@ fn security_entries(summary: &SecuritySummary, catalog: &Catalog) -> Vec<MenuEnt
             &catalog.t("menu.security.token_count.desc"),
         ),
     ];
-    if summary.lock_state == "unlocked" {
-        entries.push(info_entry(
-            &catalog.t("menu.security.unlocked_notice"),
+    match summary.lock_state.as_str() {
+        "uninitialized" => {
+            entries.push(action_entry(
+                &catalog.t("menu.security.init_action"),
+                &catalog.t("menu.security.init_action.desc"),
+                ActionKind::InitVault,
+            ));
+        }
+        "locked" => {
+            entries.push(action_entry(
+                &catalog.t("menu.security.unlock_action"),
+                &catalog.t("menu.security.unlock_action.desc"),
+                ActionKind::UnlockVault,
+            ));
+            entries.push(action_entry(
+                &catalog.t("menu.security.delete_vault_action"),
+                &catalog.t("menu.security.delete_vault_action.desc"),
+                ActionKind::DeleteVault,
+            ));
+        }
+        "unlocked" => {
+            entries.push(info_entry(
+                &catalog.t("menu.security.unlocked_notice"),
+                None,
+                &catalog.t("menu.security.unlocked_notice.desc"),
+            ));
+            entries.push(action_entry(
+                &catalog.t("menu.security.create_token_action"),
+                &catalog.t("menu.security.create_token_action.desc"),
+                ActionKind::CreateToken,
+            ));
+            entries.push(action_entry(
+                &catalog.t("menu.security.token_management_action"),
+                &catalog.t("menu.security.token_management_action.desc"),
+                ActionKind::OpenTokenManagement,
+            ));
+            entries.push(action_entry(
+                &catalog.t("menu.security.delete_vault_action"),
+                &catalog.t("menu.security.delete_vault_action.desc"),
+                ActionKind::DeleteVault,
+            ));
+        }
+        _ => {}
+    }
+    entries
+}
+
+fn token_management_entries(app: &MenuConfigApp, catalog: &Catalog) -> Vec<MenuEntry> {
+    if app.security_summary.lock_state != "unlocked" {
+        return vec![info_entry(
+            &catalog.t("menu.token_management.locked_hint"),
             None,
-            &catalog.t("menu.security.unlocked_notice.desc"),
+            &catalog.t("menu.token_management.locked_hint.desc"),
+        )];
+    }
+    if app.token_rows.is_empty() {
+        return vec![info_entry(
+            &catalog.t("menu.token_management.empty"),
+            None,
+            &catalog.t("menu.token_management.empty.desc"),
+        )];
+    }
+    let mut entries = Vec::new();
+    for item in &app.token_rows {
+        entries.push(info_entry(
+            &format!(
+                "{} ({})",
+                if item.label.trim().is_empty() {
+                    "<unlabeled>"
+                } else {
+                    item.label.as_str()
+                },
+                item.status
+            ),
+            Some(item.token_id.clone()),
+            &catalog.t("menu.token_management.token.desc"),
         ));
-    } else {
         entries.push(action_entry(
-            &catalog.t("menu.security.unlock_action"),
-            &catalog.t("menu.security.unlock_action.desc"),
-            ActionKind::UnlockVault,
+            &catalog.tf("menu.token_management.edit_label_action", &[("id", &item.token_id)]),
+            &catalog.t("menu.token_management.edit_label_action.desc"),
+            ActionKind::EditTokenLabel(item.token_id.clone()),
+        ));
+        entries.push(action_entry(
+            &catalog.tf("menu.token_management.revoke_action", &[("id", &item.token_id)]),
+            &catalog.t("menu.token_management.revoke_action.desc"),
+            ActionKind::RevokeToken(item.token_id.clone()),
+        ));
+        entries.push(action_entry(
+            &catalog.tf("menu.token_management.delete_action", &[("id", &item.token_id)]),
+            &catalog.t("menu.token_management.delete_action.desc"),
+            ActionKind::DeleteToken(item.token_id.clone()),
         ));
     }
     entries
@@ -2273,15 +2848,23 @@ fn screen_for_field(field: &str) -> Screen {
     }
 }
 
-fn load_vault_router(settings: &CoreSettings) -> SecretVaultRouter {
+fn load_vault_router(settings: &CoreSettings) -> Result<SecretVaultRouter, String> {
     let vault_root = vault_root_path(settings);
-    let mut router = if vault_root.exists() {
-        SecretVaultRouter::with_persistent_store(&vault_root).unwrap_or_default()
-    } else {
-        SecretVaultRouter::default()
-    };
-    let _ = router.set_active_backend(&settings.vault.backend);
+    let mut router = SecretVaultRouter::with_persistent_store(&vault_root).map_err(|err| {
+        format!(
+            "load vault router failed (root={}): {err:?}",
+            vault_root.display()
+        )
+    })?;
     router
+        .set_active_backend(&settings.vault.backend)
+        .map_err(|err| {
+            format!(
+                "set active vault backend `{}` failed: {err:?}",
+                settings.vault.backend
+            )
+        })?;
+    Ok(router)
 }
 
 fn vault_root_path(settings: &CoreSettings) -> PathBuf {
@@ -2301,9 +2884,15 @@ fn build_security_summary_from_projection(
     settings: &CoreSettings,
     projection: &VaultPassiveProjection,
 ) -> SecuritySummary {
+    // Passive projection cannot prove a live in-memory unlock session after process restart.
+    let passive_lock_state = if projection.lock_state.as_str() == "unlocked" {
+        "locked".to_string()
+    } else {
+        projection.lock_state.as_str().to_string()
+    };
     SecuritySummary {
         backend: settings.vault.backend.clone(),
-        lock_state: projection.lock_state.as_str().to_string(),
+        lock_state: passive_lock_state,
         trigger_policy: settings.vault.unlock.trigger_policy.clone(),
         preferred_method: settings.vault.unlock.preferred_method.clone(),
         secret_count: projection.secret_count,
@@ -2340,6 +2929,33 @@ fn ordered_unlock_methods(settings: &CoreSettings) -> Vec<String> {
         }
     }
     methods
+}
+
+fn mint_local_admin_attestation(
+    router: &mut SecretVaultRouter,
+    action_kind: LocalAdminActionKind,
+    target_object_ref: &str,
+    payload_digest: &str,
+    operator_principal: &str,
+) -> Result<String, String> {
+    let intent = router
+        .create_local_admin_intent_with_digest(
+            action_kind,
+            target_object_ref,
+            payload_digest,
+            operator_principal,
+            Duration::from_secs(300),
+        )
+        .map_err(|err| format!("create local admin intent failed: {err:?}"))?;
+    let attestation = router
+        .complete_local_admin_attestation(
+            &intent.intent_id,
+            operator_principal,
+            "menuconfig",
+            Duration::from_secs(120),
+        )
+        .map_err(|err| format!("complete local admin attestation failed: {err:?}"))?;
+    Ok(attestation.attestation_id)
 }
 
 fn default_ssh_target(index: usize) -> StandaloneTargetProfile {
@@ -2427,11 +3043,11 @@ mod tests {
     use super::{ActionKind, EditModeKind, MenuConfigApp, MenuEntryKind, Screen};
     use bridgingio_domain::TargetKind;
     use bridgingio_engine::CoreSettings;
-    use bridgingio_secrets::VaultUnlockTriggerPolicy;
+    use bridgingio_secrets::{SecretVaultRouter, VaultUnlockTriggerPolicy};
     use crossterm::event::KeyCode;
     use ratatui::style::{Color, Modifier};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_path(label: &str) -> PathBuf {
@@ -2445,6 +3061,13 @@ mod tests {
         let config_path = root.join("standalone.toml");
         fs::write(&config_path, CoreSettings::minimal_example()).expect("write config");
         config_path
+    }
+
+    fn set_config_data_dir(config_path: &Path, data_dir: &Path) {
+        let config = fs::read_to_string(config_path).expect("read config");
+        let toml_data_dir = data_dir.to_string_lossy().replace('\\', "\\\\");
+        let updated = config.replace("data_dir = \"auto\"", &format!("data_dir = \"{toml_data_dir}\""));
+        fs::write(config_path, updated).expect("write config with custom data dir");
     }
 
     #[test]
@@ -2498,6 +3121,61 @@ mod tests {
             super::parse_trigger_policy(&app.settings.vault.unlock.trigger_policy),
             VaultUnlockTriggerPolicy::OnCoreStart
         );
+    }
+
+    #[test]
+    fn passive_unlocked_projection_is_not_rendered_as_live_unlocked_state() {
+        let config_path = temp_config_path("passive-unlocked-not-live");
+        let runtime_root = config_path
+            .parent()
+            .expect("config parent")
+            .join("runtime-root");
+        set_config_data_dir(&config_path, &runtime_root);
+        let vault_root = runtime_root.join("vault");
+        fs::create_dir_all(&vault_root).expect("create vault root");
+        fs::write(
+            vault_root.join("metadata.db"),
+            r#"{"schema_version":2,"lock_state":"Unlocked","secrets":[],"agent_tokens":[]}"#,
+        )
+        .expect("write metadata");
+
+        let app = MenuConfigApp::load(&config_path).expect("load app");
+        assert_eq!(app.security_summary.lock_state, "locked");
+        assert!(app.vault_router.is_none());
+    }
+
+    #[test]
+    fn vault_router_load_failure_does_not_fall_back_to_in_memory_router() {
+        let config_path = temp_config_path("router-load-failure");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let invalid_data_dir = config_path
+            .parent()
+            .expect("config parent")
+            .join("invalid-data-dir-file");
+        fs::write(&invalid_data_dir, "not-a-directory").expect("write sentinel file");
+        app.settings.core.data_dir = invalid_data_dir.to_string_lossy().to_string();
+
+        let err = match app.ensure_vault_router_loaded() {
+            Ok(_) => panic!("router load should fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("load vault router failed"));
+        assert!(app.vault_router.is_none());
+    }
+
+    #[test]
+    fn create_token_action_refreshes_live_state_before_opening_flow() {
+        let config_path = temp_config_path("create-token-live-state");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.vault_router = Some(SecretVaultRouter::default());
+
+        app.run_action(ActionKind::CreateToken)
+            .expect("run create token action");
+
+        assert_eq!(app.security_summary.lock_state, "locked");
+        assert!(!app.edit_mode);
+        assert_eq!(app.last_status, app.t("menu.status.vault_locked_for_token_action"));
     }
 
     #[test]
@@ -2607,6 +3285,15 @@ mod tests {
         assert!(instance_line.ends_with("--->"));
         assert!(log_level_line.contains("Log Level ("));
         assert!(log_level_line.ends_with("--->"));
+    }
+
+    #[test]
+    fn token_create_edit_popup_uses_human_friendly_field_label() {
+        let config_path = temp_config_path("token-create-popup-label");
+        let app = MenuConfigApp::load(&config_path).expect("load app");
+        let label = super::display_edit_field_label(&app, super::TOKEN_CREATE_LABEL_FIELD);
+        assert_ne!(label, super::TOKEN_CREATE_LABEL_FIELD);
+        assert!(label.contains("Token"));
     }
 
     #[test]
@@ -2899,6 +3586,98 @@ mod tests {
     }
 
     #[test]
+    fn security_screen_shows_init_only_when_uninitialized() {
+        let config_path = temp_config_path("security-uninitialized");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "uninitialized".into();
+        let entries = app.entries();
+
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Action(ActionKind::InitVault))));
+        assert!(entries
+            .iter()
+            .all(|entry| !matches!(entry.kind, MenuEntryKind::Action(ActionKind::UnlockVault))));
+        assert!(entries.iter().all(|entry| !matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::CreateToken | ActionKind::OpenTokenManagement)
+        )));
+    }
+
+    #[test]
+    fn security_screen_locked_state_hides_token_actions() {
+        let config_path = temp_config_path("security-locked-actions");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "locked".into();
+        let entries = app.entries();
+
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Action(ActionKind::UnlockVault))));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Action(ActionKind::DeleteVault))));
+        assert!(entries.iter().all(|entry| !matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::CreateToken | ActionKind::OpenTokenManagement)
+        )));
+    }
+
+    #[test]
+    fn create_token_flow_validates_label_and_expiry_deadline() {
+        let config_path = temp_config_path("create-token-flow-validation");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.begin_edit(super::TOKEN_CREATE_LABEL_FIELD.to_string())
+            .expect("begin label step");
+        app.edit_input = "   ".into();
+        let empty_label = app.commit_edit();
+        assert!(empty_label.is_err());
+
+        app.edit_input = "Codex".into();
+        app.commit_edit().expect("commit label");
+        assert_eq!(
+            app.edit_field.as_deref(),
+            Some(super::TOKEN_CREATE_EXPIRY_MODE_FIELD)
+        );
+
+        app.edit_option_selected = 1;
+        app.commit_edit().expect("commit expiry mode");
+        assert_eq!(
+            app.edit_field.as_deref(),
+            Some(super::TOKEN_CREATE_EXPIRY_AT_FIELD)
+        );
+
+        let past = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs()
+            .saturating_sub(1);
+        app.edit_input = past.to_string();
+        let past_deadline = app.commit_edit();
+        assert!(past_deadline.is_err());
+    }
+
+    #[test]
+    fn destructive_actions_wait_for_confirmation() {
+        let config_path = temp_config_path("destructive-confirm");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "locked".into();
+
+        app.run_action(ActionKind::DeleteVault)
+            .expect("open delete-vault confirm");
+        assert!(matches!(
+            app.confirm_action,
+            Some(super::ConfirmAction::DeleteVault)
+        ));
+        app.handle_confirm_key(KeyCode::Esc)
+            .expect("cancel destructive action");
+        assert!(app.confirm_action.is_none());
+    }
+
+    #[test]
     fn security_lock_state_line_uses_colored_status_value() {
         let config_path = temp_config_path("security-lock-state-color");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
@@ -2930,6 +3709,57 @@ mod tests {
         let line = super::format_menu_entry_line(&app, action_index, &entries[action_index]);
         assert!(line.contains(&format!("{} --->", entries[action_index].label)));
         assert!(!line.contains("***"));
+    }
+
+    #[test]
+    fn security_action_flows_use_arrow_style() {
+        let config_path = temp_config_path("security-action-flows-arrow");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "unlocked".into();
+        let entries = app.entries();
+        for action in [
+            ActionKind::CreateToken,
+            ActionKind::OpenTokenManagement,
+            ActionKind::DeleteVault,
+        ] {
+            let index = entries
+                .iter()
+                .position(|entry| matches!(entry.kind, MenuEntryKind::Action(ref kind) if *kind == action))
+                .expect("security action entry");
+            let line = super::format_menu_entry_line(&app, index, &entries[index]);
+            assert!(line.contains(&format!("{} --->", entries[index].label)));
+            assert!(!line.contains("***"));
+        }
+    }
+
+    #[test]
+    fn token_management_actions_use_arrow_style() {
+        let config_path = temp_config_path("token-management-actions-arrow");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::TokenManagement;
+        app.security_summary.lock_state = "unlocked".into();
+        app.token_rows = vec![super::TokenManagementRow {
+            token_id: "token-000001".into(),
+            label: "test_tok".into(),
+            status: "active".into(),
+            expires_at: None,
+        }];
+
+        let entries = app.entries();
+        for action in [
+            ActionKind::EditTokenLabel("token-000001".into()),
+            ActionKind::RevokeToken("token-000001".into()),
+            ActionKind::DeleteToken("token-000001".into()),
+        ] {
+            let index = entries
+                .iter()
+                .position(|entry| matches!(entry.kind, MenuEntryKind::Action(ref kind) if *kind == action))
+                .expect("token management action entry");
+            let line = super::format_menu_entry_line(&app, index, &entries[index]);
+            assert!(line.contains(&format!("{} --->", entries[index].label)));
+            assert!(!line.contains("***"));
+        }
     }
 
     #[test]

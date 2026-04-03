@@ -1,18 +1,4 @@
-# operator-interface-matrix 规范
-
-## 目的
-待定 - 由归档变更 expand-core-test-matrix-and-interface-matrix-docs 创建。归档后请更新目的。
-## 需求
-### 需求:本地 operator surfaces 必须维护正式的接口矩阵文档
-BridgingIO 必须维护一份正式的本地 operator interface matrix，用于记录暴露给 UI、TUI、standalone 管理面和受信任本地调用方的接口真相。该矩阵至少必须覆盖命令或接口名称、调用方范围、输入、输出、状态、错误码与 apply strategy。对于 vault 与 token 这类安全管理接口，矩阵还必须额外记录状态前置条件、是否需要二次确认、是否涉及一次性 reveal 结果，以及 destructive action 的恢复语义。
-
-#### 场景:新增本地 control-plane 命令
-- **当** 团队新增或修改一个面向本地 operator surface 的 command、事件或设置写入接口
-- **那么** 系统必须同步更新接口矩阵文档，记录该接口的输入输出合同、适用调用方、状态/错误语义，以及必要的状态门控或确认要求，而不是只修改实现代码
-
-#### 场景:接口行为涉及重启或受控未实现
-- **当** 某个本地 operator 接口存在 `restart_required`、`not_ready`、`method_not_implemented`、一次性 reveal 或 destructive confirmation 等正式语义
-- **那么** 接口矩阵必须明确记录这些状态与对应恢复动作，而不是仅靠 README 叙述或代码注释隐式表达
+## 新增需求
 
 ### 需求:本地安全管理接口矩阵必须记录 vault/token 的状态门控与删除前置条件
 当本地 operator surface 提供 vault 与 token 管理动作时，接口矩阵必须明确记录这些动作各自的状态前置条件、确认要求与输出合同，而不是只列出命令名称。至少必须覆盖 `vault init`、`vault delete`、`token create`、`token revoke`、`token delete` 以及它们与 `uninitialized / locked / unlocked / revoked / expired / deleted` 等状态的关系。
@@ -44,3 +30,17 @@ BridgingIO 必须维护一份正式的本地 operator interface matrix，用于�
 - **当** `menuconfig` 的 Security 页面在 `unlocked` 状态下暴露 `Create Token` 与 `Token Management`
 - **那么** 接口矩阵必须明确记载这些入口的可见条件，以及普通列表继续遵守 display-safe projection 的限制
 
+## 修改需求
+
+### 需求:本地 operator surfaces 必须维护正式的接口矩阵文档
+BridgingIO 必须维护一份正式的本地 operator interface matrix，用于记录暴露给 UI、TUI、standalone 管理面和受信任本地调用方的接口真相。该矩阵至少必须覆盖命令或接口名称、调用方范围、输入、输出、状态、错误码与 apply strategy。对于 vault 与 token 这类安全管理接口，矩阵还必须额外记录状态前置条件、是否需要二次确认、是否涉及一次性 reveal 结果，以及 destructive action 的恢复语义。
+
+#### 场景:新增本地 control-plane 命令
+- **当** 团队新增或修改一个面向本地 operator surface 的 command、事件或设置写入接口
+- **那么** 系统必须同步更新接口矩阵文档，记录该接口的输入输出合同、适用调用方、状态/错误语义，以及必要的状态门控或确认要求，而不是只修改实现代码
+
+#### 场景:接口行为涉及重启或受控未实现
+- **当** 某个本地 operator 接口存在 `restart_required`、`not_ready`、`method_not_implemented`、一次性 reveal 或 destructive confirmation 等正式语义
+- **那么** 接口矩阵必须明确记录这些状态与对应恢复动作，而不是仅靠 README 叙述或代码注释隐式表达
+
+## 移除需求

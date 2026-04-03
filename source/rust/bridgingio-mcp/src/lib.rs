@@ -41,11 +41,12 @@ use bridgingio_platform::{
 use bridgingio_policy::{evaluate, OperationKind, PolicyDecision};
 use bridgingio_providers::{GitProvider, TerminalProvider};
 use bridgingio_secrets::{
-    normalize_credential_ref, AgentTokenSummary, CreateAgentTokenRequest, LocalAdminActionIntent,
-    LocalAdminActionKind, LocalAdminAttestationRecord, SecretVaultRouter,
+    normalize_credential_ref, AgentTokenSummary, CreateAgentTokenRequest, DeleteAgentTokenRequest,
+    DeleteVaultRequest, LocalAdminActionIntent, LocalAdminActionKind,
+    LocalAdminAttestationRecord, SecretVaultRouter,
     SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
-    UnlockVaultRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
-    VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
+    UnlockVaultRequest, UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError,
+    VaultLockState, VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
 };
 use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
@@ -3658,6 +3659,41 @@ impl StandaloneCoreRuntime {
                     Err(err) => token_vault_error_response(request.request_id, err),
                 }
             }
+            AppCommand::DeleteAgentToken {
+                token_id,
+                attestation_id,
+            } => {
+                let actor = control_plane_request_actor(&request.context);
+                match self
+                    .vault_router
+                    .delete_agent_token_with_attestation(DeleteAgentTokenRequest {
+                        token_id,
+                        requested_by: actor,
+                        attestation_id,
+                    }) {
+                    Ok(summary) => ApiResponse::AgentTokenDeleted {
+                        request_id: request.request_id,
+                        summary: app_agent_token_summary(summary),
+                    },
+                    Err(err) => token_vault_error_response(request.request_id, err),
+                }
+            }
+            AppCommand::UpdateAgentTokenLabel { token_id, label } => {
+                let actor = control_plane_request_actor(&request.context);
+                match self
+                    .vault_router
+                    .update_agent_token_label(UpdateAgentTokenLabelRequest {
+                        token_id,
+                        label,
+                        changed_by: actor,
+                    }) {
+                    Ok(summary) => ApiResponse::AgentTokenLabelUpdated {
+                        request_id: request.request_id,
+                        summary: app_agent_token_summary(summary),
+                    },
+                    Err(err) => token_vault_error_response(request.request_id, err),
+                }
+            }
             AppCommand::UpdateAgentTokenScope {
                 token_id,
                 scope,
@@ -3743,6 +3779,13 @@ impl StandaloneCoreRuntime {
                     Err(err) => token_vault_error_response(request.request_id, err),
                 }
             }
+            AppCommand::InitVault => match self.vault_router.init_vault_store() {
+                Ok(lock_state) => ApiResponse::VaultInitialized {
+                    request_id: request.request_id,
+                    lock_state: lock_state.as_str().to_string(),
+                },
+                Err(err) => token_vault_error_response(request.request_id, err),
+            },
             AppCommand::GetVaultState => match app_vault_state_projection(self) {
                 Ok(state) => ApiResponse::VaultState {
                     request_id: request.request_id,
@@ -3775,6 +3818,21 @@ impl StandaloneCoreRuntime {
                     Ok(()) => ApiResponse::VaultLocked {
                         request_id: request.request_id,
                         lock_state: self.vault_router.vault_lock_state().as_str().to_string(),
+                    },
+                    Err(err) => token_vault_error_response(request.request_id, err),
+                }
+            }
+            AppCommand::DeleteVault { attestation_id } => {
+                let actor = control_plane_request_actor(&request.context);
+                match self
+                    .vault_router
+                    .delete_vault_with_attestation(DeleteVaultRequest {
+                        requested_by: actor,
+                        attestation_id,
+                    }) {
+                    Ok(lock_state) => ApiResponse::VaultDeleted {
+                        request_id: request.request_id,
+                        lock_state: lock_state.as_str().to_string(),
                     },
                     Err(err) => token_vault_error_response(request.request_id, err),
                 }

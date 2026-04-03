@@ -1793,6 +1793,7 @@ fn canonical_vault_persistence_and_passphrase_unlock_integration_contract() {
     let root = temp_dir("canonical-vault-integration");
     let vault_root = root.join("vault-store");
     let mut router = SecretVaultRouter::with_persistent_store(&vault_root).expect("open store");
+    router.init_vault_store().expect("init vault store");
     router
         .set_active_backend("builtin-encrypted")
         .expect("set builtin backend");

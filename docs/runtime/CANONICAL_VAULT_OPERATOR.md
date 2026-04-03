@@ -9,6 +9,10 @@ This guide defines the baseline operator flow for canonical vault management.
   local verification and attestation binding.
 - Secret-backed runtime actions stay fail-closed when vault is
   `locked/unavailable/uninitialized`.
+- Vault lifecycle is explicit: `uninitialized -> init -> locked -> unlocked`;
+  deleting vault returns to `uninitialized`.
+- Token lifecycle is explicit: `active/expired -> revoked -> deleted`;
+  `revoked` is the only delete precondition.
 - Desktop settings and standalone management routes must use the same vault and
   token authority truth.
 
@@ -28,10 +32,24 @@ This guide defines the baseline operator flow for canonical vault management.
 All commands require `--config <path>`.
 
 - `bridgingio-core vault init`
+- `bridgingio-core vault delete`
 - `bridgingio-core vault import --reference <vault://...> [--label ...]`
 - `bridgingio-core vault unlock [--method os-native|passphrase]`
 - `bridgingio-core auth token create --label <name> [--expires-in-seconds <u64>]`
 - `bridgingio-core auth token revoke --token-id <id> [--reason ...]`
+- `bridgingio-core auth token delete --token-id <id>`
+
+Lifecycle and confirmation constraints:
+
+- `vault delete` is a destructive action and must be confirmed; it only deletes
+  the current runtime store and does not clear shared host keyring entries.
+- `token delete` is a destructive action and must be confirmed; only
+  `revoked` token can be deleted (including `expired` token, which must first
+  be revoked).
+- `token create` returns plaintext token only once at creation time.
+- Expiring token creation depends on local system time and is guarded by
+  rollback detection; when local clock rollback anomaly is detected, expiring
+  token create is blocked until clock health is restored.
 
 Secret input source contract:
 
@@ -59,5 +77,6 @@ Startup unlock contract:
    local prompt as required by policy.
 4. For detached startup, provide startup unlock material via the launcher
    carrier before backgrounding the child process.
-5. Create least-privilege long-lived tokens and capture one-time reveal.
-6. Revoke stale tokens and rotate secrets/protector policy periodically.
+5. Create least-privilege tokens, capture one-time reveal, and record label/expiry intent.
+6. Revoke stale or expired tokens before deleting them from active management view.
+7. Rotate secrets/protector policy periodically; use `vault delete` only for controlled local reset/testing.

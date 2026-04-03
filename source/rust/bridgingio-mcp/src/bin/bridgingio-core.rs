@@ -33,8 +33,10 @@ use bridgingio_platform::{
 use bridgingio_providers::TerminalProvider;
 use bridgingio_secrets::{
     local_admin_create_token_target, local_admin_payload_digest_for_create_agent_token,
-    local_admin_payload_digest_for_unlock_vault, local_admin_unlock_vault_target,
-    normalize_credential_ref, CreateAgentTokenRequest, LocalAdminActionKind, SecretBytes,
+    local_admin_delete_vault_target, local_admin_payload_digest_for_delete_agent_token,
+    local_admin_payload_digest_for_delete_vault, local_admin_payload_digest_for_unlock_vault,
+    local_admin_unlock_vault_target, normalize_credential_ref, CreateAgentTokenRequest,
+    DeleteAgentTokenRequest, DeleteVaultRequest, LocalAdminActionKind, SecretBytes,
     SecretVaultRouter, SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling,
     TokenScopeInput, UnlockVaultRequest, VaultError, VaultReadinessState, VaultUnlockPolicy,
     VaultUnlockTriggerPolicy,
@@ -57,6 +59,7 @@ enum LaunchMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ManagementCommand {
     VaultInit,
+    VaultDelete,
     VaultImport {
         reference: String,
         label: Option<String>,
@@ -73,6 +76,9 @@ enum ManagementCommand {
     AuthTokenRevoke {
         token_id: String,
         reason: Option<String>,
+    },
+    AuthTokenDelete {
+        token_id: String,
     },
 }
 
@@ -265,6 +271,9 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
     let operator_principal = management_operator_principal();
     match command {
         ManagementCommand::VaultInit => {
+            let _ = router
+                .init_vault_store()
+                .map_err(|err| format!("vault init failed: {err:?}"))?;
             let lock_state = router.vault_lock_state().as_str().to_string();
             let secret_count = router.list_secret_summaries().len();
             println!(
@@ -274,6 +283,45 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
                 lock_state,
             );
             emit_management_audit("vault.init", &operator_principal, None, None, "ok");
+            Ok(())
+        }
+        ManagementCommand::VaultDelete => {
+            let payload_digest = local_admin_payload_digest_for_delete_vault();
+            let intent = router
+                .create_local_admin_intent_with_digest(
+                    LocalAdminActionKind::DeleteVault,
+                    local_admin_delete_vault_target(),
+                    &payload_digest,
+                    &operator_principal,
+                    Duration::from_secs(300),
+                )
+                .map_err(|err| format!("create vault-delete intent failed: {err:?}"))?;
+            let attestation = router
+                .complete_local_admin_attestation(
+                    &intent.intent_id,
+                    &operator_principal,
+                    "standalone-cli",
+                    Duration::from_secs(120),
+                )
+                .map_err(|err| format!("complete vault-delete attestation failed: {err:?}"))?;
+            let lock_state = router
+                .delete_vault_with_attestation(DeleteVaultRequest {
+                    requested_by: operator_principal.clone(),
+                    attestation_id: attestation.attestation_id,
+                })
+                .map_err(|err| format!("vault delete failed: {err:?}"))?;
+            println!(
+                "vault deleted (data_dir={}, lock_state={})",
+                settings.core.data_dir,
+                lock_state.as_str()
+            );
+            emit_management_audit(
+                "vault.delete",
+                &operator_principal,
+                Some(&intent.intent_id),
+                None,
+                "ok",
+            );
             Ok(())
         }
         ManagementCommand::VaultImport {
@@ -437,6 +485,46 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
                 summary.revoke_reason.as_deref().unwrap_or("none")
             );
             emit_management_audit("auth.token.revoke", &operator_principal, None, None, "ok");
+            Ok(())
+        }
+        ManagementCommand::AuthTokenDelete { token_id } => {
+            let payload_digest = local_admin_payload_digest_for_delete_agent_token(&token_id);
+            let intent = router
+                .create_local_admin_intent_with_digest(
+                    LocalAdminActionKind::DeleteAgentToken,
+                    &token_id,
+                    &payload_digest,
+                    &operator_principal,
+                    Duration::from_secs(300),
+                )
+                .map_err(|err| format!("create token-delete intent failed: {err:?}"))?;
+            let attestation = router
+                .complete_local_admin_attestation(
+                    &intent.intent_id,
+                    &operator_principal,
+                    "standalone-cli",
+                    Duration::from_secs(120),
+                )
+                .map_err(|err| format!("complete token-delete attestation failed: {err:?}"))?;
+            let summary = router
+                .delete_agent_token_with_attestation(DeleteAgentTokenRequest {
+                    token_id: token_id.clone(),
+                    requested_by: operator_principal.clone(),
+                    attestation_id: attestation.attestation_id,
+                })
+                .map_err(|err| format!("delete token failed: {err:?}"))?;
+            println!(
+                "token deleted: id={} status={}",
+                summary.token_id,
+                summary.status.as_str()
+            );
+            emit_management_audit(
+                "auth.token.delete",
+                &operator_principal,
+                Some(&intent.intent_id),
+                None,
+                "ok",
+            );
             Ok(())
         }
     }
@@ -1802,7 +1890,7 @@ fn parse_vault_management_cli(args: &[String], catalog: &Catalog) -> Result<CliA
     let subcommand = args
         .get(1)
         .map(String::as_str)
-        .ok_or_else(|| "vault route requires subcommand: init|import|unlock".to_string())?;
+        .ok_or_else(|| "vault route requires subcommand: init|import|unlock|delete".to_string())?;
     let mut config_path = None::<PathBuf>;
     let mut method = None::<String>;
     let mut reference = None::<String>;
@@ -1881,6 +1969,19 @@ fn parse_vault_management_cli(args: &[String], catalog: &Catalog) -> Result<CliA
             }
             ManagementCommand::VaultInit
         }
+        "delete" => {
+            if method.is_some()
+                || reference.is_some()
+                || label.is_some()
+                || input.has_explicit_source()
+            {
+                return Err(
+                    "vault delete only accepts --config and does not consume secret input flags"
+                        .to_string(),
+                );
+            }
+            ManagementCommand::VaultDelete
+        }
         "import" => ManagementCommand::VaultImport {
             reference: reference.ok_or_else(|| {
                 "vault import requires --reference <credential-ref>".to_string()
@@ -1899,7 +2000,7 @@ fn parse_vault_management_cli(args: &[String], catalog: &Catalog) -> Result<CliA
         }
         other => {
             return Err(format!(
-                "unknown vault subcommand `{other}` (expected init|import|unlock)"
+                "unknown vault subcommand `{other}` (expected init|import|unlock|delete)"
             ))
         }
     };
@@ -1929,7 +2030,7 @@ fn parse_auth_management_cli(args: &[String], catalog: &Catalog) -> Result<CliAr
     let subcommand = args
         .get(2)
         .map(String::as_str)
-        .ok_or_else(|| "auth token requires subcommand: create|revoke".to_string())?;
+        .ok_or_else(|| "auth token requires subcommand: create|revoke|delete".to_string())?;
     let mut config_path = None::<PathBuf>;
     let mut label = None::<String>;
     let mut expires_in_seconds = None::<u64>;
@@ -2004,9 +2105,21 @@ fn parse_auth_management_cli(args: &[String], catalog: &Catalog) -> Result<CliAr
                 reason,
             }
         }
+        "delete" => {
+            if label.is_some() || expires_in_seconds.is_some() || reason.is_some() {
+                return Err(
+                    "auth token delete does not accept --label/--expires-in-seconds/--reason"
+                        .to_string(),
+                );
+            }
+            ManagementCommand::AuthTokenDelete {
+                token_id: token_id
+                    .ok_or_else(|| "auth token delete requires --token-id <id>".to_string())?,
+            }
+        }
         other => {
             return Err(format!(
-                "unknown auth token subcommand `{other}` (expected create|revoke)"
+                "unknown auth token subcommand `{other}` (expected create|revoke|delete)"
             ))
         }
     };

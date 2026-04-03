@@ -261,6 +261,14 @@ pub enum AppCommand {
         token_id: String,
         reason: Option<String>,
     },
+    DeleteAgentToken {
+        token_id: String,
+        attestation_id: String,
+    },
+    UpdateAgentTokenLabel {
+        token_id: String,
+        label: String,
+    },
     UpdateAgentTokenScope {
         token_id: String,
         scope: AgentTokenScopeView,
@@ -278,10 +286,14 @@ pub enum AppCommand {
         verification_method: String,
         ttl_seconds: Option<u64>,
     },
+    InitVault,
     GetVaultState,
     UnlockVault {
         method: String,
         passphrase: Option<String>,
+        attestation_id: String,
+    },
+    DeleteVault {
         attestation_id: String,
     },
     LockVault {
@@ -455,6 +467,14 @@ pub enum ApiResponse {
         request_id: String,
         summary: AgentTokenSummaryView,
     },
+    AgentTokenDeleted {
+        request_id: String,
+        summary: AgentTokenSummaryView,
+    },
+    AgentTokenLabelUpdated {
+        request_id: String,
+        summary: AgentTokenSummaryView,
+    },
     LocalAdminIntentCreated {
         request_id: String,
         intent: LocalAdminActionIntentView,
@@ -463,9 +483,17 @@ pub enum ApiResponse {
         request_id: String,
         attestation: LocalAdminAttestationView,
     },
+    VaultInitialized {
+        request_id: String,
+        lock_state: String,
+    },
     VaultState {
         request_id: String,
         state: VaultStateProjectionView,
+    },
+    VaultDeleted {
+        request_id: String,
+        lock_state: String,
     },
     VaultUnlocked {
         request_id: String,
@@ -639,6 +667,25 @@ impl AppApiLineCodec {
                     base.push_str(&format!("|reason={}", escape(value)));
                 }
             }
+            AppCommand::DeleteAgentToken {
+                token_id,
+                attestation_id,
+            } => {
+                base.push_str("|command=delete_agent_token");
+                base.push_str(&format!(
+                    "|token_id={}|attestation_id={}",
+                    escape(token_id),
+                    escape(attestation_id)
+                ));
+            }
+            AppCommand::UpdateAgentTokenLabel { token_id, label } => {
+                base.push_str("|command=update_agent_token_label");
+                base.push_str(&format!(
+                    "|token_id={}|label={}",
+                    escape(token_id),
+                    escape(label)
+                ));
+            }
             AppCommand::UpdateAgentTokenScope {
                 token_id,
                 scope,
@@ -689,6 +736,9 @@ impl AppApiLineCodec {
                     base.push_str(&format!("|ttl_seconds={value}"));
                 }
             }
+            AppCommand::InitVault => {
+                base.push_str("|command=init_vault");
+            }
             AppCommand::GetVaultState => {
                 base.push_str("|command=get_vault_state");
             }
@@ -706,6 +756,10 @@ impl AppApiLineCodec {
                 if let Some(value) = passphrase.as_ref() {
                     base.push_str(&format!("|passphrase={}", escape(value)));
                 }
+            }
+            AppCommand::DeleteVault { attestation_id } => {
+                base.push_str("|command=delete_vault");
+                base.push_str(&format!("|attestation_id={}", escape(attestation_id)));
             }
             AppCommand::LockVault { reason } => {
                 base.push_str("|command=lock_vault");
@@ -940,6 +994,14 @@ impl AppApiLineCodec {
                 token_id: unescape(required(&map, "token_id")?),
                 reason: optional(&map, "reason").map(unescape),
             },
+            "delete_agent_token" => AppCommand::DeleteAgentToken {
+                token_id: unescape(required(&map, "token_id")?),
+                attestation_id: unescape(required(&map, "attestation_id")?),
+            },
+            "update_agent_token_label" => AppCommand::UpdateAgentTokenLabel {
+                token_id: unescape(required(&map, "token_id")?),
+                label: unescape(required(&map, "label")?),
+            },
             "update_agent_token_scope" => AppCommand::UpdateAgentTokenScope {
                 token_id: unescape(required(&map, "token_id")?),
                 scope: parse_scope_from_fields(&map)?,
@@ -957,10 +1019,14 @@ impl AppApiLineCodec {
                 verification_method: unescape(required(&map, "verification_method")?),
                 ttl_seconds: parse_optional_u64(optional(&map, "ttl_seconds"))?,
             },
+            "init_vault" => AppCommand::InitVault,
             "get_vault_state" => AppCommand::GetVaultState,
             "unlock_vault" => AppCommand::UnlockVault {
                 method: unescape(required(&map, "method")?),
                 passphrase: optional(&map, "passphrase").map(unescape),
+                attestation_id: unescape(required(&map, "attestation_id")?),
+            },
+            "delete_vault" => AppCommand::DeleteVault {
                 attestation_id: unescape(required(&map, "attestation_id")?),
             },
             "lock_vault" => AppCommand::LockVault {
@@ -1179,6 +1245,22 @@ impl AppApiLineCodec {
                 append_agent_token_summary_fields(&mut line, summary, "");
                 line
             }
+            ApiResponse::AgentTokenDeleted {
+                request_id,
+                summary,
+            } => {
+                let mut line = format!("kind=agent_token_deleted|request_id={request_id}");
+                append_agent_token_summary_fields(&mut line, summary, "");
+                line
+            }
+            ApiResponse::AgentTokenLabelUpdated {
+                request_id,
+                summary,
+            } => {
+                let mut line = format!("kind=agent_token_label_updated|request_id={request_id}");
+                append_agent_token_summary_fields(&mut line, summary, "");
+                line
+            }
             ApiResponse::LocalAdminIntentCreated { request_id, intent } => {
                 let mut line = format!("kind=local_admin_intent_created|request_id={request_id}");
                 append_local_admin_intent_fields(&mut line, intent, "");
@@ -1193,11 +1275,25 @@ impl AppApiLineCodec {
                 append_local_admin_attestation_fields(&mut line, attestation, "");
                 line
             }
+            ApiResponse::VaultInitialized {
+                request_id,
+                lock_state,
+            } => format!(
+                "kind=vault_initialized|request_id={request_id}|lock_state={}",
+                escape(lock_state)
+            ),
             ApiResponse::VaultState { request_id, state } => {
                 let mut line = format!("kind=vault_state|request_id={request_id}");
                 append_vault_state_fields(&mut line, state);
                 line
             }
+            ApiResponse::VaultDeleted {
+                request_id,
+                lock_state,
+            } => format!(
+                "kind=vault_deleted|request_id={request_id}|lock_state={}",
+                escape(lock_state)
+            ),
             ApiResponse::VaultUnlocked {
                 request_id,
                 lock_state,
@@ -1361,6 +1457,14 @@ impl AppApiLineCodec {
                 request_id,
                 summary: parse_agent_token_summary_from_fields(&map, "")?,
             }),
+            "agent_token_deleted" => Ok(ApiResponse::AgentTokenDeleted {
+                request_id,
+                summary: parse_agent_token_summary_from_fields(&map, "")?,
+            }),
+            "agent_token_label_updated" => Ok(ApiResponse::AgentTokenLabelUpdated {
+                request_id,
+                summary: parse_agent_token_summary_from_fields(&map, "")?,
+            }),
             "local_admin_intent_created" => Ok(ApiResponse::LocalAdminIntentCreated {
                 request_id,
                 intent: parse_local_admin_intent_from_fields(&map, "")?,
@@ -1371,9 +1475,17 @@ impl AppApiLineCodec {
                     attestation: parse_local_admin_attestation_from_fields(&map, "")?,
                 })
             }
+            "vault_initialized" => Ok(ApiResponse::VaultInitialized {
+                request_id,
+                lock_state: unescape(required(&map, "lock_state")?),
+            }),
             "vault_state" => Ok(ApiResponse::VaultState {
                 request_id,
                 state: parse_vault_state_from_fields(&map)?,
+            }),
+            "vault_deleted" => Ok(ApiResponse::VaultDeleted {
+                request_id,
+                lock_state: unescape(required(&map, "lock_state")?),
             }),
             "vault_unlocked" => Ok(ApiResponse::VaultUnlocked {
                 request_id,
