@@ -18,7 +18,7 @@ use bridgingio_secrets::{
     local_admin_payload_digest_for_delete_agent_token, local_admin_payload_digest_for_delete_vault,
     read_passive_vault_projection, CreateAgentTokenRequest, DeleteAgentTokenRequest,
     DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter, TokenScopeInput,
-    UpdateAgentTokenLabelRequest, VaultPassiveProjection,
+    UpdateAgentTokenAccessRequest, UpdateAgentTokenLabelRequest, VaultPassiveProjection,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -48,7 +48,7 @@ pub struct SecuritySummary {
     pub token_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Screen {
     Root,
     Core,
@@ -58,12 +58,13 @@ enum Screen {
     Targets,
     Security,
     TokenManagement,
+    TokenDetail(String),
     TargetEditor(usize),
     SearchResults,
 }
 
 impl Screen {
-    fn title(self, catalog: &Catalog) -> String {
+    fn title(&self, catalog: &Catalog) -> String {
         match self {
             Screen::Root => catalog.t("menu.root.title"),
             Screen::Core => catalog.t("menu.core.title"),
@@ -73,6 +74,7 @@ impl Screen {
             Screen::Targets => catalog.t("menu.targets.title"),
             Screen::Security => catalog.t("menu.security.title"),
             Screen::TokenManagement => catalog.t("menu.token_management.title"),
+            Screen::TokenDetail(_) => catalog.t("menu.token_detail.title"),
             Screen::TargetEditor(_) => catalog.t("menu.target.title"),
             Screen::SearchResults => catalog.t("menu.search_results.title"),
         }
@@ -106,7 +108,10 @@ enum ActionKind {
     DeleteVault,
     CreateToken,
     OpenTokenManagement,
+    OpenTokenDetail(String),
     EditTokenLabel(String),
+    ToggleTokenAccess(String),
+    OpenTokenPermissions(String),
     RevokeToken(String),
     DeleteToken(String),
 }
@@ -160,8 +165,11 @@ enum UnlockFlowState {
 struct TokenManagementRow {
     token_id: String,
     label: String,
+    token_fingerprint: String,
     status: String,
     expires_at: Option<SystemTime>,
+    revoked_at: Option<SystemTime>,
+    revoke_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -438,9 +446,9 @@ impl MenuConfigApp {
         match entry.kind {
             MenuEntryKind::Navigate(screen) => {
                 self.push_navigation_state();
+                let screen_title = screen.title(&self.catalog);
                 self.screen = screen;
                 self.selected = 0;
-                let screen_title = screen.title(&self.catalog);
                 self.last_status =
                     self.tf("menu.status.opened_screen", &[("screen", &screen_title)]);
             }
@@ -452,6 +460,9 @@ impl MenuConfigApp {
                 self.screen = screen;
                 self.select_field(&field);
                 self.last_status = self.tf("menu.status.focused_field", &[("field", &field)]);
+            }
+            MenuEntryKind::Action(ActionKind::ToggleTokenAccess(_)) => {
+                self.last_status = self.t("menu.status.token_access_space_only");
             }
             MenuEntryKind::Action(action) => self.run_action(action)?,
             MenuEntryKind::Info => {
@@ -571,11 +582,8 @@ impl MenuConfigApp {
                 .ok_or_else(|| self.t("menu.error.no_available_option"))?,
         };
         if field == TOKEN_CREATE_LABEL_FIELD {
-            let label = value.trim();
-            if label.is_empty() {
-                return Err(self.t("menu.error.token_label_required"));
-            }
-            self.pending_token_label = Some(label.to_string());
+            let label = self.validate_token_label_input(&value)?;
+            self.pending_token_label = Some(label);
             self.reset_edit_state();
             self.begin_edit(TOKEN_CREATE_EXPIRY_MODE_FIELD.to_string())?;
             return Ok(());
@@ -614,14 +622,43 @@ impl MenuConfigApp {
             return Ok(());
         }
         if let Some(token_id) = field.strip_prefix("__token_label_edit__:") {
+            let label = self.validate_token_label_input(&value)?;
             self.reset_edit_state();
-            self.update_token_label(token_id, value.trim())?;
+            self.update_token_label(token_id, &label)?;
             return Ok(());
         }
         self.apply_edit_value(&field, &value)?;
         self.reset_edit_state();
         self.last_status = self.tf("menu.status.updated", &[("field", &field)]);
         Ok(())
+    }
+
+    fn validate_token_label_input(&self, raw: &str) -> Result<String, String> {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(self.t("menu.error.token_label_required"));
+        }
+        if value.len() > 64 {
+            return Err(self.t("menu.error.token_label_format_invalid"));
+        }
+        let mut seen_any = false;
+        let mut prev_separator = false;
+        for ch in value.chars() {
+            if ch.is_ascii_alphanumeric() {
+                seen_any = true;
+                prev_separator = false;
+                continue;
+            }
+            if (ch == '-' || ch == '_') && seen_any && !prev_separator {
+                prev_separator = true;
+                continue;
+            }
+            return Err(self.t("menu.error.token_label_format_invalid"));
+        }
+        if !seen_any || prev_separator {
+            return Err(self.t("menu.error.token_label_format_invalid"));
+        }
+        Ok(value.to_string())
     }
 
     fn apply_edit_value(&mut self, field: &str, value: &str) -> Result<(), String> {
@@ -699,22 +736,29 @@ impl MenuConfigApp {
         let Some(entry) = self.entries().into_iter().nth(self.selected) else {
             return Ok(());
         };
-        if let MenuEntryKind::EditField(field) = entry.kind {
-            if is_boolean_toggle_field(&field) {
-                let current = field_value(&self.settings, &field).unwrap_or_else(|| "false".into());
-                let parsed = current
-                    .trim()
-                    .parse::<bool>()
-                    .map_err(|_| self.tf("menu.error.bool_toggle", &[("field", &field)]))?;
-                let toggled = (!parsed).to_string();
-                self.apply_edit_value(&field, &toggled)?;
-                self.last_status = self.tf(
-                    "menu.status.toggle",
-                    &[("field", &field), ("value", &toggled)],
-                );
-            } else if field_options(&field).is_some() {
-                self.begin_edit(field)?;
+        match entry.kind {
+            MenuEntryKind::EditField(field) => {
+                if is_boolean_toggle_field(&field) {
+                    let current =
+                        field_value(&self.settings, &field).unwrap_or_else(|| "false".into());
+                    let parsed = current
+                        .trim()
+                        .parse::<bool>()
+                        .map_err(|_| self.tf("menu.error.bool_toggle", &[("field", &field)]))?;
+                    let toggled = (!parsed).to_string();
+                    self.apply_edit_value(&field, &toggled)?;
+                    self.last_status = self.tf(
+                        "menu.status.toggle",
+                        &[("field", &field), ("value", &toggled)],
+                    );
+                } else if field_options(&field).is_some() {
+                    self.begin_edit(field)?;
+                }
             }
+            MenuEntryKind::Action(ActionKind::ToggleTokenAccess(token_id)) => {
+                self.run_action(ActionKind::ToggleTokenAccess(token_id))?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -983,8 +1027,11 @@ impl MenuConfigApp {
                     .map(|item| TokenManagementRow {
                         token_id: item.token_id,
                         label: item.label,
+                        token_fingerprint: item.token_fingerprint,
                         status: item.status.as_str().to_string(),
                         expires_at: item.expires_at,
+                        revoked_at: item.revoked_at,
+                        revoke_reason: item.revoke_reason,
                     })
                     .collect();
             } else {
@@ -1056,8 +1103,33 @@ impl MenuConfigApp {
                 self.selected = 0;
                 self.last_status = self.t("menu.status.opened_token_management");
             }
+            ActionKind::OpenTokenDetail(token_id) => {
+                self.push_navigation_state();
+                self.screen = Screen::TokenDetail(token_id);
+                self.selected = 0;
+                self.last_status = self.t("menu.status.opened_token_detail");
+            }
             ActionKind::EditTokenLabel(token_id) => {
                 self.begin_edit(format!("__token_label_edit__:{token_id}"))?;
+            }
+            ActionKind::ToggleTokenAccess(token_id) => {
+                let token = self
+                    .token_rows
+                    .iter()
+                    .find(|item| item.token_id == token_id)
+                    .cloned()
+                    .ok_or_else(|| self.t("menu.error.token_not_found"))?;
+                let status = token.status.to_ascii_lowercase();
+                if status == "active" {
+                    self.update_token_access(&token_id, false)?;
+                } else if status == "disabled" {
+                    self.update_token_access(&token_id, true)?;
+                } else {
+                    self.last_status = self.t("menu.status.token_access_toggle_unavailable");
+                }
+            }
+            ActionKind::OpenTokenPermissions(_token_id) => {
+                self.last_status = self.t("menu.status.token_permissions_placeholder");
             }
             ActionKind::RevokeToken(token_id) => {
                 self.confirm_action = Some(ConfirmAction::RevokeToken(token_id));
@@ -1183,6 +1255,25 @@ impl MenuConfigApp {
         Ok(())
     }
 
+    fn update_token_access(&mut self, token_id: &str, enabled: bool) -> Result<(), String> {
+        let operator_principal = "menuconfig:local-operator".to_string();
+        let router = self.ensure_vault_router_loaded()?;
+        router
+            .update_agent_token_access(UpdateAgentTokenAccessRequest {
+                token_id: token_id.to_string(),
+                enabled,
+                changed_by: operator_principal,
+            })
+            .map_err(|err| format!("update token access failed: {err:?}"))?;
+        self.refresh_security_summary();
+        self.last_status = if enabled {
+            self.t("menu.status.token_access_enabled")
+        } else {
+            self.t("menu.status.token_access_disabled")
+        };
+        Ok(())
+    }
+
     fn revoke_token_confirmed(&mut self, token_id: &str) -> Result<(), String> {
         let router = self.ensure_vault_router_loaded()?;
         router
@@ -1252,7 +1343,7 @@ impl MenuConfigApp {
     }
 
     fn push_navigation_state(&mut self) {
-        self.navigation_stack.push((self.screen, self.selected));
+        self.navigation_stack.push((self.screen.clone(), self.selected));
     }
 
     fn move_footer_selection(&mut self, delta: isize) {
@@ -1373,6 +1464,7 @@ impl MenuConfigApp {
             Screen::Targets => targets_entries(&self.settings, &self.catalog),
             Screen::Security => security_entries(&self.security_summary, &self.catalog),
             Screen::TokenManagement => token_management_entries(self, &self.catalog),
+            Screen::TokenDetail(ref token_id) => token_detail_entries(self, &self.catalog, token_id),
             Screen::TargetEditor(index) => {
                 target_editor_entries(&self.settings, index, &self.catalog)
             }
@@ -1955,13 +2047,23 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
             None => format!("{selector} --- {}", entry.label),
         },
         MenuEntryKind::Action(action) => {
+            if matches!(action, ActionKind::ToggleTokenAccess(_)) {
+                let marker = match entry.value.as_deref() {
+                    Some("enabled") => "<*>",
+                    _ => "< >",
+                };
+                return format!("{selector} {marker} {}", entry.label);
+            }
             let uses_navigation_style = matches!(
                 action,
                 ActionKind::UnlockVault
                     | ActionKind::CreateToken
                     | ActionKind::OpenTokenManagement
+                    | ActionKind::OpenTokenDetail(_)
                     | ActionKind::DeleteVault
                     | ActionKind::EditTokenLabel(_)
+                    | ActionKind::ToggleTokenAccess(_)
+                    | ActionKind::OpenTokenPermissions(_)
                     | ActionKind::RevokeToken(_)
                     | ActionKind::DeleteToken(_)
             );
@@ -2352,38 +2454,184 @@ fn token_management_entries(app: &MenuConfigApp, catalog: &Catalog) -> Vec<MenuE
             &catalog.t("menu.token_management.empty.desc"),
         )];
     }
-    let mut entries = Vec::new();
-    for item in &app.token_rows {
-        entries.push(info_entry(
-            &format!(
-                "{} ({})",
-                if item.label.trim().is_empty() {
-                    "<unlabeled>"
-                } else {
-                    item.label.as_str()
-                },
-                item.status
-            ),
+    app.token_rows
+        .iter()
+        .map(|item| {
+            let serial = token_serial_from_id(&item.token_id).unwrap_or_else(|| "------".into());
+            let label = if item.label.trim().is_empty() {
+                catalog.t("menu.token_management.unlabeled")
+            } else {
+                item.label.clone()
+            };
+            let expiry = token_expiry_badge(item.expires_at, catalog);
+            let status = token_status_badge(&item.status, catalog);
+            action_entry(
+                &format!("({serial}) {label} {expiry} {status}"),
+                &catalog.t("menu.token_management.token_row.desc"),
+                ActionKind::OpenTokenDetail(item.token_id.clone()),
+            )
+        })
+        .collect()
+}
+
+fn token_detail_entries(app: &MenuConfigApp, catalog: &Catalog, token_id: &str) -> Vec<MenuEntry> {
+    if app.security_summary.lock_state != "unlocked" {
+        return vec![info_entry(
+            &catalog.t("menu.token_management.locked_hint"),
+            None,
+            &catalog.t("menu.token_management.locked_hint.desc"),
+        )];
+    }
+    let Some(item) = app.token_rows.iter().find(|row| row.token_id == token_id) else {
+        return vec![info_entry(
+            &catalog.t("menu.token_detail.missing"),
+            Some(token_id.to_string()),
+            &catalog.t("menu.token_detail.missing.desc"),
+        )];
+    };
+
+    let mut entries = vec![
+        info_entry(
+            &catalog.t("menu.token_detail.token_id"),
             Some(item.token_id.clone()),
-            &catalog.t("menu.token_management.token.desc"),
-        ));
-        entries.push(action_entry(
-            &catalog.tf("menu.token_management.edit_label_action", &[("id", &item.token_id)]),
-            &catalog.t("menu.token_management.edit_label_action.desc"),
+            &catalog.t("menu.token_detail.token_id.desc"),
+        ),
+        action_entry(
+            &format!("{} = {}", catalog.t("menu.token_detail.label"), item.label),
+            &catalog.t("menu.token_detail.label.desc"),
             ActionKind::EditTokenLabel(item.token_id.clone()),
-        ));
+        ),
+        info_entry(
+            &catalog.t("menu.token_detail.fingerprint"),
+            Some(item.token_fingerprint.clone()),
+            &catalog.t("menu.token_detail.fingerprint.desc"),
+        ),
+        info_entry(
+            &catalog.t("menu.token_detail.expiry"),
+            Some(token_expiry_badge(item.expires_at, catalog)),
+            &catalog.t("menu.token_detail.expiry.desc"),
+        ),
+        info_entry(
+            &catalog.t("menu.token_detail.status"),
+            Some(token_status_badge(&item.status, catalog)),
+            &catalog.t("menu.token_detail.status.desc"),
+        ),
+    ];
+
+    match item.status.to_ascii_lowercase().as_str() {
+        "active" => entries.push(MenuEntry {
+            label: format!(
+                "{} = {}",
+                catalog.t("menu.token_detail.access_switch"),
+                catalog.t("menu.token_detail.access_state_enabled")
+            ),
+            value: Some("enabled".into()),
+            description: catalog.t("menu.token_detail.access_switch.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::Action(ActionKind::ToggleTokenAccess(item.token_id.clone())),
+        }),
+        "disabled" => entries.push(MenuEntry {
+            label: format!(
+                "{} = {}",
+                catalog.t("menu.token_detail.access_switch"),
+                catalog.t("menu.token_detail.access_state_disabled")
+            ),
+            value: Some("disabled".into()),
+            description: catalog.t("menu.token_detail.access_switch.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::Action(ActionKind::ToggleTokenAccess(item.token_id.clone())),
+        }),
+        _ => entries.push(info_entry(
+            &catalog.t("menu.token_detail.access_readonly"),
+            None,
+            &catalog.t("menu.token_detail.access_readonly.desc"),
+        )),
+    }
+
+    entries.push(action_entry(
+        &catalog.t("menu.token_detail.permissions_action"),
+        &catalog.t("menu.token_detail.permissions_action.desc"),
+        ActionKind::OpenTokenPermissions(item.token_id.clone()),
+    ));
+
+    if item.status.to_ascii_lowercase() != "revoked" {
         entries.push(action_entry(
-            &catalog.tf("menu.token_management.revoke_action", &[("id", &item.token_id)]),
-            &catalog.t("menu.token_management.revoke_action.desc"),
+            &catalog.t("menu.token_detail.revoke_action"),
+            &catalog.t("menu.token_detail.revoke_action.desc"),
             ActionKind::RevokeToken(item.token_id.clone()),
         ));
+    }
+
+    if item.status.to_ascii_lowercase() == "revoked" {
         entries.push(action_entry(
             &catalog.tf("menu.token_management.delete_action", &[("id", &item.token_id)]),
             &catalog.t("menu.token_management.delete_action.desc"),
             ActionKind::DeleteToken(item.token_id.clone()),
         ));
+    } else {
+        entries.push(info_entry(
+            &catalog.t("menu.token_detail.delete_guard"),
+            None,
+            &catalog.t("menu.token_detail.delete_guard.desc"),
+        ));
+    }
+
+    if let Some(reason) = item.revoke_reason.as_ref() {
+        entries.push(info_entry(
+            &catalog.t("menu.token_detail.revoke_reason"),
+            Some(reason.clone()),
+            &catalog.t("menu.token_detail.revoke_reason.desc"),
+        ));
     }
     entries
+}
+
+fn token_serial_from_id(token_id: &str) -> Option<String> {
+    let suffix = token_id.rsplit_once('-')?.1;
+    if suffix.len() == 6 && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        Some(suffix.to_string())
+    } else {
+        None
+    }
+}
+
+fn token_expiry_badge(expires_at: Option<SystemTime>, catalog: &Catalog) -> String {
+    match expires_at.and_then(format_short_utc_date) {
+        Some(value) => format!("[{value}]"),
+        None => catalog.t("menu.token_management.expiry.long_lived"),
+    }
+}
+
+fn token_status_badge(status: &str, catalog: &Catalog) -> String {
+    let key = match status.trim().to_ascii_lowercase().as_str() {
+        "active" => "menu.token_management.status.active",
+        "disabled" => "menu.token_management.status.disabled",
+        "revoked" => "menu.token_management.status.revoked",
+        "expired" => "menu.token_management.status.expired",
+        _ => "menu.token_management.status.unknown",
+    };
+    format!("[{}]", catalog.t(key))
+}
+
+fn format_short_utc_date(value: SystemTime) -> Option<String> {
+    let secs = value.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    let days = i64::try_from(secs / 86_400).ok()?;
+    let (year, month, day) = civil_from_days(days);
+    Some(format!("{:02}-{:02}-{:02}", year.rem_euclid(100), month, day))
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    (year, month as u32, day as u32)
 }
 
 fn targets_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
@@ -3742,24 +3990,106 @@ mod tests {
         app.token_rows = vec![super::TokenManagementRow {
             token_id: "token-000001".into(),
             label: "test_tok".into(),
+            token_fingerprint: "fp-deadbeef0001".into(),
             status: "active".into(),
             expires_at: None,
+            revoked_at: None,
+            revoke_reason: None,
         }];
 
         let entries = app.entries();
-        for action in [
-            ActionKind::EditTokenLabel("token-000001".into()),
-            ActionKind::RevokeToken("token-000001".into()),
-            ActionKind::DeleteToken("token-000001".into()),
-        ] {
-            let index = entries
-                .iter()
-                .position(|entry| matches!(entry.kind, MenuEntryKind::Action(ref kind) if *kind == action))
-                .expect("token management action entry");
-            let line = super::format_menu_entry_line(&app, index, &entries[index]);
-            assert!(line.contains(&format!("{} --->", entries[index].label)));
-            assert!(!line.contains("***"));
-        }
+        let index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::OpenTokenDetail(ref token_id))
+                        if token_id == "token-000001"
+                )
+            })
+            .expect("token management detail entry");
+        let line = super::format_menu_entry_line(&app, index, &entries[index]);
+        assert!(line.contains("--->"));
+        assert!(!line.contains("***"));
+    }
+
+    #[test]
+    fn token_detail_hides_delete_until_revoked() {
+        let config_path = temp_config_path("token-detail-delete-guard");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.token_rows = vec![super::TokenManagementRow {
+            token_id: "token-000001".into(),
+            label: "test_tok".into(),
+            token_fingerprint: "fp-deadbeef0001".into(),
+            status: "active".into(),
+            expires_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+        }];
+        app.screen = Screen::TokenDetail("token-000001".into());
+        let entries = app.entries();
+        assert!(!entries.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::DeleteToken(ref token_id))
+                    if token_id == "token-000001"
+            )
+        }));
+    }
+
+    #[test]
+    fn token_detail_permissions_entry_returns_placeholder_status() {
+        let config_path = temp_config_path("token-detail-permissions-placeholder");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.token_rows = vec![super::TokenManagementRow {
+            token_id: "token-000001".into(),
+            label: "test_tok".into(),
+            token_fingerprint: "fp-deadbeef0001".into(),
+            status: "active".into(),
+            expires_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+        }];
+        app.run_action(ActionKind::OpenTokenDetail("token-000001".into()))
+            .expect("open detail");
+        app.run_action(ActionKind::OpenTokenPermissions("token-000001".into()))
+            .expect("open permissions placeholder");
+        assert_eq!(
+            app.last_status,
+            app.t("menu.status.token_permissions_placeholder")
+        );
+    }
+
+    #[test]
+    fn token_detail_access_switch_requires_space_instead_of_enter() {
+        let config_path = temp_config_path("token-detail-access-space-only");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.token_rows = vec![super::TokenManagementRow {
+            token_id: "token-000001".into(),
+            label: "test_tok".into(),
+            token_fingerprint: "fp-deadbeef0001".into(),
+            status: "active".into(),
+            expires_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+        }];
+        app.screen = Screen::TokenDetail("token-000001".into());
+        let entries = app.entries();
+        app.selected = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::ToggleTokenAccess(ref token_id))
+                        if token_id == "token-000001"
+                )
+            })
+            .expect("access switch entry");
+        app.activate_selected().expect("enter on access switch");
+        assert_eq!(app.last_status, app.t("menu.status.token_access_space_only"));
     }
 
     #[test]

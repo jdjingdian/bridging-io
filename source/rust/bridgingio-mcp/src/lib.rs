@@ -41,9 +41,9 @@ use bridgingio_platform::{
 use bridgingio_policy::{evaluate, OperationKind, PolicyDecision};
 use bridgingio_providers::{GitProvider, TerminalProvider};
 use bridgingio_secrets::{
-    normalize_credential_ref, AgentTokenSummary, CreateAgentTokenRequest, DeleteAgentTokenRequest,
-    DeleteVaultRequest, LocalAdminActionIntent, LocalAdminActionKind,
-    LocalAdminAttestationRecord, SecretVaultRouter,
+    normalize_credential_ref, AgentTokenAuthRejectReason, AgentTokenAuthResult,
+    AgentTokenSummary, CreateAgentTokenRequest, DeleteAgentTokenRequest, DeleteVaultRequest,
+    LocalAdminActionIntent, LocalAdminActionKind, LocalAdminAttestationRecord, SecretVaultRouter,
     SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
     UnlockVaultRequest, UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError,
     VaultLockState, VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
@@ -4146,6 +4146,29 @@ fn token_vault_error_response(request_id: String, err: VaultError) -> ApiRespons
     shared_error_response(request_id, err.shared_error())
 }
 
+fn shared_error_to_model_plane_response_line(error: SharedError) -> String {
+    format!(
+        "result=error|status={}|domain={}|common_code={}|module_code={}|message={}|recovery_hint={}",
+        error.status.as_str(),
+        error.domain.as_str(),
+        error.common_code.as_str(),
+        error.module_code.unwrap_or_default(),
+        error.message,
+        error.recovery_hint.unwrap_or_default(),
+    )
+}
+
+fn token_authn_shared_error(reason: AgentTokenAuthRejectReason) -> SharedError {
+    SharedError::new(
+        ContractStatus::Failed,
+        ErrorDomain::Authn,
+        CommonErrorCode::CredentialRejected,
+        reason.display_message(),
+    )
+    .with_module_code(reason.module_code())
+    .with_recovery_hint(reason.recovery_hint())
+}
+
 fn error_response(request_id: String, code: ApiErrorCode, message: &str) -> ApiResponse {
     let status = match code {
         CommonErrorCode::MethodNotImplemented => ContractStatus::MethodNotImplemented,
@@ -5728,57 +5751,61 @@ fn handle_http_connection(
                     )),
                 };
 
-                let mut auth_error = None::<&str>;
+                let mut auth_error = None::<String>;
                 if let Some(token) = bearer_token_from_headers(&headers) {
-                    if let Some(authenticated) =
-                        runtime.vault_router.authenticate_agent_token(&token)
-                    {
-                        let resolved_target_id = runtime
-                            .resolve_target_profile_by_ref(target_ref)
-                            .map(|profile| profile.id.to_ascii_lowercase());
-                        let allowed = resolved_target_id
-                            .as_ref()
-                            .map(|target_id| authenticated.target_ids.contains(target_id))
-                            .unwrap_or(false);
-                        if !allowed {
-                            auth_error = Some("token_scope_denied_for_target");
-                        } else if authenticated.tool_ids.is_empty()
-                            || !authenticated
-                                .tool_ids
-                                .iter()
-                                .any(|tool_id| tool_id == "terminal.exec")
-                        {
-                            auth_error = Some("token_scope_denied_for_tool");
-                        } else if !authenticated.allow_open_shell
-                            || !authenticated.allow_write_shell_input
-                        {
-                            auth_error = Some("token_scope_denied_for_shell_capability");
-                        } else if authenticated.max_risk_envelope == "deny-all" {
-                            auth_error = Some("token_scope_denied_by_risk_envelope");
-                        } else {
-                            context.principal_id = Some(authenticated.principal_id);
-                            context.timeline_source = Some(timeline_source_from_token_label(
-                                &authenticated.label,
-                                context.principal_id.as_deref().unwrap_or("local-operator"),
-                                user_agent_summary.clone(),
+                    match runtime.vault_router.authenticate_agent_token(&token) {
+                        AgentTokenAuthResult::Authenticated(authenticated) => {
+                            let resolved_target_id = runtime
+                                .resolve_target_profile_by_ref(target_ref)
+                                .map(|profile| profile.id.to_ascii_lowercase());
+                            let allowed = resolved_target_id
+                                .as_ref()
+                                .map(|target_id| authenticated.target_ids.contains(target_id))
+                                .unwrap_or(false);
+                            if !allowed {
+                                auth_error = Some("result=error|message=token_scope_denied_for_target".to_string());
+                            } else if authenticated.tool_ids.is_empty()
+                                || !authenticated
+                                    .tool_ids
+                                    .iter()
+                                    .any(|tool_id| tool_id == "terminal.exec")
+                            {
+                                auth_error = Some("result=error|message=token_scope_denied_for_tool".to_string());
+                            } else if !authenticated.allow_open_shell
+                                || !authenticated.allow_write_shell_input
+                            {
+                                auth_error = Some("result=error|message=token_scope_denied_for_shell_capability".to_string());
+                            } else if authenticated.max_risk_envelope == "deny-all" {
+                                auth_error = Some("result=error|message=token_scope_denied_by_risk_envelope".to_string());
+                            } else {
+                                context.principal_id = Some(authenticated.principal_id);
+                                context.timeline_source = Some(timeline_source_from_token_label(
+                                    &authenticated.label,
+                                    context.principal_id.as_deref().unwrap_or("local-operator"),
+                                    user_agent_summary.clone(),
+                                ));
+                            }
+                        }
+                        AgentTokenAuthResult::Rejected(reason) => {
+                            auth_error = Some(shared_error_to_model_plane_response_line(
+                                token_authn_shared_error(reason),
                             ));
                         }
-                    } else {
-                        auth_error = Some("invalid_or_expired_token");
                     }
                 } else if let Some(descriptor) = runtime
                     .resolve_target_descriptor_by_ref(target_ref)
                     .cloned()
                 {
                     if !runtime.anonymous_loopback_compat_enabled() {
-                        auth_error = Some("anonymous_compat_disabled");
+                        auth_error = Some("result=error|message=anonymous_compat_disabled".to_string());
                     } else if !remote_addr
                         .map(|value| value.ip().is_loopback())
                         .unwrap_or(false)
                     {
-                        auth_error = Some("anonymous_compat_non_loopback_rejected");
+                        auth_error =
+                            Some("result=error|message=anonymous_compat_non_loopback_rejected".to_string());
                     } else if !descriptor.allows_anonymous_execution() {
-                        auth_error = Some("anonymous_compat_denied_for_target");
+                        auth_error = Some("result=error|message=anonymous_compat_denied_for_target".to_string());
                     } else {
                         context.principal_id = Some("anonymous-local".to_string());
                         context.timeline_source = Some(timeline_source_for_anonymous_loopback(
@@ -5788,8 +5815,8 @@ fn handle_http_connection(
                     }
                 }
 
-                if let Some(message) = auth_error {
-                    (403, "text/plain", format!("result=error|message={message}"))
+                if let Some(response_line) = auth_error {
+                    (403, "text/plain", response_line)
                 } else {
                     match runtime.execute_target_command(
                         target_ref,
@@ -7489,8 +7516,9 @@ mod tests {
         local_admin_create_token_target, local_admin_payload_digest_for_create_agent_token,
         local_admin_payload_digest_for_unlock_vault,
         local_admin_payload_digest_for_update_agent_token_scope, local_admin_unlock_vault_target,
-        CreateAgentTokenRequest, TokenScopeInput, UpdateAgentTokenScopeRequest, VaultLockState,
-        VaultUnlockPolicy, VaultUnlockTriggerPolicy,
+        CreateAgentTokenRequest, TokenScopeInput, UpdateAgentTokenAccessRequest,
+        UpdateAgentTokenScopeRequest, VaultLockState, VaultUnlockPolicy,
+        VaultUnlockTriggerPolicy,
     };
 
     use super::{
@@ -8884,8 +8912,226 @@ enabled = true
         serve_thread.join().expect("join serve thread");
 
         assert!(response.starts_with("HTTP/1.1 403"), "response={response}");
-        assert!(response.contains("invalid_or_expired_token"));
+        assert!(response.contains("domain=authn"));
+        assert!(response.contains("common_code=credential_rejected"));
+        assert!(response.contains("module_code=agent_token_invalid"));
         assert!(!response.contains("anonymous_compat"));
+    }
+
+    #[test]
+    fn model_plane_terminal_exec_reports_disabled_token_subcode() {
+        let root = temp_dir("model-plane-disabled-token-subcode");
+        let mut settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example().replace("port = 19718", "port = 0"),
+        )
+        .expect("parse settings");
+        settings.model_plane.http.port = 0;
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let scope = AgentTokenScopeView {
+            scope_profile: Some("strict-default".into()),
+            target_ids: vec!["local-ssh".into()],
+            tool_ids: vec!["terminal.exec".into()],
+            max_risk_envelope: Some("allow-low".into()),
+            allow_open_shell: Some(true),
+            allow_write_shell_input: Some(true),
+            allow_artifact_cross_principal: Some(false),
+            allow_delegation: Some(false),
+            allow_admin_actions: Some(false),
+        };
+        let attestation_id =
+            create_token_attestation_id(&mut runtime, "disabled-token", None, scope.clone());
+        let created = runtime.handle_app_request(ApiRequest {
+            request_id: "token-create-disabled".into(),
+            context: request_context(),
+            command: AppCommand::CreateAgentToken {
+                label: "disabled-token".into(),
+                expires_in_seconds: None,
+                scope,
+                attestation_id: Some(attestation_id),
+            },
+        });
+        let (token, token_id) = match created {
+            ApiResponse::AgentTokenCreated { result, .. } => {
+                (result.plaintext_token, result.summary.token_id)
+            }
+            other => panic!("unexpected token create response: {other:?}"),
+        };
+        runtime
+            .vault_router
+            .update_agent_token_access(UpdateAgentTokenAccessRequest {
+                token_id,
+                enabled: false,
+                changed_by: "control-plane:ui-agent:ui-run:ui-client".into(),
+            })
+            .expect("disable token");
+
+        let shared = runtime.shared();
+        let server = ModelPlaneHttpServer::bind(shared, &settings).expect("bind model-plane");
+        let addr = server.local_addr().expect("local addr");
+        let serve_thread = thread::spawn(move || server.serve_once().expect("serve once"));
+
+        let body = "agent_id=agent-mcp|run_id=run-mcp|client_session_id=client-mcp|reuse_policy=reuse_if_alive|target_id=local-ssh|command=echo";
+        let request = format!(
+            "POST /tool/terminal.exec HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).expect("connect model-plane");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        serve_thread.join().expect("join serve thread");
+
+        assert!(response.starts_with("HTTP/1.1 403"), "response={response}");
+        assert!(response.contains("domain=authn"));
+        assert!(response.contains("common_code=credential_rejected"));
+        assert!(response.contains("module_code=agent_token_disabled"));
+    }
+
+    #[test]
+    fn model_plane_terminal_exec_reports_revoked_token_subcode() {
+        let root = temp_dir("model-plane-revoked-token-subcode");
+        let mut settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example().replace("port = 19718", "port = 0"),
+        )
+        .expect("parse settings");
+        settings.model_plane.http.port = 0;
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let scope = AgentTokenScopeView {
+            scope_profile: Some("strict-default".into()),
+            target_ids: vec!["local-ssh".into()],
+            tool_ids: vec!["terminal.exec".into()],
+            max_risk_envelope: Some("allow-low".into()),
+            allow_open_shell: Some(true),
+            allow_write_shell_input: Some(true),
+            allow_artifact_cross_principal: Some(false),
+            allow_delegation: Some(false),
+            allow_admin_actions: Some(false),
+        };
+        let attestation_id =
+            create_token_attestation_id(&mut runtime, "revoked-token", None, scope.clone());
+        let created = runtime.handle_app_request(ApiRequest {
+            request_id: "token-create-revoked".into(),
+            context: request_context(),
+            command: AppCommand::CreateAgentToken {
+                label: "revoked-token".into(),
+                expires_in_seconds: None,
+                scope,
+                attestation_id: Some(attestation_id),
+            },
+        });
+        let (token, token_id) = match created {
+            ApiResponse::AgentTokenCreated { result, .. } => {
+                (result.plaintext_token, result.summary.token_id)
+            }
+            other => panic!("unexpected token create response: {other:?}"),
+        };
+        runtime
+            .vault_router
+            .revoke_agent_token(&token_id, Some("test revoke".into()))
+            .expect("revoke token");
+
+        let shared = runtime.shared();
+        let server = ModelPlaneHttpServer::bind(shared, &settings).expect("bind model-plane");
+        let addr = server.local_addr().expect("local addr");
+        let serve_thread = thread::spawn(move || server.serve_once().expect("serve once"));
+
+        let body = "agent_id=agent-mcp|run_id=run-mcp|client_session_id=client-mcp|reuse_policy=reuse_if_alive|target_id=local-ssh|command=echo";
+        let request = format!(
+            "POST /tool/terminal.exec HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).expect("connect model-plane");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        serve_thread.join().expect("join serve thread");
+
+        assert!(response.starts_with("HTTP/1.1 403"), "response={response}");
+        assert!(response.contains("domain=authn"));
+        assert!(response.contains("common_code=credential_rejected"));
+        assert!(response.contains("module_code=agent_token_revoked"));
+    }
+
+    #[test]
+    fn model_plane_terminal_exec_reports_expired_token_subcode() {
+        let root = temp_dir("model-plane-expired-token-subcode");
+        let mut settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example().replace("port = 19718", "port = 0"),
+        )
+        .expect("parse settings");
+        settings.model_plane.http.port = 0;
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings.clone(), resolver).expect("runtime");
+        let scope = AgentTokenScopeView {
+            scope_profile: Some("strict-default".into()),
+            target_ids: vec!["local-ssh".into()],
+            tool_ids: vec!["terminal.exec".into()],
+            max_risk_envelope: Some("allow-low".into()),
+            allow_open_shell: Some(true),
+            allow_write_shell_input: Some(true),
+            allow_artifact_cross_principal: Some(false),
+            allow_delegation: Some(false),
+            allow_admin_actions: Some(false),
+        };
+        let attestation_id = create_token_attestation_id(
+            &mut runtime,
+            "expired-token",
+            Some(1),
+            scope.clone(),
+        );
+        let created = runtime.handle_app_request(ApiRequest {
+            request_id: "token-create-expired".into(),
+            context: request_context(),
+            command: AppCommand::CreateAgentToken {
+                label: "expired-token".into(),
+                expires_in_seconds: Some(1),
+                scope,
+                attestation_id: Some(attestation_id),
+            },
+        });
+        let token = match created {
+            ApiResponse::AgentTokenCreated { result, .. } => result.plaintext_token,
+            other => panic!("unexpected token create response: {other:?}"),
+        };
+        std::thread::sleep(Duration::from_secs(2));
+
+        let shared = runtime.shared();
+        let server = ModelPlaneHttpServer::bind(shared, &settings).expect("bind model-plane");
+        let addr = server.local_addr().expect("local addr");
+        let serve_thread = thread::spawn(move || server.serve_once().expect("serve once"));
+
+        let body = "agent_id=agent-mcp|run_id=run-mcp|client_session_id=client-mcp|reuse_policy=reuse_if_alive|target_id=local-ssh|command=echo";
+        let request = format!(
+            "POST /tool/terminal.exec HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).expect("connect model-plane");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        serve_thread.join().expect("join serve thread");
+
+        assert!(response.starts_with("HTTP/1.1 403"), "response={response}");
+        assert!(response.contains("domain=authn"));
+        assert!(response.contains("common_code=credential_rejected"));
+        assert!(response.contains("module_code=agent_token_expired"));
     }
 
     #[test]

@@ -52,6 +52,7 @@ impl ContractStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommonErrorCode {
+    CredentialRejected,
     NotFound,
     PermissionDenied,
     ValidationFailed,
@@ -68,6 +69,7 @@ pub enum CommonErrorCode {
 impl CommonErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::CredentialRejected => "credential_rejected",
             Self::NotFound => "not_found",
             Self::PermissionDenied => "permission_denied",
             Self::ValidationFailed => "validation_failed",
@@ -84,6 +86,7 @@ impl CommonErrorCode {
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "credential_rejected" | "credentialrejected" => Some(Self::CredentialRejected),
             "not_found" | "notfound" => Some(Self::NotFound),
             "permission_denied" | "permissiondenied" => Some(Self::PermissionDenied),
             "validation_failed" | "validationfailed" => Some(Self::ValidationFailed),
@@ -104,6 +107,7 @@ impl CommonErrorCode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorDomain {
+    Authn,
     AppApi,
     ControlPlane,
     Mcp,
@@ -116,6 +120,7 @@ pub enum ErrorDomain {
 impl ErrorDomain {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Authn => "authn",
             Self::AppApi => "app_api",
             Self::ControlPlane => "control_plane",
             Self::Mcp => "mcp",
@@ -128,6 +133,7 @@ impl ErrorDomain {
 
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "authn" => Some(Self::Authn),
             "app_api" | "appapi" => Some(Self::AppApi),
             "control_plane" | "controlplane" => Some(Self::ControlPlane),
             "mcp" => Some(Self::Mcp),

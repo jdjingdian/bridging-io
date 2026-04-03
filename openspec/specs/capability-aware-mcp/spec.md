@@ -273,11 +273,11 @@ BridgingIO 的 agent access token 必须被建模为用户显式签发的访问�
 - **那么** 系统必须把对应 scope 字段持久化到 `TokenScopeRecord`，并在后续授权时据此判定，而不能退化为仅按 token 存在与否放行
 
 ### 需求:token 查询与管理返回必须使用安全投影而不是内部认证真相
-系统必须把 token 的内部认证真相与对本地管理面的展示结果分离。即使在本地受信任 control-plane 中，token 查询默认也只能返回安全投影，例如 `token_id`、label、scope 摘要、状态与时间戳，而不能返回明文 token、`token_hash`、内部 matcher cache、精确 network binding 或等价认证内部字段。普通 model-plane / MCP 请求不得把认证内部 record 作为调试信息回显给模型。
+系统必须把 token 的内部认证真相与对本地管理面的展示结果分离。即使在本地受信任 control-plane 中，token 查询默认也只能返回安全投影，例如 `token_id`、label、display-safe 的 token 指纹/摘要、scope 摘要、状态与时间戳，而不能返回明文 token、原始 `token_hash`、内部 matcher cache、精确 network binding 或等价认证内部字段。普通 model-plane / MCP 请求不得把认证内部 record 作为调试信息回显给模型。
 
-#### 场景:本地管理员查看 token 列表
-- **当** 本地受信任 control-plane 请求查看当前 token 列表或某个 token 的状态
-- **那么** 系统必须返回 display-safe summary，而不能再次展示明文 token，也不能输出 `token_hash` 等内部校验字段
+#### 场景:本地管理员查看 token 列表或详情
+- **当** 本地受信任 control-plane 请求查看当前 token 列表或某个 token 的详情
+- **那么** 系统必须返回 display-safe summary，并且若需要辅助人工识别 token，只能返回 display-safe 的指纹/摘要字段，而不能输出明文 token 或原始 `token_hash`
 
 #### 场景:已认证 agent 请求获取自身认证细节
 - **当** 某个已认证 agent 试图通过 model-plane 或普通 MCP tool 查看自身或其他 token 的内部认证记录
@@ -346,15 +346,19 @@ BridgingIO 的 agent access token 必须被建模为用户显式签发的访问�
 - **那么** 新 token 的 target 范围、tool 范围、风险边界和有效期都必须不超过父 token，且 revoke 父 token 后子 token 也必须失效
 
 ### 需求:agent token 生命周期必须单向收敛并级联收权
-系统必须把 agent token 设计成单向收敛的生命周期对象。token 只能从“尚未签发”进入 `active`，随后进入 `revoked` 或 `expired` 等终态；系统不得重新激活已失效 token。若 token 之间存在 delegation lineage，则父 token 失效时必须对仍处于活动态的子 token 一致施加级联收权。
+系统必须把 agent token 设计成“单向终态 + 可逆启停”的组合生命周期对象。token 在签发后进入可访问态，并且在未 `revoked`、`expired` 或 `deleted` 时允许本地受信任管理面临时切换为 `disabled` 或等价的不可访问状态；`revoked`、`expired` 与 `deleted` 仍属于不可重新激活的收敛终态。系统不得通过 enable/disable 开关让已过期或已撤销 token 恢复可用。若 token 之间存在 delegation lineage，则父 token 进入失效终态时必须对仍处于可访问态或 `disabled` 管理态的子 token 一致施加级联收权。
 
-#### 场景:token 到期后不得恢复使用
-- **当** 某个 token 因绝对 TTL 或 idle timeout 进入 expired 状态
-- **那么** 系统必须拒绝继续使用该 token，并要求重新签发新 token，而不能把旧 token 重新激活
+#### 场景:token 被禁用后不得继续使用
+- **当** 某个 token 被本地受信任管理面切换为 `disabled`
+- **那么** 系统必须拒绝继续使用该 token，直到其被重新启用或进入其他终态
+
+#### 场景:禁用 token 到期后不得因重新启用而复活
+- **当** 某个 token 在 `disabled` 状态下到达 TTL 或 idle timeout 并进入 `expired`
+- **那么** 系统不得因本地管理面后来重新启用该 token 而把它恢复为可访问状态
 
 #### 场景:父 token 收权后子 token 级联失效
-- **当** 某个允许 delegation 的父 token 被 revoke 或因策略进入失效状态
-- **那么** 仍处于活动态的子 token 必须级联失效，并在后续访问中被一致拒绝
+- **当** 某个允许 delegation 的父 token 被 revoke 或因策略进入失效终态
+- **那么** 仍处于可访问态或 `disabled` 管理态的子 token 必须级联失效，并在后续访问中被一致拒绝
 
 ### 需求:认证后的 principal 必须从凭证派生，而不是信任请求体自报身份
 对 model-plane 或 MCP typed tools 的每次调用，系统都必须把 authenticated principal 视为真正的身份来源。请求体中的 `agent_id`、`run_id`、`client_session_id` 等字段只能作为调用标签或子上下文，不能单独决定权限，也不能覆盖 token 所绑定的 principal / scope。
@@ -480,4 +484,23 @@ BridgingIO 的 MCP 回包在出现参数错误、能力未就绪、方法未实�
 #### 场景:能力处于受控降级
 - **当** MCP 客户端调用的能力当前处于 `degraded` 或 `not_ready` 状态
 - **那么** 系统必须在回包中明确返回对应共享状态与恢复提示，而不是把该情况统一压扁为内部错误
+
+### 需求:bearer token 认证失败必须返回可区分的 token 拒绝原因
+当 model-plane 或 MCP typed tools 因 bearer token 认证失败而拒绝请求时，系统必须返回可区分的 token 拒绝原因，而不能继续把 `invalid`、`disabled`、`revoked`、`expired` 等不同情况压成单一的“无效 token”语义。该拒绝原因必须能够被 MCP 回包、审计记录和本地管理面一致消费，并与后续的 scope / policy 拒绝区分。
+
+#### 场景:disabled token 发起 MCP 请求
+- **当** 客户端显式携带一个处于 `disabled` 管理状态的 bearer token 调用 model-plane 或 MCP typed tool
+- **那么** 系统必须在 `authn` 阶段直接拒绝该请求，并返回等价于 `token_disabled` 的稳定拒绝原因
+
+#### 场景:revoked token 发起 MCP 请求
+- **当** 客户端显式携带一个已被 `revoked` 的 bearer token 调用 model-plane 或 MCP typed tool
+- **那么** 系统必须在 `authn` 阶段直接拒绝该请求，并返回等价于 `token_revoked` 的稳定拒绝原因
+
+#### 场景:expired token 发起 MCP 请求
+- **当** 客户端显式携带一个已过期的 bearer token 调用 model-plane 或 MCP typed tool
+- **那么** 系统必须在 `authn` 阶段直接拒绝该请求，并返回等价于 `token_expired` 的稳定拒绝原因
+
+#### 场景:未知 token 发起 MCP 请求
+- **当** 客户端显式携带一个不存在或无法匹配的 bearer token 调用 model-plane 或 MCP typed tool
+- **那么** 系统必须在 `authn` 阶段直接拒绝该请求，并返回等价于 `token_invalid` 的稳定拒绝原因
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -306,6 +306,7 @@ pub struct SecretRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentTokenStatus {
     Active,
+    Disabled,
     Revoked,
     Expired,
     Deleted,
@@ -315,6 +316,7 @@ impl AgentTokenStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Active => "active",
+            Self::Disabled => "disabled",
             Self::Revoked => "revoked",
             Self::Expired => "expired",
             Self::Deleted => "deleted",
@@ -334,6 +336,7 @@ pub struct AgentTokenRecord {
     pub principal_id: String,
     pub label: String,
     pub status: AgentTokenStatus,
+    pub access_enabled: bool,
     pub token_hash: String,
     pub hash_scheme: String,
     pub scope_profile: String,
@@ -374,6 +377,7 @@ pub struct TokenScopeRecord {
 pub struct AgentTokenSummary {
     pub token_id: String,
     pub label: String,
+    pub token_fingerprint: String,
     pub principal_summary: String,
     pub status: AgentTokenStatus,
     pub scope_profile: String,
@@ -434,6 +438,13 @@ pub struct UpdateAgentTokenLabelRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateAgentTokenAccessRequest {
+    pub token_id: String,
+    pub enabled: bool,
+    pub changed_by: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnlockVaultRequest {
     pub method: String,
     pub passphrase: Option<String>,
@@ -468,6 +479,49 @@ pub struct AuthenticatedAgentToken {
     pub allow_artifact_cross_principal: bool,
     pub allow_delegation: bool,
     pub allow_admin_actions: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTokenAuthRejectReason {
+    Invalid,
+    Disabled,
+    Revoked,
+    Expired,
+}
+
+impl AgentTokenAuthRejectReason {
+    pub fn module_code(self) -> &'static str {
+        match self {
+            Self::Invalid => "agent_token_invalid",
+            Self::Disabled => "agent_token_disabled",
+            Self::Revoked => "agent_token_revoked",
+            Self::Expired => "agent_token_expired",
+        }
+    }
+
+    pub fn display_message(self) -> &'static str {
+        match self {
+            Self::Invalid => "Bearer token is invalid.",
+            Self::Disabled => "Bearer token is disabled by local operator policy.",
+            Self::Revoked => "Bearer token has been revoked.",
+            Self::Expired => "Bearer token has expired.",
+        }
+    }
+
+    pub fn recovery_hint(self) -> &'static str {
+        match self {
+            Self::Invalid => "Use a valid bearer token and retry.",
+            Self::Disabled => "Ask a local operator to re-enable this token or issue a new one.",
+            Self::Revoked => "Issue a new token from a trusted local management surface.",
+            Self::Expired => "Issue a fresh token and retry the request.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentTokenAuthResult {
+    Authenticated(AuthenticatedAgentToken),
+    Rejected(AgentTokenAuthRejectReason),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1369,6 +1423,8 @@ struct PersistedAgentTokenRecordV2 {
     principal_id: String,
     label: String,
     status: AgentTokenStatus,
+    #[serde(default = "default_agent_token_access_enabled")]
+    access_enabled: bool,
     token_hash: String,
     hash_scheme: String,
     scope_profile: String,
@@ -1532,6 +1588,10 @@ fn default_persisted_lock_state() -> VaultLockState {
 
 fn default_clock_watermark_unix_sec() -> u64 {
     0
+}
+
+fn default_agent_token_access_enabled() -> bool {
+    true
 }
 
 fn default_persisted_unlock_policy() -> PersistedVaultUnlockPolicyV2 {
@@ -2124,12 +2184,7 @@ impl SecretVaultRouter {
         &mut self,
         request: CreateAgentTokenRequest,
     ) -> Result<CreateAgentTokenResult, VaultError> {
-        let label = request.label.trim();
-        if label.is_empty() {
-            return Err(VaultError::AgentTokenRejected(
-                "token label must be non-empty".into(),
-            ));
-        }
+        let label = normalize_agent_token_label_for_write(&request.label)?;
         let created_by = request.created_by.trim();
         if created_by.is_empty() {
             return Err(VaultError::AgentTokenRejected(
@@ -2195,8 +2250,9 @@ impl SecretVaultRouter {
             AgentTokenRecord {
                 token_id: token_id.clone(),
                 principal_id,
-                label: label.to_string(),
+                label: label.clone(),
                 status: AgentTokenStatus::Active,
+                access_enabled: true,
                 token_hash,
                 hash_scheme: "siphash-64".into(),
                 scope_profile: scope_profile.clone(),
@@ -2348,10 +2404,38 @@ impl SecretVaultRouter {
                 "changed_by principal must be non-empty".into(),
             ));
         }
-        let label = request.label.trim();
-        if label.is_empty() {
+        let label = normalize_agent_token_label_for_write(&request.label)?;
+        let (now, _) = self.token_effective_now();
+        let token = self
+            .agent_tokens
+            .get_mut(token_id)
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))?;
+        refresh_agent_token_status(token, now);
+        if matches!(agent_token_projected_status(token), AgentTokenStatus::Deleted) {
             return Err(VaultError::AgentTokenRejected(
-                "token label must be non-empty".into(),
+                "cannot update label for a deleted token".into(),
+            ));
+        }
+        token.label = label;
+        self.persist_metadata_db()?;
+        self.agent_token_summary_with_now(token_id, now)?
+            .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))
+    }
+
+    pub fn update_agent_token_access(
+        &mut self,
+        request: UpdateAgentTokenAccessRequest,
+    ) -> Result<AgentTokenSummary, VaultError> {
+        let token_id = request.token_id.trim();
+        if token_id.is_empty() {
+            return Err(VaultError::AgentTokenRejected(
+                "token_id must be non-empty".into(),
+            ));
+        }
+        let changed_by = request.changed_by.trim();
+        if changed_by.is_empty() {
+            return Err(VaultError::AgentTokenRejected(
+                "changed_by principal must be non-empty".into(),
             ));
         }
         let (now, _) = self.token_effective_now();
@@ -2360,12 +2444,18 @@ impl SecretVaultRouter {
             .get_mut(token_id)
             .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))?;
         refresh_agent_token_status(token, now);
-        if matches!(token.status, AgentTokenStatus::Deleted) {
-            return Err(VaultError::AgentTokenRejected(
-                "cannot update label for a deleted token".into(),
-            ));
+        match agent_token_projected_status(token) {
+            AgentTokenStatus::Active | AgentTokenStatus::Disabled => {
+                token.access_enabled = request.enabled;
+            }
+            AgentTokenStatus::Revoked | AgentTokenStatus::Expired | AgentTokenStatus::Deleted => {
+                return Err(VaultError::AgentTokenRejected(format!(
+                    "token {} cannot change access in status {}",
+                    token.token_id,
+                    agent_token_projected_status(token).as_str()
+                )));
+            }
         }
-        token.label = label.to_string();
         self.persist_metadata_db()?;
         self.agent_token_summary_with_now(token_id, now)?
             .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))
@@ -2435,7 +2525,7 @@ impl SecretVaultRouter {
                 .get_mut(&token_id)
                 .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.clone()))?;
             refresh_agent_token_status(token, now);
-            if !matches!(token.status, AgentTokenStatus::Active) {
+            if !matches!(agent_token_projected_status(token), AgentTokenStatus::Active) {
                 return Err(VaultError::AgentTokenRejected(format!(
                     "token {} is not active",
                     token.token_id
@@ -2463,7 +2553,7 @@ impl SecretVaultRouter {
             .get_mut(&token_id)
             .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.clone()))?;
         refresh_agent_token_status(token, now);
-        if !matches!(token.status, AgentTokenStatus::Active) {
+        if !matches!(agent_token_projected_status(token), AgentTokenStatus::Active) {
             return Err(VaultError::AgentTokenRejected(format!(
                 "token {} is not active",
                 token.token_id
@@ -2509,15 +2599,31 @@ impl SecretVaultRouter {
             .ok_or_else(|| VaultError::AgentTokenNotFound(token_id))
     }
 
-    pub fn authenticate_agent_token(&mut self, token: &str) -> Option<AuthenticatedAgentToken> {
+    pub fn authenticate_agent_token(&mut self, token: &str) -> AgentTokenAuthResult {
         let token_hash = short_digest(token.as_bytes());
-        let token_id = self.token_hash_index.get(&token_hash)?.clone();
+        let Some(token_id) = self.token_hash_index.get(&token_hash).cloned() else {
+            return AgentTokenAuthResult::Rejected(AgentTokenAuthRejectReason::Invalid);
+        };
         let (now, _) = self.token_effective_now();
         let (label, principal_id, active_scope_version, scope_profile) = {
-            let record = self.agent_tokens.get_mut(&token_id)?;
+            let Some(record) = self.agent_tokens.get_mut(&token_id) else {
+                return AgentTokenAuthResult::Rejected(AgentTokenAuthRejectReason::Invalid);
+            };
             refresh_agent_token_status(record, now);
-            if !matches!(record.status, AgentTokenStatus::Active) {
-                return None;
+            match agent_token_projected_status(record) {
+                AgentTokenStatus::Active => {}
+                AgentTokenStatus::Disabled => {
+                    return AgentTokenAuthResult::Rejected(AgentTokenAuthRejectReason::Disabled)
+                }
+                AgentTokenStatus::Revoked => {
+                    return AgentTokenAuthResult::Rejected(AgentTokenAuthRejectReason::Revoked)
+                }
+                AgentTokenStatus::Expired => {
+                    return AgentTokenAuthResult::Rejected(AgentTokenAuthRejectReason::Expired)
+                }
+                AgentTokenStatus::Deleted => {
+                    return AgentTokenAuthResult::Rejected(AgentTokenAuthRejectReason::Invalid)
+                }
             }
             record.last_used_at = Some(now);
             (
@@ -2527,10 +2633,13 @@ impl SecretVaultRouter {
                 record.scope_profile.clone(),
             )
         };
-        let scope = self
-            .scope_for_version(&token_id, active_scope_version)?
-            .clone();
-        Some(AuthenticatedAgentToken {
+        let Some(scope) = self
+            .scope_for_version(&token_id, active_scope_version)
+            .cloned()
+        else {
+            return AgentTokenAuthResult::Rejected(AgentTokenAuthRejectReason::Invalid);
+        };
+        AgentTokenAuthResult::Authenticated(AuthenticatedAgentToken {
             token_id,
             label,
             principal_id,
@@ -2624,11 +2733,14 @@ impl SecretVaultRouter {
         let scope = self
             .scope_for_version(token_id, record.active_scope_version)
             .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))?;
+        let status = agent_token_projected_status(&record);
+        let token_fingerprint = agent_token_display_fingerprint(&record);
         Ok(Some(AgentTokenSummary {
             token_id: record.token_id,
             label: record.label,
+            token_fingerprint,
             principal_summary: record.principal_id,
-            status: record.status,
+            status,
             scope_profile: record.scope_profile,
             target_scope_summary: format!("targets:{}", scope.target_ids.len()),
             active_scope_version: record.active_scope_version,
@@ -4200,13 +4312,20 @@ impl SecretVaultRouter {
         self.agent_tokens = agent_tokens
             .into_iter()
             .map(|record| {
+                let (status, access_enabled) = if matches!(record.status, AgentTokenStatus::Disabled)
+                {
+                    (AgentTokenStatus::Active, false)
+                } else {
+                    (record.status.clone(), record.access_enabled)
+                };
                 (
                     record.token_id.clone(),
                     AgentTokenRecord {
                         token_id: record.token_id,
                         principal_id: record.principal_id,
                         label: record.label,
-                        status: record.status,
+                        status,
+                        access_enabled,
                         token_hash: record.token_hash,
                         hash_scheme: record.hash_scheme,
                         scope_profile: record.scope_profile,
@@ -4255,6 +4374,7 @@ impl SecretVaultRouter {
         self.token_hash_index = self
             .agent_tokens
             .iter()
+            .filter(|(_, token)| !matches!(agent_token_projected_status(token), AgentTokenStatus::Deleted))
             .map(|(token_id, token)| (token.token_hash.clone(), token_id.clone()))
             .collect();
         self.intents = intents
@@ -4715,6 +4835,7 @@ impl SecretVaultRouter {
                     principal_id: token.principal_id,
                     label: token.label,
                     status: token.status,
+                    access_enabled: token.access_enabled,
                     token_hash: token.token_hash,
                     hash_scheme: token.hash_scheme,
                     scope_profile: token.scope_profile,
@@ -4812,6 +4933,65 @@ fn refresh_agent_token_status(record: &mut AgentTokenRecord, now: SystemTime) {
     {
         record.status = AgentTokenStatus::Expired;
     }
+}
+
+fn agent_token_projected_status(record: &AgentTokenRecord) -> AgentTokenStatus {
+    if matches!(record.status, AgentTokenStatus::Deleted) {
+        return AgentTokenStatus::Deleted;
+    }
+    if matches!(record.status, AgentTokenStatus::Revoked) {
+        return AgentTokenStatus::Revoked;
+    }
+    if matches!(record.status, AgentTokenStatus::Expired) {
+        return AgentTokenStatus::Expired;
+    }
+    if !record.access_enabled {
+        return AgentTokenStatus::Disabled;
+    }
+    AgentTokenStatus::Active
+}
+
+fn normalize_agent_token_label_for_write(raw: &str) -> Result<String, VaultError> {
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return Err(VaultError::AgentTokenRejected(
+            "token label must be non-empty".into(),
+        ));
+    }
+    if candidate.len() > 64 {
+        return Err(VaultError::AgentTokenRejected(
+            "token label must be <= 64 ASCII characters".into(),
+        ));
+    }
+    if !is_valid_agent_token_label(candidate) {
+        return Err(VaultError::AgentTokenRejected(
+            "token label must match [A-Za-z0-9]+([-_][A-Za-z0-9]+)* without spaces".into(),
+        ));
+    }
+    Ok(candidate.to_string())
+}
+
+fn is_valid_agent_token_label(value: &str) -> bool {
+    let mut prev_separator = false;
+    let mut seen_any = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            seen_any = true;
+            prev_separator = false;
+            continue;
+        }
+        if (ch == '-' || ch == '_') && seen_any && !prev_separator {
+            prev_separator = true;
+            continue;
+        }
+        return false;
+    }
+    seen_any && !prev_separator
+}
+
+fn agent_token_display_fingerprint(record: &AgentTokenRecord) -> String {
+    let digest = short_digest(format!("{}:{}", record.token_id, record.token_hash).as_bytes());
+    format!("fp-{}", &digest[..12.min(digest.len())])
 }
 
 fn normalized_scope_profile(value: Option<&str>, fallback: Option<&str>) -> String {
@@ -5378,21 +5558,58 @@ const OS_NATIVE_PROTECTOR_SERVICE: &str = "io.bridgingio.vault";
 const OS_NATIVE_PROTECTOR_ACCOUNT: &str = "os-native-protector-kek-v1";
 const OS_NATIVE_VERIFIED_TIMEOUT_SECS: u64 = 120;
 static OS_NATIVE_PROTECTOR_KEK_CACHE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+static OS_NATIVE_VERIFIED_KEK_CACHE: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
 
 fn os_native_platform_binding_ready() -> bool {
-    os_native_protector_kek().is_some()
+    // Readiness reporting must be side-effect free: do not touch keyring here,
+    // otherwise diagnostics can trigger interactive system authorization prompts.
+    os_native_platform_binding_supported()
+}
+
+fn os_native_platform_binding_supported() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        !env_flag_enabled("BRIDGINGIO_DISABLE_OS_NATIVE_KEYRING")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+fn verified_os_native_kek_cache() -> &'static Mutex<Option<Vec<u8>>> {
+    OS_NATIVE_VERIFIED_KEK_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_verified_os_native_kek() -> Option<Vec<u8>> {
+    verified_os_native_kek_cache()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn cache_verified_os_native_kek(kek: Option<Vec<u8>>) {
+    if let Ok(mut guard) = verified_os_native_kek_cache().lock() {
+        *guard = kek;
+    }
 }
 
 fn os_native_protector_kek() -> Option<Vec<u8>> {
+    if let Some(cached) = cached_verified_os_native_kek() {
+        return Some(cached);
+    }
     OS_NATIVE_PROTECTOR_KEK_CACHE
         .get_or_init(os_native_protector_kek_inner)
         .clone()
 }
 
 fn os_native_protector_kek_verified() -> Option<Vec<u8>> {
+    if let Some(cached) = cached_verified_os_native_kek() {
+        return Some(cached);
+    }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        if env_flag_enabled("BRIDGINGIO_DISABLE_OS_NATIVE_KEYRING") {
+        if !os_native_platform_binding_supported() {
             return None;
         }
         let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(1);
@@ -5404,10 +5621,12 @@ fn os_native_protector_kek_verified() -> Option<Vec<u8>> {
         if spawned.is_err() {
             return None;
         }
-        match rx.recv_timeout(Duration::from_secs(OS_NATIVE_VERIFIED_TIMEOUT_SECS)) {
+        let value = match rx.recv_timeout(Duration::from_secs(OS_NATIVE_VERIFIED_TIMEOUT_SECS)) {
             Ok(value) => value,
             Err(_) => None,
-        }
+        };
+        cache_verified_os_native_kek(value.clone());
+        value
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -5418,7 +5637,7 @@ fn os_native_protector_kek_verified() -> Option<Vec<u8>> {
 fn os_native_protector_kek_inner() -> Option<Vec<u8>> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        if env_flag_enabled("BRIDGINGIO_DISABLE_OS_NATIVE_KEYRING") {
+        if !os_native_platform_binding_supported() {
             return None;
         }
         let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(1);
@@ -5574,9 +5793,10 @@ fn unix_secs_to_system_time(value: u64) -> SystemTime {
 mod tests {
     use super::{
         command_audit_preview, normalize_credential_ref, read_passive_vault_projection,
-        AgentTokenStatus, CreateAgentTokenRequest, DeleteAgentTokenRequest, DeleteVaultRequest,
-        LocalAdminActionKind, SecretBytes, SecretVaultRouter, SshAgentBrokerPrepareRequest,
-        SshAgentBrokerSessionState, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
+        AgentTokenAuthResult, AgentTokenStatus, CreateAgentTokenRequest, DeleteAgentTokenRequest,
+        DeleteVaultRequest, LocalAdminActionKind, SecretBytes, SecretVaultRouter,
+        SshAgentBrokerPrepareRequest, SshAgentBrokerSessionState, SshHostKeyPolicy,
+        SshKeyPassphraseHandling, TokenScopeInput, UpdateAgentTokenAccessRequest,
         UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
         VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
     };
@@ -6297,9 +6517,10 @@ mod tests {
         let listed = router.list_agent_tokens();
         assert_eq!(listed.len(), 1);
         assert_ne!(listed[0].token_id, created.plaintext_token);
-        assert!(router
-            .authenticate_agent_token(&created.plaintext_token)
-            .is_some());
+        assert!(matches!(
+            router.authenticate_agent_token(&created.plaintext_token),
+            AgentTokenAuthResult::Authenticated(_)
+        ));
     }
 
     #[test]
@@ -6527,9 +6748,10 @@ mod tests {
         request.attestation_id = Some(mint_create_token_attestation(&mut router, &request));
         let created = router.create_agent_token(request).expect("create token");
         std::thread::sleep(Duration::from_millis(5));
-        assert!(router
-            .authenticate_agent_token(&created.plaintext_token)
-            .is_none());
+        assert!(matches!(
+            router.authenticate_agent_token(&created.plaintext_token),
+            AgentTokenAuthResult::Rejected(_)
+        ));
         let listed = router.list_agent_tokens();
         assert_eq!(listed[0].status, AgentTokenStatus::Expired);
     }
@@ -6645,6 +6867,162 @@ mod tests {
             update_deleted,
             Err(VaultError::AgentTokenRejected(_))
         ));
+    }
+
+    #[test]
+    fn token_label_write_contract_enforces_ascii_separator_rules_and_keeps_legacy_readable() {
+        let mut router = SecretVaultRouter::default();
+        let mut create_request = CreateAgentTokenRequest {
+            label: "test_tok".into(),
+            created_by: "local-operator".into(),
+            expires_in: None,
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: Some("strict-default".into()),
+                target_ids: vec!["target-a".into()],
+                tool_ids: Vec::new(),
+                max_risk_envelope: None,
+                allow_open_shell: None,
+                allow_write_shell_input: None,
+                allow_artifact_cross_principal: None,
+                allow_delegation: None,
+                allow_admin_actions: None,
+            },
+            attestation_id: None,
+        };
+        create_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &create_request));
+        let created = router
+            .create_agent_token(create_request)
+            .expect("create token");
+
+        let invalid_update = router.update_agent_token_label(UpdateAgentTokenLabelRequest {
+            token_id: created.summary.token_id.clone(),
+            label: "bad label".into(),
+            changed_by: "local-operator".into(),
+        });
+        assert!(matches!(
+            invalid_update,
+            Err(VaultError::AgentTokenRejected(_))
+        ));
+
+        router
+            .agent_tokens
+            .get_mut(&created.summary.token_id)
+            .expect("token exists")
+            .label = "legacy label with spaces".into();
+        let listed = router.list_agent_tokens();
+        assert_eq!(listed[0].label, "legacy label with spaces");
+
+        let valid_update = router
+            .update_agent_token_label(UpdateAgentTokenLabelRequest {
+                token_id: created.summary.token_id,
+                label: "legacy_fixed".into(),
+                changed_by: "local-operator".into(),
+            })
+            .expect("valid update");
+        assert_eq!(valid_update.label, "legacy_fixed");
+    }
+
+    #[test]
+    fn token_access_toggle_supports_disabled_projection_but_not_terminal_reactivation() {
+        let mut router = SecretVaultRouter::default();
+        let mut create_request = CreateAgentTokenRequest {
+            label: "toggle-access".into(),
+            created_by: "local-operator".into(),
+            expires_in: None,
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: Some("strict-default".into()),
+                target_ids: vec!["target-a".into()],
+                tool_ids: vec!["terminal.exec".into()],
+                max_risk_envelope: Some("allow-low".into()),
+                allow_open_shell: Some(true),
+                allow_write_shell_input: Some(true),
+                allow_artifact_cross_principal: Some(false),
+                allow_delegation: Some(false),
+                allow_admin_actions: Some(false),
+            },
+            attestation_id: None,
+        };
+        create_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &create_request));
+        let created = router
+            .create_agent_token(create_request)
+            .expect("create token");
+
+        let disabled = router
+            .update_agent_token_access(UpdateAgentTokenAccessRequest {
+                token_id: created.summary.token_id.clone(),
+                enabled: false,
+                changed_by: "local-operator".into(),
+            })
+            .expect("disable token");
+        assert_eq!(disabled.status, AgentTokenStatus::Disabled);
+        assert!(matches!(
+            router.authenticate_agent_token(&created.plaintext_token),
+            AgentTokenAuthResult::Rejected(_)
+        ));
+
+        let enabled = router
+            .update_agent_token_access(UpdateAgentTokenAccessRequest {
+                token_id: created.summary.token_id.clone(),
+                enabled: true,
+                changed_by: "local-operator".into(),
+            })
+            .expect("enable token");
+        assert_eq!(enabled.status, AgentTokenStatus::Active);
+        assert!(matches!(
+            router.authenticate_agent_token(&created.plaintext_token),
+            AgentTokenAuthResult::Authenticated(_)
+        ));
+
+        let mut expiring_request = CreateAgentTokenRequest {
+            label: "toggle-access-expiring".into(),
+            created_by: "local-operator".into(),
+            expires_in: Some(Duration::from_millis(1)),
+            idle_timeout_sec: None,
+            scope: TokenScopeInput {
+                scope_profile: Some("strict-default".into()),
+                target_ids: vec!["target-a".into()],
+                tool_ids: Vec::new(),
+                max_risk_envelope: None,
+                allow_open_shell: None,
+                allow_write_shell_input: None,
+                allow_artifact_cross_principal: None,
+                allow_delegation: None,
+                allow_admin_actions: None,
+            },
+            attestation_id: None,
+        };
+        expiring_request.attestation_id =
+            Some(mint_create_token_attestation(&mut router, &expiring_request));
+        let expiring = router
+            .create_agent_token(expiring_request)
+            .expect("create expiring token");
+        router
+            .update_agent_token_access(UpdateAgentTokenAccessRequest {
+                token_id: expiring.summary.token_id.clone(),
+                enabled: false,
+                changed_by: "local-operator".into(),
+            })
+            .expect("disable expiring token");
+        std::thread::sleep(Duration::from_millis(5));
+        let cannot_reactivate = router.update_agent_token_access(UpdateAgentTokenAccessRequest {
+            token_id: expiring.summary.token_id.clone(),
+            enabled: true,
+            changed_by: "local-operator".into(),
+        });
+        assert!(matches!(
+            cannot_reactivate,
+            Err(VaultError::AgentTokenRejected(_))
+        ));
+        let listed = router.list_agent_tokens();
+        let expiring_summary = listed
+            .iter()
+            .find(|item| item.token_id == expiring.summary.token_id)
+            .expect("expiring token listed");
+        assert_eq!(expiring_summary.status, AgentTokenStatus::Expired);
     }
 
     #[test]
