@@ -960,12 +960,7 @@ impl MenuConfigApp {
 
     fn move_selection(&mut self, delta: isize) {
         let total = self.entries().len();
-        if total == 0 {
-            self.selected = 0;
-            return;
-        }
-        let next = self.selected as isize + delta;
-        self.selected = next.clamp(0, total.saturating_sub(1) as isize) as usize;
+        self.selected = wrap_selection_index(self.selected, delta, total);
     }
 
     fn select_field(&mut self, field: &str) {
@@ -1079,6 +1074,16 @@ fn selected_highlight_style(mode: SelectionHighlightMode) -> Style {
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::UNDERLINED),
     }
+}
+
+fn wrap_selection_index(current: usize, delta: isize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let total_i128 = total as i128;
+    let current_i128 = current.min(total.saturating_sub(1)) as i128;
+    let next = (current_i128 + delta as i128).rem_euclid(total_i128);
+    next as usize
 }
 
 fn menu_entry_style(state: MenuEntryVisualState, mode: SelectionHighlightMode) -> Style {
@@ -2630,6 +2635,57 @@ mod tests {
             super::menu_entry_visual_state(app.selected, 1, &entries[1]),
             super::MenuEntryVisualState::Selected
         );
+    }
+
+    #[test]
+    fn keyboard_navigation_wraps_from_first_item_to_last() {
+        let config_path = temp_config_path("selected-wrap-up");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Root;
+        app.selected = 0;
+
+        let total = app.entries().len();
+        assert!(total > 1);
+
+        app.move_selection(-1);
+        assert_eq!(app.selected, total - 1);
+    }
+
+    #[test]
+    fn keyboard_navigation_wraps_from_last_item_to_first() {
+        let config_path = temp_config_path("selected-wrap-down");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Root;
+
+        let total = app.entries().len();
+        assert!(total > 1);
+        app.selected = total - 1;
+
+        app.move_selection(1);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn keyboard_navigation_wraps_inside_submenu() {
+        let config_path = temp_config_path("selected-wrap-submenu");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Core;
+        app.selected = 0;
+
+        let total = app.entries().len();
+        assert!(total > 1);
+
+        app.move_selection(-1);
+        assert_eq!(app.selected, total - 1);
+        app.move_selection(1);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn wrap_selection_index_handles_empty_and_single_item_lists() {
+        assert_eq!(super::wrap_selection_index(7, 1, 0), 0);
+        assert_eq!(super::wrap_selection_index(0, 1, 1), 0);
+        assert_eq!(super::wrap_selection_index(0, -1, 1), 0);
     }
 
     #[test]
