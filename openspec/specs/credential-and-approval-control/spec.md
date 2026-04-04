@@ -24,6 +24,38 @@
 - **当** 用户为 standalone core 编写包含 SSH 目标的配置文件
 - **那么** 配置文件中必须只出现凭据引用、标签或导入提示，而不能包含可被模型或普通文件读取直接获取的私钥明文
 
+### 需求:vault 必须支持 `target-profile` 作为 sensitive target 的 authoritative secret kind
+BridgingIO 的 canonical vault 必须允许把 sensitive target 保存为专用的 `target-profile` secret kind，而不是继续只保存零散 overlay。该 secret 必须至少承载 `public_descriptor`、`sensitive_overlay` 与 `public_descriptor_digest`。
+
+#### 场景:保存 sensitive target
+- **当** 本地受信任管理面创建或更新一个 sensitive target
+- **那么** 系统必须把该 target 的 authoritative `target-profile` 写入 vault
+- **并且** 该写入对象必须同时包含 public descriptor 与 sensitive overlay，而不得只保存 digest 或零散敏感字段
+
+#### 场景:升级旧格式 sealed overlay
+- **当** 系统在 unlocked 状态下读取到旧格式 sealed overlay，且外层 public descriptor 仍可用
+- **那么** 系统必须允许把该对象升级为新的 `target-profile` secret 格式，以便后续 sensitive target 由 vault authoritative truth 驱动
+
+### 需求:受信任本地管理面必须能够以 display-safe 方式发现 `target-profile`
+vault 的 secret summary 与本地受信任管理面必须允许以 display-safe 方式发现 `target-profile` 对象，以支持 unlock 后 sensitive target reconcile。系统禁止把 `target-profile` 的 sensitive overlay 明文直接暴露给普通摘要列表、普通 MCP tool 或非受信任读取路径。
+
+#### 场景:本地管理面列出 target-profile 摘要
+- **当** 本地受信任管理面请求列出 vault 中的 secret summary
+- **那么** 系统必须允许其中包含 `target-profile` 的 reference、kind、label、status 与等价 display-safe 字段
+- **但是** 不得在该摘要列表中返回 connection、notes、credential_ref 或其他 sensitive overlay 内容
+
+#### 场景:普通读取路径请求 target-profile 内部内容
+- **当** 普通 MCP tool、普通摘要页或非受信任路径尝试读取某个 `target-profile` 的内部 payload
+- **那么** 系统必须拒绝该请求，或仅返回 display-safe 摘要，而不得直接暴露 `public_descriptor` 之外的 sensitive overlay
+
+### 需求:配置文件中 sensitive target 只允许保存 public cache
+对于 sensitive target，配置文件必须禁止持久化 host、username、selector、notes、policy、credential 引用或其他属于 sensitive overlay 的字段；`config.toml` 只允许保存该 target 的 public descriptor cache。
+
+#### 场景:用户手写包含 sensitive target 的 standalone 配置
+- **当** 用户为 standalone core 编写包含 sensitive target 的配置文件
+- **那么** 配置文件中必须只出现该 sensitive target 的 public descriptor cache
+- **并且** 不得继续把 host、selector、notes、policy 或 `credential_ref` 作为外层持久化字段写入 config
+
 ### 需求:高风险操作必须经过审批策略
 系统必须在执行写操作、删除操作、特权操作或策略标记为敏感的读取操作之前评估审批策略。若策略要求人工确认，系统必须先创建审批请求，再决定是否继续执行。
 
@@ -189,11 +221,17 @@ BridgingIO 必须通过规范化的加密保险库真相层管理敏感凭据，
 - **那么** 该 fallback 必须使用私有运行目录、严格文件权限、连接级生命周期清理与显式 degraded diagnostics，并且不得把私钥暴露给模型、Artifact 或常规日志
 
 ### 需求:受保护的 SSH key import 禁止把 key passphrase 重新带入运行时数据面
-系统必须确保：若系统允许导入 passphrase-protected 的 SSH 私钥，则该 passphrase 只能在本地受信任的导入或管理流程中使用。运行时的 SSH broker 或 connector 不得再要求远端 agent、普通 MCP tool 或常规运行链路提供该 key passphrase，且不得把其转写到 argv、prompt transcript、artifact 或日志中。
+系统必须确保：若系统允许导入 passphrase-protected 的 SSH 私钥，则该 passphrase 只能在本地受信任的导入或管理流程中使用。运行时的 SSH broker、connector、target 绑定 picker 或普通 MCP/tool 路径不得再要求该 passphrase，且不得把它转写到 argv、prompt transcript、artifact、menuconfig 状态文本或日志中。
 
-#### 场景:导入受 passphrase 保护的 OpenSSH 私钥
-- **当** 本地管理员导入一个带 passphrase 的 OpenSSH 私钥
-- **那么** 系统必须在本地受控流程中完成验证与 canonical 化，并使后续运行时连接能够通过 vault 保护下的 signer material 建立，而不是每次连接都再次暴露该 passphrase
+#### 场景:menuconfig 导入受 passphrase 保护的 OpenSSH 私钥
+- **当** 本地管理员通过 menuconfig 导入一个带 passphrase 的 OpenSSH 私钥
+- **那么** 系统必须在本地受控流程中完成该 passphrase 的输入与校验，并把导入结果写入 vault canonical secret
+- **并且** 后续运行时连接不得再次要求 target、agent 或普通工具知道该 passphrase
+
+#### 场景:SSH target 使用已导入的 encrypted key
+- **当** 某个 SSH target 绑定了一个曾在导入时处理过 passphrase 的 `ssh-private-key`
+- **那么** 运行时 SSH broker 只能消费 vault 保护下的 signer material
+- **并且** 不得退化为再次提示 key passphrase 或把其暴露给运行时数据面
 
 ### 需求:高风险保险库管理动作必须支持本地用户验证并兼容 passkey
 对于 vault 解锁、secret reveal / export、长期 agent token 签发、权限提升、敏感 secret rotation 或等价的高风险管理动作，系统必须要求本地用户验证。该验证机制在支持的平台上必须能够兼容 passkey / platform authenticator，而不是只依赖“当前 UI 已打开”或“调用来自本机”这类弱判断。
@@ -493,4 +531,64 @@ BridgingIO 在 vault、token、secret broker 和 approval 路径中对外暴露�
 #### 场景:钥匙串 ACL 要求额外确认时按平台行为处理
 - **当** macOS 钥匙串访问控制未将当前 `bridgingio-core` 可执行体标记为“始终允许”
 - **那么** 平台仍可能弹出一次“访问钥匙串中的密钥”确认；该提示属于平台 ACL 行为，系统应保持可预期且不重复触发
+
+### 需求:受信任本地管理面必须提供 `ssh-private-key` 的 canonical 导入与版本化语义
+系统必须允许本地受信任管理面把 SSH 私钥导入为 canonical `vault://<namespace>/ssh-private-key/<name>`。底层 secret 模型保留同一 canonical ref 的版本化能力；同时 menuconfig 操作面必须明确采用 delete-first 更新流程。导入结果必须只返回 display-safe 字段，不得回显私钥材料。
+
+#### 场景:以 key name 导入新的 ssh-private-key
+- **当** 本地管理面提交 `key name`、`label` 与私钥材料
+- **那么** 系统必须把该私钥保存为 canonical `ssh-private-key` secret，并返回 canonical `credential_ref`、`status` 与 `record id`
+- **并且** 不得返回私钥明文、密文 locator 或 unwrap material
+
+#### 场景:底层管理接口对同一 canonical ref 进行版本化导入
+- **当** 本地管理接口对同一 `key name` 再次导入 SSH 私钥
+- **那么** 系统必须在同一 secret record 下创建新 version 并更新 active version
+- **并且** 不得要求调用方改写 target 的 `credential_ref` URI
+
+#### 场景:menuconfig 对重复 key name 执行 delete-first 更新
+- **当** 操作员在 menuconfig 中使用同一 `key name` 重复导入 SSH 私钥
+- **那么** 系统必须拒绝本次导入并提示先删除旧 key
+- **并且** 更新 key 的正式操作路径是 `Delete SSH Key` 二次确认后重新导入
+
+### 需求:passphrase-protected OpenSSH key 必须在导入阶段通过受控本地输入处理
+对于加密 OpenSSH 私钥，系统必须在导入阶段通过受控本地 passphrase 输入完成校验。passphrase 仅允许在导入流程中使用，不得传播到运行时 SSH broker prompt、普通日志、普通状态栏或配置文件。
+
+#### 场景:导入加密 OpenSSH 私钥但未提供 passphrase
+- **当** 本地管理面尝试导入加密 OpenSSH 私钥，且未提供 passphrase
+- **那么** 系统必须拒绝导入并返回明确的 passphrase-required 语义
+
+#### 场景:运行时使用导入过的 SSH key
+- **当** SSH target 绑定了导入时已处理 passphrase 的 `ssh-private-key`
+- **那么** 运行时 SSH broker 必须继续禁止 runtime passphrase prompt，并仅消费 vault 中的 signer material
+
+### 需求:受信任本地管理面必须把 SSH 私钥导入建模为正式的 `ssh-private-key` import 流程
+BridgingIO 的受信任本地管理面必须允许把 SSH 私钥作为正式的 `ssh-private-key` secret family 导入 canonical vault，而不是继续只把它当作 generic text blob 或要求 target 侧手工拼接引用。该 import 流程必须输出稳定 canonical `vault://<namespace>/ssh-private-key/<name>` 引用；底层 secret 模型保留 version 记录能力，但 menuconfig 的默认运维流程应使用 delete-first 再导入更新 key。
+
+#### 场景:导入新的 SSH key
+- **当** 本地受信任管理面导入一个新的 SSH 私钥，并提供 `key name` 与等价 operator-facing label
+- **那么** 系统必须把该对象保存为 canonical `ssh-private-key` secret，并返回 canonical `credential_ref`
+- **并且** 后续 target 配置只能引用该 canonical ref，而不得保存私钥明文
+
+#### 场景:底层接口为同一 canonical ref 导入新版本
+- **当** 本地受信任管理接口为一个已存在的 `vault://.../ssh-private-key/<name>` 再次导入新的 SSH 私钥内容
+- **那么** 系统必须在同一 secret record 下创建新的 version，并更新 active version
+- **并且** 不得要求所有引用该 ref 的 target 改写为新的 URI
+
+#### 场景:menuconfig 默认执行 delete-first 更新
+- **当** 操作员在 menuconfig 中尝试用同一 `key name` 重复导入 SSH key
+- **那么** 系统必须拒绝重复导入并提示先删除旧 key
+- **并且** 详情页应提供 `Delete SSH Key` 二次确认流程，供操作员删除后重新导入
+
+### 需求:SSH key import 的 display-safe metadata 与 secret material 必须分层处理
+SSH key import 必须把 operator-facing metadata 与实际 secret material 分层处理。`key name`、`label`、`source path`、kind、status、record-id 与 rotation 摘要可以进入 trusted local 管理面的 display-safe 交互；私钥材料、passphrase、ciphertext locator 与 unwrap material 则不得进入普通 UI 字段、普通 CLI 输出、日志或搜索结果。
+
+#### 场景:本地管理面展示导入结果
+- **当** 受信任本地管理面完成一次 SSH key import
+- **那么** 结果输出只能包含 canonical `credential_ref`、label、status、record-id 或等价 display-safe 摘要
+- **并且** 不得把 SSH key 内容或 passphrase 作为“导入成功结果”的一部分返回
+
+#### 场景:列出已导入的 SSH key
+- **当** 受信任本地管理面列出当前 vault 中已导入的 SSH key
+- **那么** 系统只能返回 canonical `credential_ref`、label、kind、status、record-id 与等价 display-safe 字段
+- **并且** 不得把密文定位信息、key 明文或 passphrase 相关材料暴露给普通管理列表
 

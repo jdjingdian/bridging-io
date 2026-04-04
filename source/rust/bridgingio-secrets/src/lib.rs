@@ -6,6 +6,7 @@ use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bridgingio_domain::{CommonErrorCode, ContractStatus, ErrorDomain, SharedError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,6 +89,14 @@ impl CanonicalCredentialRef {
 
 pub fn normalize_credential_ref(raw: &str) -> Result<String, VaultError> {
     CanonicalCredentialRef::parse(raw).map(|value| value.to_uri())
+}
+
+pub fn canonical_ssh_private_key_ref_from_key_name(raw: &str) -> Result<String, VaultError> {
+    let canonical = canonical_ssh_private_key_name(raw)?;
+    Ok(format!(
+        "vault://{}/ssh-private-key/{}",
+        DEFAULT_CREDENTIAL_NAMESPACE, canonical
+    ))
 }
 
 pub fn command_audit_preview(command: &str) -> String {
@@ -801,6 +810,61 @@ pub struct SshAgentBrokerPreparedSession {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(PartialEq, Eq)]
+pub struct TrustedLocalSshKeyImportRequest {
+    pub key_name: String,
+    pub label: Option<String>,
+    pub private_key: SecretBytes,
+    pub passphrase: Option<String>,
+    pub imported_by: String,
+    pub rotation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedLocalSshKeyImportResult {
+    pub credential_ref: String,
+    pub kind: String,
+    pub label: String,
+    pub status: String,
+    pub active_version: String,
+    pub encrypted_input: bool,
+    pub last_rotated_at_unix_sec: Option<u64>,
+    pub last_used_at_unix_sec: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetProfilePublicDescriptor {
+    pub id: String,
+    pub display_name: String,
+    pub aliases: Vec<String>,
+    pub kind: String,
+    pub enabled: bool,
+    pub storage_class: String,
+    pub access_class: String,
+    pub sealed_profile_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TargetProfileSensitiveOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    #[serde(default)]
+    pub connection: serde_json::Value,
+    #[serde(default)]
+    pub toolchains: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub policy: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetProfileSecretPayload {
+    pub public_descriptor: TargetProfilePublicDescriptor,
+    pub sensitive_overlay: TargetProfileSensitiveOverlay,
+    pub public_descriptor_digest: String,
+}
+
 pub struct BrokeredSecretLease {
     reference: String,
     version_id: String,
@@ -997,6 +1061,8 @@ impl SecretVaultBackend for FileVaultBackend {
 pub enum VaultError {
     BackendNotRegistered(String),
     InvalidCredentialRef(String),
+    InvalidSshPrivateKey(String),
+    SshKeyPassphraseRequired(String),
     PlaintextAccessDisabled(String),
     SecretNotFound(String),
     SecretVersionNotFound(String),
@@ -1037,6 +1103,20 @@ impl VaultError {
                 "vault.invalid_credential_ref",
                 "credential reference is invalid",
                 "use a canonical vault reference and retry",
+            ),
+            Self::InvalidSshPrivateKey(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.invalid_ssh_private_key",
+                "ssh private key payload is invalid",
+                "provide a valid private key file from trusted local storage and retry",
+            ),
+            Self::SshKeyPassphraseRequired(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::VerificationRequired,
+                "vault.ssh_key_passphrase_required",
+                "passphrase is required to import this ssh private key",
+                "provide the key passphrase through trusted local input and retry",
             ),
             Self::PlaintextAccessDisabled(_) => (
                 ContractStatus::Failed,
@@ -2108,6 +2188,63 @@ impl SecretVaultRouter {
         Ok(output)
     }
 
+    pub fn import_ssh_private_key_trusted_local(
+        &mut self,
+        request: TrustedLocalSshKeyImportRequest,
+    ) -> Result<TrustedLocalSshKeyImportResult, VaultError> {
+        let canonical_ref = canonical_ssh_private_key_ref_from_key_name(&request.key_name)?;
+        let key_payload = request
+            .private_key
+            .expose_utf8_for_use()
+            .ok_or_else(|| VaultError::InvalidSshPrivateKey("key payload must be UTF-8".into()))?;
+        let validation = validate_trusted_local_ssh_private_key_material(
+            key_payload,
+            request.passphrase.as_deref(),
+        )?;
+        let label = request
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| request.key_name.trim())
+            .to_string();
+        let actor = request.imported_by.trim();
+        let actor = if actor.is_empty() {
+            "trusted-local-admin"
+        } else {
+            actor
+        };
+
+        self.put_with_actor(
+            &canonical_ref,
+            request.private_key,
+            label.clone(),
+            actor,
+            request.rotation_reason,
+        )?;
+        let metadata = self
+            .secret_metadata(&canonical_ref)?
+            .ok_or_else(|| VaultError::SecretNotFound(canonical_ref.clone()))?;
+        let active_version = metadata
+            .record
+            .active_version_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(TrustedLocalSshKeyImportResult {
+            credential_ref: canonical_ref,
+            kind: metadata.record.kind.clone(),
+            label,
+            status: metadata.record.status.as_str().to_string(),
+            active_version,
+            encrypted_input: validation.encrypted_input,
+            last_rotated_at_unix_sec: metadata
+                .record
+                .last_rotated_at
+                .map(system_time_to_unix_secs),
+            last_used_at_unix_sec: metadata.record.last_used_at.map(system_time_to_unix_secs),
+        })
+    }
+
     pub fn get(&self, reference: &str) -> Result<Option<String>, VaultError> {
         let canonical = normalize_credential_ref(reference)?;
         if self.secrets.contains_key(&canonical) {
@@ -2116,6 +2253,18 @@ impl SecretVaultRouter {
             ));
         }
         Ok(None)
+    }
+
+    pub fn delete_secret_trusted_local(&mut self, reference: &str) -> Result<(), VaultError> {
+        let canonical = normalize_credential_ref(reference)?;
+        self.ensure_backend_allows_secret_use()?;
+        if self.secrets.remove(&canonical).is_none() {
+            return Err(VaultError::SecretNotFound(canonical));
+        }
+        self.ssh_broker_sessions
+            .retain(|_, stored| !stored.secret_reference.eq_ignore_ascii_case(&canonical));
+        self.persist_metadata_db()?;
+        Ok(())
     }
 
     pub fn use_for_ssh_auth(
@@ -2411,7 +2560,10 @@ impl SecretVaultRouter {
             .get_mut(token_id)
             .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.to_string()))?;
         refresh_agent_token_status(token, now);
-        if matches!(agent_token_projected_status(token), AgentTokenStatus::Deleted) {
+        if matches!(
+            agent_token_projected_status(token),
+            AgentTokenStatus::Deleted
+        ) {
             return Err(VaultError::AgentTokenRejected(
                 "cannot update label for a deleted token".into(),
             ));
@@ -2525,7 +2677,10 @@ impl SecretVaultRouter {
                 .get_mut(&token_id)
                 .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.clone()))?;
             refresh_agent_token_status(token, now);
-            if !matches!(agent_token_projected_status(token), AgentTokenStatus::Active) {
+            if !matches!(
+                agent_token_projected_status(token),
+                AgentTokenStatus::Active
+            ) {
                 return Err(VaultError::AgentTokenRejected(format!(
                     "token {} is not active",
                     token.token_id
@@ -2553,7 +2708,10 @@ impl SecretVaultRouter {
             .get_mut(&token_id)
             .ok_or_else(|| VaultError::AgentTokenNotFound(token_id.clone()))?;
         refresh_agent_token_status(token, now);
-        if !matches!(agent_token_projected_status(token), AgentTokenStatus::Active) {
+        if !matches!(
+            agent_token_projected_status(token),
+            AgentTokenStatus::Active
+        ) {
             return Err(VaultError::AgentTokenRejected(format!(
                 "token {} is not active",
                 token.token_id
@@ -4312,12 +4470,12 @@ impl SecretVaultRouter {
         self.agent_tokens = agent_tokens
             .into_iter()
             .map(|record| {
-                let (status, access_enabled) = if matches!(record.status, AgentTokenStatus::Disabled)
-                {
-                    (AgentTokenStatus::Active, false)
-                } else {
-                    (record.status.clone(), record.access_enabled)
-                };
+                let (status, access_enabled) =
+                    if matches!(record.status, AgentTokenStatus::Disabled) {
+                        (AgentTokenStatus::Active, false)
+                    } else {
+                        (record.status.clone(), record.access_enabled)
+                    };
                 (
                     record.token_id.clone(),
                     AgentTokenRecord {
@@ -4374,7 +4532,12 @@ impl SecretVaultRouter {
         self.token_hash_index = self
             .agent_tokens
             .iter()
-            .filter(|(_, token)| !matches!(agent_token_projected_status(token), AgentTokenStatus::Deleted))
+            .filter(|(_, token)| {
+                !matches!(
+                    agent_token_projected_status(token),
+                    AgentTokenStatus::Deleted
+                )
+            })
             .map(|(token_id, token)| (token.token_hash.clone(), token_id.clone()))
             .collect();
         self.intents = intents
@@ -5290,6 +5453,168 @@ fn secret_record_from_metadata(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SshPrivateKeyValidationSummary {
+    encrypted_input: bool,
+}
+
+fn canonical_ssh_private_key_name(raw: &str) -> Result<String, VaultError> {
+    let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
+    if normalized.is_empty() {
+        return Err(VaultError::InvalidCredentialRef(raw.to_string()));
+    }
+    let mut out = String::with_capacity(normalized.len());
+    let mut prev_dash = false;
+    for ch in normalized.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '.' {
+            out.push(ch);
+            prev_dash = false;
+            continue;
+        }
+        if ch == '-' || ch.is_ascii_whitespace() {
+            if !prev_dash && !out.is_empty() {
+                out.push('-');
+                prev_dash = true;
+            }
+            continue;
+        }
+        return Err(VaultError::InvalidCredentialRef(raw.to_string()));
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return Err(VaultError::InvalidCredentialRef(raw.to_string()));
+    }
+    Ok(out)
+}
+
+fn validate_trusted_local_ssh_private_key_material(
+    raw: &str,
+    passphrase: Option<&str>,
+) -> Result<SshPrivateKeyValidationSummary, VaultError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(VaultError::InvalidSshPrivateKey(
+            "ssh private key payload is empty".into(),
+        ));
+    }
+    let encrypted = if trimmed.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
+        parse_openssh_private_key_encryption_state(trimmed)?
+    } else if trimmed.contains("-----BEGIN ") && trimmed.contains(" PRIVATE KEY-----") {
+        parse_pem_private_key_encryption_state(trimmed)?
+    } else {
+        return Err(VaultError::InvalidSshPrivateKey(
+            "missing private key envelope markers".into(),
+        ));
+    };
+    if encrypted
+        && passphrase
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        return Err(VaultError::SshKeyPassphraseRequired(
+            "encrypted ssh private key requires passphrase during import".into(),
+        ));
+    }
+    Ok(SshPrivateKeyValidationSummary {
+        encrypted_input: encrypted,
+    })
+}
+
+fn parse_pem_private_key_encryption_state(raw: &str) -> Result<bool, VaultError> {
+    let begin_marker = raw
+        .lines()
+        .find(|line| line.trim_start().starts_with("-----BEGIN "))
+        .ok_or_else(|| VaultError::InvalidSshPrivateKey("missing PEM begin marker".into()))?;
+    let end_marker = begin_marker
+        .replace("BEGIN", "END")
+        .replace("-----BEGIN ", "-----END ");
+    if !raw.contains(&end_marker) {
+        return Err(VaultError::InvalidSshPrivateKey(
+            "missing PEM end marker".into(),
+        ));
+    }
+    let encrypted = raw
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("proc-type: 4,encrypted"))
+        || raw.lines().any(|line| line.trim().starts_with("DEK-Info:"));
+    Ok(encrypted)
+}
+
+fn parse_openssh_private_key_encryption_state(raw: &str) -> Result<bool, VaultError> {
+    let begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    let end = "-----END OPENSSH PRIVATE KEY-----";
+    let start = raw.find(begin).ok_or_else(|| {
+        VaultError::InvalidSshPrivateKey("missing OpenSSH key begin marker".into())
+    })?;
+    let end_pos = raw
+        .find(end)
+        .ok_or_else(|| VaultError::InvalidSshPrivateKey("missing OpenSSH key end marker".into()))?;
+    if end_pos <= start {
+        return Err(VaultError::InvalidSshPrivateKey(
+            "OpenSSH key envelope order is invalid".into(),
+        ));
+    }
+    let body = &raw[start + begin.len()..end_pos];
+    let encoded = body.lines().map(str::trim).collect::<String>();
+    if encoded.is_empty() {
+        return Err(VaultError::InvalidSshPrivateKey(
+            "OpenSSH key payload is empty".into(),
+        ));
+    }
+    let payload = BASE64_STANDARD.decode(encoded.as_bytes()).map_err(|_| {
+        VaultError::InvalidSshPrivateKey("OpenSSH key payload is not valid base64".into())
+    })?;
+    let magic = b"openssh-key-v1\0";
+    if payload.len() <= magic.len() || &payload[..magic.len()] != magic {
+        return Err(VaultError::InvalidSshPrivateKey(
+            "OpenSSH key payload has invalid magic header".into(),
+        ));
+    }
+    let mut offset = magic.len();
+    let ciphername = read_openssh_string(&payload, &mut offset, "ciphername")?;
+    let kdfname = read_openssh_string(&payload, &mut offset, "kdfname")?;
+    let _kdfoptions = read_openssh_string(&payload, &mut offset, "kdfoptions")?;
+    let _nkeys = read_openssh_u32(&payload, &mut offset, "nkeys")?;
+    Ok(!ciphername.eq_ignore_ascii_case("none") || !kdfname.eq_ignore_ascii_case("none"))
+}
+
+fn read_openssh_u32(payload: &[u8], offset: &mut usize, field: &str) -> Result<u32, VaultError> {
+    if payload.len().saturating_sub(*offset) < 4 {
+        return Err(VaultError::InvalidSshPrivateKey(format!(
+            "OpenSSH key payload truncated while reading {field}"
+        )));
+    }
+    let value = u32::from_be_bytes([
+        payload[*offset],
+        payload[*offset + 1],
+        payload[*offset + 2],
+        payload[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_openssh_string(
+    payload: &[u8],
+    offset: &mut usize,
+    field: &str,
+) -> Result<String, VaultError> {
+    let len = read_openssh_u32(payload, offset, field)? as usize;
+    if payload.len().saturating_sub(*offset) < len {
+        return Err(VaultError::InvalidSshPrivateKey(format!(
+            "OpenSSH key payload truncated while reading {field}"
+        )));
+    }
+    let bytes = &payload[*offset..*offset + len];
+    *offset += len;
+    String::from_utf8(bytes.to_vec()).map_err(|_| {
+        VaultError::InvalidSshPrivateKey(format!("OpenSSH key field `{field}` is not valid UTF-8"))
+    })
+}
+
 fn normalize_ref_segment(raw: &str) -> Result<String, VaultError> {
     let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
     if normalized.is_empty() {
@@ -5792,14 +6117,16 @@ fn unix_secs_to_system_time(value: u64) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_audit_preview, normalize_credential_ref, read_passive_vault_projection,
-        AgentTokenAuthResult, AgentTokenStatus, CreateAgentTokenRequest, DeleteAgentTokenRequest,
-        DeleteVaultRequest, LocalAdminActionKind, SecretBytes, SecretVaultRouter,
-        SshAgentBrokerPrepareRequest, SshAgentBrokerSessionState, SshHostKeyPolicy,
-        SshKeyPassphraseHandling, TokenScopeInput, UpdateAgentTokenAccessRequest,
+        canonical_ssh_private_key_ref_from_key_name, command_audit_preview,
+        normalize_credential_ref, read_passive_vault_projection, AgentTokenAuthResult,
+        AgentTokenStatus, CreateAgentTokenRequest, DeleteAgentTokenRequest, DeleteVaultRequest,
+        LocalAdminActionKind, SecretBytes, SecretVaultRouter, SshAgentBrokerPrepareRequest,
+        SshAgentBrokerSessionState, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
+        TrustedLocalSshKeyImportRequest, UpdateAgentTokenAccessRequest,
         UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
         VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
     };
+    use base64::Engine as _;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -5914,6 +6241,35 @@ mod tests {
             .attestation_id
     }
 
+    fn openssh_test_key(encrypted: bool) -> String {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        fn push_string(bytes: &mut Vec<u8>, value: &str) {
+            push_u32(bytes, value.len() as u32);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+
+        let mut payload = b"openssh-key-v1\0".to_vec();
+        if encrypted {
+            push_string(&mut payload, "aes256-ctr");
+            push_string(&mut payload, "bcrypt");
+            push_string(&mut payload, "kdfopts");
+        } else {
+            push_string(&mut payload, "none");
+            push_string(&mut payload, "none");
+            push_string(&mut payload, "");
+        }
+        push_u32(&mut payload, 1);
+        push_string(&mut payload, "ssh-ed25519");
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            encoded
+        )
+    }
+
     #[test]
     fn normalizes_legacy_credential_refs_to_canonical_uri() {
         let canonical = normalize_credential_ref("vault:ssh-key:ops-prod").expect("canonical");
@@ -5922,6 +6278,174 @@ mod tests {
         let namespaced = normalize_credential_ref("vault:infra:token:grok_default")
             .expect("canonical namespaced");
         assert_eq!(namespaced, "vault://infra/opaque-token/grok-default");
+    }
+
+    #[test]
+    fn canonicalizes_key_name_to_ssh_private_key_ref() {
+        let canonical =
+            canonical_ssh_private_key_ref_from_key_name("Ops Prod_Main").expect("canonical ref");
+        assert_eq!(
+            canonical,
+            "vault://bridgingio/ssh-private-key/ops-prod-main"
+        );
+    }
+
+    #[test]
+    fn trusted_local_ssh_import_creates_and_rotates_same_canonical_ref() {
+        let mut router = SecretVaultRouter::default();
+        router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch backend");
+        let first = router
+            .import_ssh_private_key_trusted_local(TrustedLocalSshKeyImportRequest {
+                key_name: "ops-prod".into(),
+                label: Some("Ops Prod".into()),
+                private_key: SecretBytes::from_utf8(openssh_test_key(false)),
+                passphrase: None,
+                imported_by: "menuconfig:local-operator".into(),
+                rotation_reason: None,
+            })
+            .expect("first import");
+        let second = router
+            .import_ssh_private_key_trusted_local(TrustedLocalSshKeyImportRequest {
+                key_name: "ops-prod".into(),
+                label: Some("Ops Prod".into()),
+                private_key: SecretBytes::from_utf8(openssh_test_key(false)),
+                passphrase: None,
+                imported_by: "menuconfig:local-operator".into(),
+                rotation_reason: Some("import-new-version".into()),
+            })
+            .expect("second import");
+
+        assert_eq!(first.credential_ref, second.credential_ref);
+        assert_ne!(first.active_version, second.active_version);
+
+        let metadata = router
+            .secret_metadata(&first.credential_ref)
+            .expect("metadata lookup")
+            .expect("metadata exists");
+        assert_eq!(metadata.record.rotation.rotation_count, 1);
+        assert_eq!(metadata.record.label, "Ops Prod");
+    }
+
+    #[test]
+    fn trusted_local_ssh_import_rejects_invalid_key_payload() {
+        let mut router = SecretVaultRouter::default();
+        router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch backend");
+        let err = router
+            .import_ssh_private_key_trusted_local(TrustedLocalSshKeyImportRequest {
+                key_name: "ops-prod".into(),
+                label: Some("Ops Prod".into()),
+                private_key: SecretBytes::from_utf8("not-a-private-key"),
+                passphrase: None,
+                imported_by: "menuconfig:local-operator".into(),
+                rotation_reason: None,
+            })
+            .expect_err("invalid key must be rejected");
+        assert!(matches!(err, VaultError::InvalidSshPrivateKey(_)));
+    }
+
+    #[test]
+    fn trusted_local_ssh_import_requires_passphrase_for_encrypted_openssh_input() {
+        let mut router = SecretVaultRouter::default();
+        router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch backend");
+        let encrypted_key = openssh_test_key(true);
+        let err = router
+            .import_ssh_private_key_trusted_local(TrustedLocalSshKeyImportRequest {
+                key_name: "ops-encrypted".into(),
+                label: Some("Ops Encrypted".into()),
+                private_key: SecretBytes::from_utf8(encrypted_key.clone()),
+                passphrase: None,
+                imported_by: "menuconfig:local-operator".into(),
+                rotation_reason: None,
+            })
+            .expect_err("encrypted key requires passphrase");
+        assert!(matches!(err, VaultError::SshKeyPassphraseRequired(_)));
+
+        let imported = router
+            .import_ssh_private_key_trusted_local(TrustedLocalSshKeyImportRequest {
+                key_name: "ops-encrypted".into(),
+                label: Some("Ops Encrypted".into()),
+                private_key: SecretBytes::from_utf8(encrypted_key),
+                passphrase: Some("correct horse battery staple".into()),
+                imported_by: "menuconfig:local-operator".into(),
+                rotation_reason: None,
+            })
+            .expect("encrypted key import");
+        assert!(imported.encrypted_input);
+    }
+
+    #[test]
+    fn trusted_local_ssh_import_exposes_display_safe_summary_and_detail_fields() {
+        let mut router = SecretVaultRouter::default();
+        router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch backend");
+        let imported = router
+            .import_ssh_private_key_trusted_local(TrustedLocalSshKeyImportRequest {
+                key_name: "display-safe".into(),
+                label: Some("Display Safe".into()),
+                private_key: SecretBytes::from_utf8(openssh_test_key(false)),
+                passphrase: None,
+                imported_by: "menuconfig:local-operator".into(),
+                rotation_reason: None,
+            })
+            .expect("import key");
+
+        let summaries = router.list_secret_summaries();
+        let summary = summaries
+            .iter()
+            .find(|item| item.reference == imported.credential_ref)
+            .expect("summary");
+        assert_eq!(summary.kind, "ssh-private-key");
+        assert_eq!(summary.label, "Display Safe");
+        assert!(summary.active_version_id.is_some());
+
+        let detail = router
+            .secret_metadata(&imported.credential_ref)
+            .expect("metadata")
+            .expect("detail");
+        assert_eq!(detail.record.reference, imported.credential_ref);
+        assert_eq!(detail.record.kind, "ssh-private-key");
+        assert_eq!(detail.record.label, "Display Safe");
+        assert_eq!(
+            detail.record.active_version_id.as_deref(),
+            Some(imported.active_version.as_str())
+        );
+    }
+
+    #[test]
+    fn trusted_local_ssh_key_can_be_deleted_after_import() {
+        let mut router = SecretVaultRouter::default();
+        router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch backend");
+        let imported = router
+            .import_ssh_private_key_trusted_local(TrustedLocalSshKeyImportRequest {
+                key_name: "delete-me".into(),
+                label: Some("Delete Me".into()),
+                private_key: SecretBytes::from_utf8(openssh_test_key(false)),
+                passphrase: None,
+                imported_by: "menuconfig:local-operator".into(),
+                rotation_reason: None,
+            })
+            .expect("import key");
+        router
+            .delete_secret_trusted_local(&imported.credential_ref)
+            .expect("delete imported key");
+
+        let summaries = router.list_secret_summaries();
+        assert!(summaries
+            .iter()
+            .all(|item| item.reference != imported.credential_ref));
+        let metadata = router
+            .secret_metadata(&imported.credential_ref)
+            .expect("metadata lookup");
+        assert!(metadata.is_none());
     }
 
     #[test]
@@ -6799,7 +7323,10 @@ mod tests {
         ));
 
         router
-            .revoke_agent_token(&created.summary.token_id, Some("revoke before delete".into()))
+            .revoke_agent_token(
+                &created.summary.token_id,
+                Some("revoke before delete".into()),
+            )
             .expect("revoke expired token");
         delete_request.attestation_id = mint_delete_token_attestation(&mut router, &delete_request);
         let deleted = router
@@ -6995,8 +7522,10 @@ mod tests {
             },
             attestation_id: None,
         };
-        expiring_request.attestation_id =
-            Some(mint_create_token_attestation(&mut router, &expiring_request));
+        expiring_request.attestation_id = Some(mint_create_token_attestation(
+            &mut router,
+            &expiring_request,
+        ));
         let expiring = router
             .create_agent_token(expiring_request)
             .expect("create expiring token");

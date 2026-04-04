@@ -68,9 +68,14 @@ grammar. New menu fields should match one of these mappings.
 | Vault | `vault.backend` / `vault.unlock.preferred_method` / `vault.unlock.allowed_methods` | Read-only info | `---` | `--- Label = value` | none |
 | Targets | `targets[*].enabled` | Multi-select toggle | `[ ]` / `[*]` | `[ ] Enabled` / `[*] Enabled` | `Space` toggles, `Enter` does not toggle |
 | Targets | `targets[*].id` / `display_name` / `aliases` / connection fields | Text field | blank prefix column | `Label (value) --->` | `Enter` edits |
+| Targets | `Add Target` | Submenu/action entry | blank prefix column | `Add Target --->` | `Enter` follows mode-first flow |
+| Targets | `Add Target -> Choose Storage Mode` | Submenu/action entry | blank prefix column | `Plain Target --->` / `Sensitive Target --->` | `Enter` follows; sensitive path is replaced by `Unlock Vault --->` while vault is locked |
+| Targets | `sensitive target detail (vault locked)` | Placeholder/read-only | `---` + action row | `--- Sensitive overlay is locked` + `Unlock Vault --->` | read-only + unlock action only |
+| Targets | `SSH target -> Credential Source` | Submenu/action entry + info rows | blank prefix column / `---` | `Credential Source --->`, `Use Imported Vault SSH Key --->`, `Import Local SSH Key Into Vault --->`, `Manual Reference --->`, `No Credential --->` | picker/import actions are unlocked-only for sensitive SSH overlays |
 | Security | lock/backend/count summary rows | Read-only info | `---` | `--- Label = value` | none |
 | Security | unlocked notice | Fixed enabled feature | `-*-` | `-*- Credential Management Unlocked` | none |
-| Security | `Init/Unlock/Create Token/Token Management/Delete Vault` | Submenu/action entry | blank prefix column | `Label --->` | `Enter` follows action flow |
+| Security | `Init/Unlock/Import SSH Key/SSH Key Management/Create Token/Token Management/Delete Vault` | Submenu/action entry | blank prefix column | `Label --->` | `Enter` follows action flow; locked state shows aggregate `SSH Key Count` only |
+| Security | `SSH Key Management` list/detail | Submenu/action entry + info rows | blank prefix column / `---` | list rows `Label [status] record-id --->`; detail rows `--- Field = value` + `Delete SSH Key --->` | detail/list are unlocked-only and display-safe only |
 | Token Detail | access switch (`enabled` / `disabled`) | Single-choice toggle (no submenu) | `< >` / `<*>` | `< > Access Switch = [disabled]` / `<*> Access Switch = [enabled]` | `Space` toggles, `Enter` does not toggle |
 | Token Detail | label edit | Submenu/action entry | blank prefix column | `Label = value --->` | `Enter` opens edit popup |
 | Token Detail | fingerprint/expiry/status/revoke reason | Read-only info | `---` | `--- Label = value` | none |
@@ -85,8 +90,10 @@ grammar. New menu fields should match one of these mappings.
 | Confirm popup | centered modal with message and inline button row | buttons only | `←/→` move; `Enter` confirms current button; `Esc` cancels | current button must use same reverse / fallback as menu rows | applies to save/discard, delete, revoke, etc. |
 | Choice popup | centered modal with vertical options list | list rows | `↑/↓` move; `Enter` or `Space` confirms; `Esc` cancels | current row must use same reverse / fallback as menu rows | single-choice editor |
 | Text input popup | centered modal with one input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` commits; `Esc` cancels | caret must be visible | all text fields share one editing contract |
+| Hidden passphrase popup | centered modal with one masked input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` commits; `Esc` cancels | caret visible; characters rendered as mask glyph | used for encrypted SSH key import passphrase capture |
 | Help popup | centered modal with read-only content | none | `Esc` closes; help shortcut may toggle | none required | read-only overlay |
 | One-time reveal popup | centered modal with read-only sensitive result | none or one acknowledge button | `Enter` / `Esc` closes according to concrete flow | if an acknowledge button exists, it follows shared selected feedback | closing the popup ends the one-time reveal path |
+| Risk confirm popup | centered modal with message and inline button row | buttons only | `←/→` move; `Enter` confirms current button; `Esc` cancels | current button must use same reverse / fallback as menu rows | used by `plain + ssh` create flow before entering editor |
 | Resize-required popup | centered blocking overlay | optional exit button only | normal navigation blocked; `Esc` may exit from root flow | if a button exists, it follows shared selected feedback | shown for viewport smaller than minimum supported size |
 
 ## Navigation And Key Matrix

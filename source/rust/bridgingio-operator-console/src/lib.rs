@@ -13,12 +13,13 @@ use bridgingio_engine::{
 #[cfg(test)]
 use bridgingio_secrets::VaultUnlockTriggerPolicy;
 use bridgingio_secrets::{
-    local_admin_create_token_target, local_admin_delete_vault_target,
-    local_admin_payload_digest_for_create_agent_token,
+    canonical_ssh_private_key_ref_from_key_name, local_admin_create_token_target,
+    local_admin_delete_vault_target, local_admin_payload_digest_for_create_agent_token,
     local_admin_payload_digest_for_delete_agent_token, local_admin_payload_digest_for_delete_vault,
     read_passive_vault_projection, CreateAgentTokenRequest, DeleteAgentTokenRequest,
     DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter, TokenScopeInput,
-    UpdateAgentTokenAccessRequest, UpdateAgentTokenLabelRequest, VaultPassiveProjection,
+    TrustedLocalSshKeyImportRequest, TrustedLocalSshKeyImportResult, UpdateAgentTokenAccessRequest,
+    UpdateAgentTokenLabelRequest, VaultError, VaultPassiveProjection,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -46,6 +47,7 @@ pub struct SecuritySummary {
     pub trigger_policy: String,
     pub preferred_method: String,
     pub secret_count: usize,
+    pub ssh_key_count: usize,
     pub token_count: usize,
 }
 
@@ -58,9 +60,21 @@ enum Screen {
     Vault,
     Targets,
     Security,
+    SshKeyImport,
+    SshKeyManagement,
+    SshKeyDetail(String),
     TokenManagement,
     TokenDetail(String),
+    TargetAddMode,
+    TargetAddTypePlain,
+    TargetAddTypeSensitive,
     TargetEditor(usize),
+    TargetPublicDescriptor(usize),
+    TargetConnectionProfile(usize),
+    TargetSensitiveOverlay(usize),
+    TargetCredentialSource(usize),
+    TargetCredentialPicker(usize),
+    TargetPolicy(usize),
     SearchResults,
 }
 
@@ -74,9 +88,21 @@ impl Screen {
             Screen::Vault => catalog.t("menu.vault.title"),
             Screen::Targets => catalog.t("menu.targets.title"),
             Screen::Security => catalog.t("menu.security.title"),
+            Screen::SshKeyImport => catalog.t("menu.ssh_key.import.title"),
+            Screen::SshKeyManagement => catalog.t("menu.ssh_key.management.title"),
+            Screen::SshKeyDetail(_) => catalog.t("menu.ssh_key.detail.title"),
             Screen::TokenManagement => catalog.t("menu.token_management.title"),
             Screen::TokenDetail(_) => catalog.t("menu.token_detail.title"),
+            Screen::TargetAddMode => catalog.t("menu.targets.add_target"),
+            Screen::TargetAddTypePlain => catalog.t("menu.targets.choose_type_plain"),
+            Screen::TargetAddTypeSensitive => catalog.t("menu.targets.choose_type_sensitive"),
             Screen::TargetEditor(_) => catalog.t("menu.target.title"),
+            Screen::TargetPublicDescriptor(_) => catalog.t("menu.target.public_descriptor"),
+            Screen::TargetConnectionProfile(_) => catalog.t("menu.target.connection_profile"),
+            Screen::TargetSensitiveOverlay(_) => catalog.t("menu.target.sensitive_overlay"),
+            Screen::TargetCredentialSource(_) => catalog.t("menu.target.credential_source"),
+            Screen::TargetCredentialPicker(_) => catalog.t("menu.target.credential_picker"),
+            Screen::TargetPolicy(_) => catalog.t("menu.target.policy"),
             Screen::SearchResults => catalog.t("menu.search_results.title"),
         }
     }
@@ -102,8 +128,28 @@ enum MenuEntryKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ActionKind {
+    OpenAddTarget,
+    ChoosePlainTargetMode,
+    ChooseSensitiveTargetMode,
+    AddSensitiveSshTarget,
+    AddSensitiveAdbTarget,
     AddSshTarget,
     AddAdbTarget,
+    OpenSshKeyImport,
+    ExecuteSshKeyImport,
+    OpenSshKeyManagement,
+    OpenSshKeyDetail(String),
+    DeleteSshKey(String),
+    OpenTargetCredentialSource(usize),
+    OpenTargetCredentialPicker(usize),
+    ApplyTarget(usize),
+    BindTargetCredentialRef {
+        target_index: usize,
+        credential_ref: String,
+    },
+    ClearTargetCredentialRef(usize),
+    EditTargetCredentialRef(usize),
+    ImportLocalSshKeyIntoVault(usize),
     UnlockVault,
     InitVault,
     DeleteVault,
@@ -115,6 +161,7 @@ enum ActionKind {
     OpenTokenPermissions(String),
     RevokeToken(String),
     DeleteToken(String),
+    DeleteTarget(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,10 +221,39 @@ struct TokenManagementRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SshKeyManagementRow {
+    credential_ref: String,
+    label: String,
+    status: String,
+    active_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct SshKeyImportDraft {
+    key_name: String,
+    label: String,
+    source_path: String,
+    passphrase: Option<String>,
+    bind_target_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ConfirmAction {
     DeleteVault,
+    ConfirmPlainSshRisk,
+    DeleteSshKey(String),
     RevokeToken(String),
     DeleteToken(String),
+    DeleteTarget(usize),
+    DiscardNewTarget(usize),
+    DiscardTargetChanges(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetEditSession {
+    index: usize,
+    is_new: bool,
+    baseline: Option<StandaloneTargetProfile>,
 }
 
 const MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT_ENV: &str =
@@ -187,6 +263,10 @@ const FOOTER_LOCK_STATE_TOKEN: &str = "__bridgingio_footer_lock_state_token__";
 const TOKEN_CREATE_LABEL_FIELD: &str = "__token_create_label__";
 const TOKEN_CREATE_EXPIRY_MODE_FIELD: &str = "__token_create_expiry_mode__";
 const TOKEN_CREATE_EXPIRY_AT_FIELD: &str = "__token_create_expiry_at_unix_sec__";
+const SSH_IMPORT_KEY_NAME_FIELD: &str = "__ssh_import_key_name__";
+const SSH_IMPORT_LABEL_FIELD: &str = "__ssh_import_label__";
+const SSH_IMPORT_SOURCE_PATH_FIELD: &str = "__ssh_import_source_path__";
+const SSH_IMPORT_PASSPHRASE_FIELD: &str = "__ssh_import_passphrase__";
 const MENUCONFIG_MIN_VIEWPORT_WIDTH: u16 = 80;
 const MENUCONFIG_MIN_VIEWPORT_HEIGHT: u16 = 24;
 
@@ -227,6 +307,10 @@ pub struct MenuConfigApp {
     unlock_flow_pending: bool,
     unlock_worker: Option<UnlockWorkerHandle>,
     token_rows: Vec<TokenManagementRow>,
+    ssh_key_rows: Vec<SshKeyManagementRow>,
+    ssh_import_draft: SshKeyImportDraft,
+    ssh_import_last_result: Option<TrustedLocalSshKeyImportResult>,
+    target_edit_session: Option<TargetEditSession>,
     confirm_action: Option<ConfirmAction>,
     confirm_selected: usize,
     token_reveal: Option<String>,
@@ -276,6 +360,10 @@ impl MenuConfigApp {
             unlock_flow_pending: false,
             unlock_worker: None,
             token_rows: Vec::new(),
+            ssh_key_rows: Vec::new(),
+            ssh_import_draft: SshKeyImportDraft::default(),
+            ssh_import_last_result: None,
+            target_edit_session: None,
             confirm_action: None,
             confirm_selected: 0,
             token_reveal: None,
@@ -464,6 +552,9 @@ impl MenuConfigApp {
             MenuEntryKind::Navigate(screen) => {
                 self.push_navigation_state();
                 let screen_title = screen.title(&self.catalog);
+                if let Some(index) = target_screen_index(&screen) {
+                    self.ensure_target_edit_session(index);
+                }
                 self.screen = screen;
                 self.selected = 0;
                 self.sync_selection_to_focusable();
@@ -479,12 +570,18 @@ impl MenuConfigApp {
             }
             MenuEntryKind::FocusField { screen, field } => {
                 self.push_navigation_state();
+                if let Some(index) = target_screen_index(&screen) {
+                    self.ensure_target_edit_session(index);
+                }
                 self.screen = screen;
                 self.select_field(&field);
                 self.last_status = self.tf("menu.status.focused_field", &[("field", &field)]);
             }
             MenuEntryKind::Action(ActionKind::ToggleTokenAccess(_)) => {
                 self.last_status = self.t("menu.status.token_access_space_only");
+            }
+            MenuEntryKind::Action(ActionKind::BindTargetCredentialRef { .. }) => {
+                self.last_status = self.t("menu.status.target_credential_picker_space_only");
             }
             MenuEntryKind::Action(action) => self.run_action(action)?,
             MenuEntryKind::Info => {
@@ -495,6 +592,50 @@ impl MenuConfigApp {
     }
 
     fn begin_edit(&mut self, field: String) -> Result<(), String> {
+        if field == SSH_IMPORT_KEY_NAME_FIELD {
+            self.edit_mode = true;
+            self.edit_mode_kind = EditModeKind::Text;
+            self.edit_field = Some(field);
+            self.edit_input = self.ssh_import_draft.key_name.clone();
+            self.edit_cursor = self.edit_input.chars().count();
+            self.edit_options.clear();
+            self.edit_option_selected = 0;
+            self.last_status = self.t("menu.status.ssh_import_key_name_prompt");
+            return Ok(());
+        }
+        if field == SSH_IMPORT_LABEL_FIELD {
+            self.edit_mode = true;
+            self.edit_mode_kind = EditModeKind::Text;
+            self.edit_field = Some(field);
+            self.edit_input = self.ssh_import_draft.label.clone();
+            self.edit_cursor = self.edit_input.chars().count();
+            self.edit_options.clear();
+            self.edit_option_selected = 0;
+            self.last_status = self.t("menu.status.ssh_import_label_prompt");
+            return Ok(());
+        }
+        if field == SSH_IMPORT_SOURCE_PATH_FIELD {
+            self.edit_mode = true;
+            self.edit_mode_kind = EditModeKind::Text;
+            self.edit_field = Some(field);
+            self.edit_input = self.ssh_import_draft.source_path.clone();
+            self.edit_cursor = self.edit_input.chars().count();
+            self.edit_options.clear();
+            self.edit_option_selected = 0;
+            self.last_status = self.t("menu.status.ssh_import_source_path_prompt");
+            return Ok(());
+        }
+        if field == SSH_IMPORT_PASSPHRASE_FIELD {
+            self.edit_mode = true;
+            self.edit_mode_kind = EditModeKind::Text;
+            self.edit_field = Some(field);
+            self.edit_input.clear();
+            self.edit_cursor = 0;
+            self.edit_options.clear();
+            self.edit_option_selected = 0;
+            self.last_status = self.t("menu.status.ssh_import_passphrase_prompt");
+            return Ok(());
+        }
         if field == TOKEN_CREATE_LABEL_FIELD {
             self.edit_mode = true;
             self.edit_mode_kind = EditModeKind::Text;
@@ -603,6 +744,34 @@ impl MenuConfigApp {
                 .cloned()
                 .ok_or_else(|| self.t("menu.error.no_available_option"))?,
         };
+        if field == SSH_IMPORT_KEY_NAME_FIELD {
+            self.ssh_import_draft.key_name = value.trim().to_string();
+            self.reset_edit_state();
+            self.last_status = self.t("menu.status.ssh_import_key_name_saved");
+            return Ok(());
+        }
+        if field == SSH_IMPORT_LABEL_FIELD {
+            self.ssh_import_draft.label = value.trim().to_string();
+            self.reset_edit_state();
+            self.last_status = self.t("menu.status.ssh_import_label_saved");
+            return Ok(());
+        }
+        if field == SSH_IMPORT_SOURCE_PATH_FIELD {
+            self.ssh_import_draft.source_path = value.trim().to_string();
+            self.reset_edit_state();
+            self.last_status = self.t("menu.status.ssh_import_source_path_saved");
+            return Ok(());
+        }
+        if field == SSH_IMPORT_PASSPHRASE_FIELD {
+            self.ssh_import_draft.passphrase = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            };
+            self.reset_edit_state();
+            self.last_status = self.t("menu.status.ssh_import_passphrase_captured");
+            return Ok(());
+        }
         if field == TOKEN_CREATE_LABEL_FIELD {
             let label = self.validate_token_label_input(&value)?;
             self.pending_token_label = Some(label);
@@ -779,6 +948,15 @@ impl MenuConfigApp {
             }
             MenuEntryKind::Action(ActionKind::ToggleTokenAccess(token_id)) => {
                 self.run_action(ActionKind::ToggleTokenAccess(token_id))?;
+            }
+            MenuEntryKind::Action(ActionKind::BindTargetCredentialRef {
+                target_index,
+                credential_ref,
+            }) => {
+                self.run_action(ActionKind::BindTargetCredentialRef {
+                    target_index,
+                    credential_ref,
+                })?;
             }
             _ => {}
         }
@@ -1042,6 +1220,19 @@ impl MenuConfigApp {
     fn refresh_security_summary(&mut self) {
         if let Some(router) = self.vault_router.as_mut() {
             self.security_summary = build_security_summary_from_router(&self.settings, router);
+            self.ssh_key_rows = router
+                .list_secret_summaries()
+                .into_iter()
+                .filter(|item| item.kind.eq_ignore_ascii_case("ssh-private-key"))
+                .map(|item| SshKeyManagementRow {
+                    credential_ref: item.reference,
+                    label: item.label,
+                    status: item.status.as_str().to_string(),
+                    active_version: item
+                        .active_version_id
+                        .unwrap_or_else(|| "unknown".to_string()),
+                })
+                .collect();
             if self.security_summary.lock_state == "unlocked" {
                 self.token_rows = router
                     .list_agent_tokens()
@@ -1062,28 +1253,378 @@ impl MenuConfigApp {
         } else {
             self.security_summary = build_security_summary_passive(&self.settings);
             self.token_rows.clear();
+            self.ssh_key_rows.clear();
+        }
+    }
+
+    fn execute_ssh_key_import(&mut self) -> Result<(), String> {
+        if self.vault_router.is_none() {
+            let _ = self.ensure_vault_router_loaded()?;
+        }
+        self.refresh_security_summary();
+        if self.security_summary.lock_state != "unlocked" {
+            self.last_status = self.t("menu.status.vault_locked_for_ssh_key_action");
+            return Ok(());
+        }
+
+        let key_name = self.ssh_import_draft.key_name.trim().to_string();
+        if key_name.is_empty() {
+            self.last_status = self.t("menu.error.ssh_import_key_name_required");
+            return Ok(());
+        }
+        let canonical_ref = canonical_ssh_private_key_ref_from_key_name(&key_name)
+            .map_err(|_| self.t("menu.error.ssh_import_key_name_invalid"));
+        let canonical_ref = match canonical_ref {
+            Ok(value) => value,
+            Err(message) => {
+                self.last_status = message;
+                return Ok(());
+            }
+        };
+        let source_path = self.ssh_import_draft.source_path.trim().to_string();
+        if source_path.is_empty() {
+            self.last_status = self.t("menu.error.ssh_import_source_path_required");
+            return Ok(());
+        }
+        let key_material = fs::read_to_string(&source_path).map_err(|err| {
+            self.tf(
+                "menu.error.ssh_import_read_source_failed",
+                &[("path", source_path.as_str()), ("error", &err.to_string())],
+            )
+        });
+        let key_material = match key_material {
+            Ok(value) => value,
+            Err(message) => {
+                self.last_status = message;
+                return Ok(());
+            }
+        };
+        if self
+            .ssh_key_rows
+            .iter()
+            .any(|item| item.credential_ref == canonical_ref)
+        {
+            self.last_status = self.tf(
+                "menu.error.ssh_import_key_already_exists",
+                &[("ref", canonical_ref.as_str())],
+            );
+            return Ok(());
+        }
+        let label = self.ssh_import_draft.label.trim();
+        let request = TrustedLocalSshKeyImportRequest {
+            key_name: key_name.clone(),
+            label: if label.is_empty() {
+                None
+            } else {
+                Some(label.to_string())
+            },
+            private_key: bridgingio_secrets::SecretBytes::from_utf8(key_material),
+            passphrase: self.ssh_import_draft.passphrase.clone(),
+            imported_by: "menuconfig:local-operator".to_string(),
+            rotation_reason: None,
+        };
+        let result = self
+            .ensure_vault_router_loaded()?
+            .import_ssh_private_key_trusted_local(request);
+        match result {
+            Ok(imported) => {
+                self.ssh_import_last_result = Some(imported.clone());
+                self.ssh_import_draft.passphrase = None;
+                self.ssh_import_draft.source_path.clear();
+                let bound_target = self.ssh_import_draft.bind_target_index;
+                if let Some(index) = bound_target {
+                    apply_target_field_edit(
+                        &mut self.settings,
+                        &format!("targets[{index}].credential_ref"),
+                        &imported.credential_ref,
+                    )?;
+                    if !self
+                        .dirty_paths
+                        .contains(&format!("targets[{index}].credential_ref"))
+                    {
+                        self.dirty_paths
+                            .push(format!("targets[{index}].credential_ref"));
+                    }
+                    self.ssh_import_draft.bind_target_index = None;
+                    self.screen = Screen::TargetCredentialSource(index);
+                    self.selected = 0;
+                    self.sync_selection_to_focusable();
+                    self.last_status = self.tf(
+                        "menu.status.inline_ssh_import_bound_target",
+                        &[("ref", imported.credential_ref.as_str())],
+                    );
+                } else {
+                    self.screen = Screen::SshKeyDetail(imported.credential_ref.clone());
+                    self.selected = 0;
+                    self.sync_selection_to_focusable();
+                    self.last_status = self.tf(
+                        "menu.status.ssh_import_completed",
+                        &[("ref", imported.credential_ref.as_str())],
+                    );
+                }
+                self.refresh_security_summary();
+                Ok(())
+            }
+            Err(VaultError::SshKeyPassphraseRequired(_)) => {
+                self.last_status = self.t("menu.status.ssh_import_passphrase_required");
+                self.begin_edit(SSH_IMPORT_PASSPHRASE_FIELD.to_string())?;
+                Ok(())
+            }
+            Err(err) => {
+                self.last_status = format!("import ssh key failed: {err:?}");
+                Ok(())
+            }
         }
     }
 
     fn run_action(&mut self, action: ActionKind) -> Result<(), String> {
         match action {
-            ActionKind::AddSshTarget => {
-                let index = self.settings.targets.len();
-                self.settings.targets.push(default_ssh_target(index));
+            ActionKind::OpenAddTarget => {
                 self.push_navigation_state();
-                self.screen = Screen::TargetEditor(index);
+                self.screen = Screen::TargetAddMode;
                 self.selected = 0;
                 self.sync_selection_to_focusable();
-                self.last_status = self.t("menu.status.added_ssh_target");
+                self.last_status = self.t("menu.status.opened_add_target");
+            }
+            ActionKind::ChoosePlainTargetMode => {
+                self.push_navigation_state();
+                self.screen = Screen::TargetAddTypePlain;
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.opened_add_target_plain");
+            }
+            ActionKind::ChooseSensitiveTargetMode => {
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_sensitive_target");
+                    return Ok(());
+                }
+                self.push_navigation_state();
+                self.screen = Screen::TargetAddTypeSensitive;
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.opened_add_target_sensitive");
+            }
+            ActionKind::AddSshTarget => {
+                self.confirm_action = Some(ConfirmAction::ConfirmPlainSshRisk);
+                self.confirm_selected = 0;
+                self.last_status = self.t("menu.status.plain_ssh_risk_confirm_pending");
             }
             ActionKind::AddAdbTarget => {
                 let index = self.settings.targets.len();
                 self.settings.targets.push(default_adb_target(index));
                 self.push_navigation_state();
+                self.start_target_edit_session(index, true);
                 self.screen = Screen::TargetEditor(index);
                 self.selected = 0;
                 self.sync_selection_to_focusable();
                 self.last_status = self.t("menu.status.added_adb_target");
+            }
+            ActionKind::OpenSshKeyImport => {
+                if self.vault_router.is_none() {
+                    let _ = self.ensure_vault_router_loaded()?;
+                }
+                self.refresh_security_summary();
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_ssh_key_action");
+                    return Ok(());
+                }
+                self.ssh_import_draft = SshKeyImportDraft::default();
+                self.ssh_import_last_result = None;
+                self.push_navigation_state();
+                self.screen = Screen::SshKeyImport;
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.opened_ssh_key_import");
+            }
+            ActionKind::ExecuteSshKeyImport => {
+                self.execute_ssh_key_import()?;
+            }
+            ActionKind::OpenSshKeyManagement => {
+                if self.vault_router.is_none() {
+                    let _ = self.ensure_vault_router_loaded()?;
+                }
+                self.refresh_security_summary();
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_ssh_key_action");
+                    return Ok(());
+                }
+                self.push_navigation_state();
+                self.screen = Screen::SshKeyManagement;
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.opened_ssh_key_management");
+            }
+            ActionKind::OpenSshKeyDetail(reference) => {
+                self.push_navigation_state();
+                self.screen = Screen::SshKeyDetail(reference);
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.opened_ssh_key_detail");
+            }
+            ActionKind::DeleteSshKey(reference) => {
+                if self.vault_router.is_none() {
+                    let _ = self.ensure_vault_router_loaded()?;
+                }
+                self.refresh_security_summary();
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_ssh_key_action");
+                    return Ok(());
+                }
+                self.confirm_action = Some(ConfirmAction::DeleteSshKey(reference));
+                self.confirm_selected = 0;
+                self.last_status = self.t("menu.status.ssh_key_delete_confirm_pending");
+            }
+            ActionKind::OpenTargetCredentialSource(index) => {
+                let Some(target) = self.settings.targets.get(index) else {
+                    self.last_status = self.t("menu.error.target_not_found");
+                    return Ok(());
+                };
+                if !matches!(target.kind, TargetKind::Ssh) {
+                    self.last_status = self.t("menu.status.target_credential_source_ssh_only");
+                    return Ok(());
+                }
+                if is_sensitive_target(target) && self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_sensitive_target");
+                    return Ok(());
+                }
+                self.ensure_target_edit_session(index);
+                self.push_navigation_state();
+                self.screen = Screen::TargetCredentialSource(index);
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.opened_target_credential_source");
+            }
+            ActionKind::OpenTargetCredentialPicker(index) => {
+                if self.vault_router.is_none() {
+                    let _ = self.ensure_vault_router_loaded()?;
+                }
+                self.refresh_security_summary();
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_ssh_key_action");
+                    return Ok(());
+                }
+                self.ensure_target_edit_session(index);
+                self.push_navigation_state();
+                self.screen = Screen::TargetCredentialPicker(index);
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.opened_target_credential_picker");
+            }
+            ActionKind::ApplyTarget(index) => {
+                let Some(current) = self.settings.targets.get(index).cloned() else {
+                    self.last_status = self.t("menu.error.target_not_found");
+                    return Ok(());
+                };
+                let mut created = false;
+                if let Some(session) = self.target_edit_session.as_mut() {
+                    if session.index == index {
+                        created = session.is_new;
+                        session.is_new = false;
+                        session.baseline = Some(current);
+                    }
+                } else {
+                    self.target_edit_session = Some(TargetEditSession {
+                        index,
+                        is_new: false,
+                        baseline: Some(current),
+                    });
+                }
+                self.last_status = if created {
+                    self.t("menu.status.target_created_applied")
+                } else {
+                    self.t("menu.status.target_changes_applied")
+                };
+            }
+            ActionKind::BindTargetCredentialRef {
+                target_index,
+                credential_ref,
+            } => {
+                apply_target_field_edit(
+                    &mut self.settings,
+                    &format!("targets[{target_index}].credential_ref"),
+                    &credential_ref,
+                )?;
+                if !self
+                    .dirty_paths
+                    .contains(&format!("targets[{target_index}].credential_ref"))
+                {
+                    self.dirty_paths
+                        .push(format!("targets[{target_index}].credential_ref"));
+                }
+                self.last_status = self.tf(
+                    "menu.status.bound_target_credential_ref",
+                    &[("ref", credential_ref.as_str())],
+                );
+            }
+            ActionKind::ClearTargetCredentialRef(index) => {
+                apply_target_field_edit(
+                    &mut self.settings,
+                    &format!("targets[{index}].credential_ref"),
+                    "",
+                )?;
+                if !self
+                    .dirty_paths
+                    .contains(&format!("targets[{index}].credential_ref"))
+                {
+                    self.dirty_paths
+                        .push(format!("targets[{index}].credential_ref"));
+                }
+                self.last_status = self.t("menu.status.cleared_target_credential_ref");
+            }
+            ActionKind::EditTargetCredentialRef(index) => {
+                self.begin_edit(format!("targets[{index}].credential_ref"))?;
+            }
+            ActionKind::ImportLocalSshKeyIntoVault(index) => {
+                if self.vault_router.is_none() {
+                    let _ = self.ensure_vault_router_loaded()?;
+                }
+                self.refresh_security_summary();
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_ssh_key_action");
+                    return Ok(());
+                }
+                self.ssh_import_draft = SshKeyImportDraft {
+                    bind_target_index: Some(index),
+                    ..SshKeyImportDraft::default()
+                };
+                self.ssh_import_last_result = None;
+                self.push_navigation_state();
+                self.screen = Screen::SshKeyImport;
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.opened_inline_ssh_import_for_target");
+            }
+            ActionKind::AddSensitiveSshTarget => {
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_sensitive_target");
+                    return Ok(());
+                }
+                let index = self.settings.targets.len();
+                self.settings
+                    .targets
+                    .push(default_sensitive_ssh_target(index));
+                self.push_navigation_state();
+                self.start_target_edit_session(index, true);
+                self.screen = Screen::TargetEditor(index);
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.added_sensitive_ssh_target");
+            }
+            ActionKind::AddSensitiveAdbTarget => {
+                if self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_sensitive_target");
+                    return Ok(());
+                }
+                let index = self.settings.targets.len();
+                self.settings
+                    .targets
+                    .push(default_sensitive_adb_target(index));
+                self.push_navigation_state();
+                self.start_target_edit_session(index, true);
+                self.screen = Screen::TargetEditor(index);
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.added_sensitive_adb_target");
             }
             ActionKind::UnlockVault => {
                 self.begin_unlock_flow();
@@ -1167,6 +1708,21 @@ impl MenuConfigApp {
                 self.confirm_selected = 0;
                 self.last_status = self.t("menu.status.token_delete_confirm_pending");
             }
+            ActionKind::DeleteTarget(index) => {
+                let sensitive = self
+                    .settings
+                    .targets
+                    .get(index)
+                    .map(is_sensitive_target)
+                    .unwrap_or(false);
+                if sensitive && self.security_summary.lock_state != "unlocked" {
+                    self.last_status = self.t("menu.status.vault_locked_for_sensitive_target");
+                    return Ok(());
+                }
+                self.confirm_action = Some(ConfirmAction::DeleteTarget(index));
+                self.confirm_selected = 0;
+                self.last_status = self.t("menu.status.target_delete_confirm_pending");
+            }
         }
         Ok(())
     }
@@ -1208,11 +1764,59 @@ impl MenuConfigApp {
                 self.confirm_selected = 0;
                 match action {
                     Some(ConfirmAction::DeleteVault) => self.delete_vault_confirmed()?,
+                    Some(ConfirmAction::ConfirmPlainSshRisk) => {
+                        let index = self.settings.targets.len();
+                        self.settings.targets.push(default_ssh_target(index));
+                        self.push_navigation_state();
+                        self.start_target_edit_session(index, true);
+                        self.screen = Screen::TargetEditor(index);
+                        self.selected = 0;
+                        self.sync_selection_to_focusable();
+                        self.last_status = self.t("menu.status.added_ssh_target");
+                    }
                     Some(ConfirmAction::RevokeToken(token_id)) => {
                         self.revoke_token_confirmed(&token_id)?
                     }
                     Some(ConfirmAction::DeleteToken(token_id)) => {
                         self.delete_token_confirmed(&token_id)?
+                    }
+                    Some(ConfirmAction::DeleteSshKey(reference)) => {
+                        self.delete_ssh_key_confirmed(&reference)?
+                    }
+                    Some(ConfirmAction::DeleteTarget(index)) => {
+                        if index < self.settings.targets.len() {
+                            self.settings.targets.remove(index);
+                            self.strip_dirty_paths_for_target(index);
+                            self.clear_target_edit_session_if_matches(index);
+                            self.screen = Screen::Targets;
+                            self.selected = index.saturating_sub(1);
+                            self.sync_selection_to_focusable();
+                            self.last_status = self.t("menu.status.deleted_target");
+                        }
+                    }
+                    Some(ConfirmAction::DiscardNewTarget(index)) => {
+                        if index < self.settings.targets.len() {
+                            self.settings.targets.remove(index);
+                        }
+                        self.strip_dirty_paths_for_target(index);
+                        self.clear_target_edit_session_if_matches(index);
+                        self.go_back();
+                        self.last_status = self.t("menu.status.target_draft_discarded");
+                    }
+                    Some(ConfirmAction::DiscardTargetChanges(index)) => {
+                        if let Some(session) = self.target_edit_session.as_ref() {
+                            if session.index == index {
+                                if let Some(original) = session.baseline.clone() {
+                                    if let Some(target) = self.settings.targets.get_mut(index) {
+                                        *target = original;
+                                    }
+                                }
+                            }
+                        }
+                        self.strip_dirty_paths_for_target(index);
+                        self.clear_target_edit_session_if_matches(index);
+                        self.go_back();
+                        self.last_status = self.t("menu.status.target_changes_discarded");
                     }
                     None => {}
                 }
@@ -1333,6 +1937,30 @@ impl MenuConfigApp {
         Ok(())
     }
 
+    fn delete_ssh_key_confirmed(&mut self, credential_ref: &str) -> Result<(), String> {
+        let router = self.ensure_vault_router_loaded()?;
+        router
+            .delete_secret_trusted_local(credential_ref)
+            .map_err(|err| format!("delete ssh key failed: {err:?}"))?;
+
+        for target in &mut self.settings.targets {
+            if target
+                .credential_ref
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(credential_ref))
+                .unwrap_or(false)
+            {
+                target.credential_ref = None;
+            }
+        }
+        self.screen = Screen::SshKeyManagement;
+        self.selected = 0;
+        self.sync_selection_to_focusable();
+        self.refresh_security_summary();
+        self.last_status = self.tf("menu.status.ssh_key_deleted", &[("ref", credential_ref)]);
+        Ok(())
+    }
+
     fn delete_vault_confirmed(&mut self) -> Result<(), String> {
         let operator_principal = "menuconfig:local-operator".to_string();
         let digest = local_admin_payload_digest_for_delete_vault();
@@ -1375,6 +2003,75 @@ impl MenuConfigApp {
             .push((self.screen.clone(), self.selected));
     }
 
+    fn start_target_edit_session(&mut self, index: usize, is_new: bool) {
+        let baseline = if is_new {
+            None
+        } else {
+            self.settings.targets.get(index).cloned()
+        };
+        self.target_edit_session = Some(TargetEditSession {
+            index,
+            is_new,
+            baseline,
+        });
+    }
+
+    fn ensure_target_edit_session(&mut self, index: usize) {
+        if self
+            .target_edit_session
+            .as_ref()
+            .map(|session| session.index == index)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.start_target_edit_session(index, false);
+    }
+
+    fn clear_target_edit_session_if_matches(&mut self, index: usize) {
+        if self
+            .target_edit_session
+            .as_ref()
+            .map(|session| session.index == index)
+            .unwrap_or(false)
+        {
+            self.target_edit_session = None;
+        }
+    }
+
+    fn strip_dirty_paths_for_target(&mut self, index: usize) {
+        let prefix = format!("targets[{index}].");
+        self.dirty_paths.retain(|path| !path.starts_with(&prefix));
+    }
+
+    fn leaving_target_flow_on_back(&self) -> Option<usize> {
+        let index = target_screen_index(&self.screen)?;
+        let (previous, _) = self.navigation_stack.last()?;
+        if target_screen_index(previous) == Some(index) {
+            return None;
+        }
+        Some(index)
+    }
+
+    fn target_session_has_pending_changes(&self, index: usize) -> bool {
+        let Some(session) = self.target_edit_session.as_ref() else {
+            return false;
+        };
+        if session.index != index {
+            return false;
+        }
+        if session.is_new {
+            return true;
+        }
+        let Some(current) = self.settings.targets.get(index) else {
+            return false;
+        };
+        let Some(baseline) = session.baseline.as_ref() else {
+            return false;
+        };
+        current != baseline
+    }
+
     fn move_footer_selection(&mut self, delta: isize) {
         let next = self.footer_selected as isize + delta;
         self.footer_selected = next.clamp(0, 2) as usize;
@@ -1412,6 +2109,28 @@ impl MenuConfigApp {
                 apply_strategy: self.last_apply_strategy.clone(),
                 config_path: self.config_path.clone(),
             }));
+        }
+        if let Some(index) = self.leaving_target_flow_on_back() {
+            if self.target_session_has_pending_changes(index) {
+                let discard = self
+                    .target_edit_session
+                    .as_ref()
+                    .map(|session| session.is_new)
+                    .unwrap_or(false);
+                self.confirm_action = Some(if discard {
+                    ConfirmAction::DiscardNewTarget(index)
+                } else {
+                    ConfirmAction::DiscardTargetChanges(index)
+                });
+                self.confirm_selected = 0;
+                self.last_status = if discard {
+                    self.t("menu.status.target_discard_new_confirm_pending")
+                } else {
+                    self.t("menu.status.target_discard_changes_confirm_pending")
+                };
+                return Ok(None);
+            }
+            self.clear_target_edit_session_if_matches(index);
         }
         self.go_back();
         Ok(None)
@@ -1496,15 +2215,37 @@ impl MenuConfigApp {
             Screen::Storage => storage_entries(&self.settings, &self.catalog),
             Screen::ModelPlane => model_plane_entries(&self.settings, &self.catalog),
             Screen::Vault => vault_entries(&self.settings, &self.catalog),
-            Screen::Targets => targets_entries(&self.settings, &self.catalog),
+            Screen::Targets => targets_entries(self, &self.catalog),
             Screen::Security => security_entries(&self.security_summary, &self.catalog),
+            Screen::SshKeyImport => ssh_key_import_entries(self, &self.catalog),
+            Screen::SshKeyManagement => ssh_key_management_entries(self, &self.catalog),
+            Screen::SshKeyDetail(ref credential_ref) => {
+                ssh_key_detail_entries(self, &self.catalog, credential_ref)
+            }
             Screen::TokenManagement => token_management_entries(self, &self.catalog),
             Screen::TokenDetail(ref token_id) => {
                 token_detail_entries(self, &self.catalog, token_id)
             }
-            Screen::TargetEditor(index) => {
-                target_editor_entries(&self.settings, index, &self.catalog)
+            Screen::TargetAddMode => target_add_mode_entries(self, &self.catalog),
+            Screen::TargetAddTypePlain => target_add_type_entries(false, &self.catalog),
+            Screen::TargetAddTypeSensitive => target_add_type_entries(true, &self.catalog),
+            Screen::TargetEditor(index) => target_editor_entries(self, index, &self.catalog),
+            Screen::TargetPublicDescriptor(index) => {
+                target_public_descriptor_entries(&self.settings, index, &self.catalog)
             }
+            Screen::TargetConnectionProfile(index) => {
+                target_connection_profile_entries(&self.settings, index, &self.catalog)
+            }
+            Screen::TargetSensitiveOverlay(index) => {
+                target_sensitive_overlay_entries(self, index, &self.catalog)
+            }
+            Screen::TargetCredentialSource(index) => {
+                target_credential_source_entries(self, index, &self.catalog)
+            }
+            Screen::TargetCredentialPicker(index) => {
+                target_credential_picker_entries(self, index, &self.catalog)
+            }
+            Screen::TargetPolicy(index) => target_policy_entries(self, index, &self.catalog),
             Screen::SearchResults => {
                 search_entries(&self.settings, &self.search_input, &self.catalog)
             }
@@ -2103,12 +2844,22 @@ fn render_confirm_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     };
     let action_text = match action {
         ConfirmAction::DeleteVault => app.t("menu.confirm.delete_vault"),
+        ConfirmAction::ConfirmPlainSshRisk => app.t("menu.confirm.plain_ssh_risk"),
+        ConfirmAction::DeleteSshKey(reference) => app.tf(
+            "menu.confirm.delete_ssh_key",
+            &[("ref", reference.as_str())],
+        ),
         ConfirmAction::RevokeToken(token_id) => {
             app.tf("menu.confirm.revoke_token", &[("id", token_id.as_str())])
         }
         ConfirmAction::DeleteToken(token_id) => {
             app.tf("menu.confirm.delete_token", &[("id", token_id.as_str())])
         }
+        ConfirmAction::DeleteTarget(index) => {
+            app.tf("menu.confirm.delete_target", &[("id", &index.to_string())])
+        }
+        ConfirmAction::DiscardNewTarget(_) => app.t("menu.confirm.discard_new_target"),
+        ConfirmAction::DiscardTargetChanges(_) => app.t("menu.confirm.discard_target_changes"),
     };
     let area = centered_rect(62, 32, frame.area());
     frame.render_widget(Clear, area);
@@ -2290,6 +3041,13 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
                 };
                 return format!("{selector} {marker} {}", entry.label);
             }
+            if matches!(action, ActionKind::BindTargetCredentialRef { .. }) {
+                let marker = match entry.value.as_deref() {
+                    Some("selected") => "<*>",
+                    _ => "< >",
+                };
+                return format!("{selector} {marker} {}", entry.label);
+            }
             format!("{selector}     {} --->", entry.label)
         }
     }
@@ -2344,7 +3102,32 @@ fn is_security_unlocked_notice_entry(app: &MenuConfigApp, entry: &MenuEntry) -> 
         && entry.value.is_none()
 }
 
+fn target_screen_index(screen: &Screen) -> Option<usize> {
+    match screen {
+        Screen::TargetEditor(index)
+        | Screen::TargetPublicDescriptor(index)
+        | Screen::TargetConnectionProfile(index)
+        | Screen::TargetSensitiveOverlay(index)
+        | Screen::TargetCredentialSource(index)
+        | Screen::TargetCredentialPicker(index)
+        | Screen::TargetPolicy(index) => Some(*index),
+        _ => None,
+    }
+}
+
 fn display_edit_field_label(app: &MenuConfigApp, field: &str) -> String {
+    if field == SSH_IMPORT_KEY_NAME_FIELD {
+        return app.t("menu.edit.field.ssh_import_key_name");
+    }
+    if field == SSH_IMPORT_LABEL_FIELD {
+        return app.t("menu.edit.field.ssh_import_label");
+    }
+    if field == SSH_IMPORT_SOURCE_PATH_FIELD {
+        return app.t("menu.edit.field.ssh_import_source_path");
+    }
+    if field == SSH_IMPORT_PASSPHRASE_FIELD {
+        return app.t("menu.edit.field.ssh_import_passphrase");
+    }
     if field == TOKEN_CREATE_LABEL_FIELD {
         return app.t("menu.edit.field.token_create_label");
     }
@@ -2370,11 +3153,16 @@ fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
             let area = centered_rect(70, 28, frame.area());
             frame.render_widget(Clear, area);
             let input_prefix = app.t("menu.edit.input_prefix");
+            let display_value = if field == SSH_IMPORT_PASSPHRASE_FIELD {
+                "•".repeat(app.edit_input.chars().count())
+            } else {
+                app.edit_input.clone()
+            };
             let popup = Paragraph::new(vec![
                 Line::from(app.tf("menu.edit.field", &[("field", &field_label)])),
                 Line::from(app.t("menu.edit.hint")),
                 Line::from(""),
-                Line::from(format!("{input_prefix}{}", app.edit_input)),
+                Line::from(format!("{input_prefix}{display_value}")),
             ])
             .block(
                 Block::default()
@@ -2624,6 +3412,11 @@ fn security_entries(summary: &SecuritySummary, catalog: &Catalog) -> Vec<MenuEnt
             &catalog.t("menu.security.secret_count.desc"),
         ),
         info_entry(
+            &catalog.t("menu.security.ssh_key_count"),
+            Some(summary.ssh_key_count.to_string()),
+            &catalog.t("menu.security.ssh_key_count.desc"),
+        ),
+        info_entry(
             &catalog.t("menu.security.token_count"),
             Some(summary.token_count.to_string()),
             &catalog.t("menu.security.token_count.desc"),
@@ -2656,6 +3449,16 @@ fn security_entries(summary: &SecuritySummary, catalog: &Catalog) -> Vec<MenuEnt
                 &catalog.t("menu.security.unlocked_notice.desc"),
             ));
             entries.push(action_entry(
+                &catalog.t("menu.security.import_ssh_key_action"),
+                &catalog.t("menu.security.import_ssh_key_action.desc"),
+                ActionKind::OpenSshKeyImport,
+            ));
+            entries.push(action_entry(
+                &catalog.t("menu.security.ssh_key_management_action"),
+                &catalog.t("menu.security.ssh_key_management_action.desc"),
+                ActionKind::OpenSshKeyManagement,
+            ));
+            entries.push(action_entry(
                 &catalog.t("menu.security.create_token_action"),
                 &catalog.t("menu.security.create_token_action.desc"),
                 ActionKind::CreateToken,
@@ -2673,6 +3476,310 @@ fn security_entries(summary: &SecuritySummary, catalog: &Catalog) -> Vec<MenuEnt
         }
         _ => {}
     }
+    entries
+}
+
+fn ssh_key_import_entries(app: &MenuConfigApp, catalog: &Catalog) -> Vec<MenuEntry> {
+    if app.security_summary.lock_state != "unlocked" {
+        return vec![info_entry(
+            &catalog.t("menu.ssh_key.management.locked_hint"),
+            None,
+            &catalog.t("menu.ssh_key.management.locked_hint.desc"),
+        )];
+    }
+    let mut entries = vec![
+        MenuEntry {
+            label: catalog.t("menu.ssh_key.import.key_name"),
+            value: Some(app.ssh_import_draft.key_name.clone()),
+            description: catalog.t("menu.ssh_key.import.key_name.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::EditField(SSH_IMPORT_KEY_NAME_FIELD.to_string()),
+        },
+        MenuEntry {
+            label: catalog.t("menu.ssh_key.import.label"),
+            value: Some(app.ssh_import_draft.label.clone()),
+            description: catalog.t("menu.ssh_key.import.label.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::EditField(SSH_IMPORT_LABEL_FIELD.to_string()),
+        },
+        MenuEntry {
+            label: catalog.t("menu.ssh_key.import.source_path"),
+            value: Some(app.ssh_import_draft.source_path.clone()),
+            description: catalog.t("menu.ssh_key.import.source_path.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::EditField(SSH_IMPORT_SOURCE_PATH_FIELD.to_string()),
+        },
+        MenuEntry {
+            label: catalog.t("menu.ssh_key.import.passphrase"),
+            value: Some(if app.ssh_import_draft.passphrase.is_some() {
+                catalog.t("menu.ssh_key.import.passphrase_set")
+            } else {
+                catalog.t("menu.ssh_key.import.passphrase_unset")
+            }),
+            description: catalog.t("menu.ssh_key.import.passphrase.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::EditField(SSH_IMPORT_PASSPHRASE_FIELD.to_string()),
+        },
+    ];
+    if let Ok(preview) = canonical_ssh_private_key_ref_from_key_name(&app.ssh_import_draft.key_name)
+    {
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.import.preview_ref"),
+            Some(preview),
+            &catalog.t("menu.ssh_key.import.preview_ref.desc"),
+        ));
+    }
+    if let Some(result) = app.ssh_import_last_result.as_ref() {
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.import.result_ref"),
+            Some(result.credential_ref.clone()),
+            &catalog.t("menu.ssh_key.import.result_ref.desc"),
+        ));
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.import.result_version"),
+            Some(result.active_version.clone()),
+            &catalog.t("menu.ssh_key.import.result_version.desc"),
+        ));
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.import.result_status"),
+            Some(result.status.clone()),
+            &catalog.t("menu.ssh_key.import.result_status.desc"),
+        ));
+    }
+    entries.push(action_entry(
+        &catalog.t("menu.ssh_key.import.execute"),
+        &catalog.t("menu.ssh_key.import.execute.desc"),
+        ActionKind::ExecuteSshKeyImport,
+    ));
+    entries
+}
+
+fn ssh_key_management_entries(app: &MenuConfigApp, catalog: &Catalog) -> Vec<MenuEntry> {
+    if app.security_summary.lock_state != "unlocked" {
+        return vec![info_entry(
+            &catalog.t("menu.ssh_key.management.locked_hint"),
+            None,
+            &catalog.t("menu.ssh_key.management.locked_hint.desc"),
+        )];
+    }
+    if app.ssh_key_rows.is_empty() {
+        return vec![info_entry(
+            &catalog.t("menu.ssh_key.management.empty"),
+            None,
+            &catalog.t("menu.ssh_key.management.empty.desc"),
+        )];
+    }
+    app.ssh_key_rows
+        .iter()
+        .map(|item| {
+            let label = if item.label.trim().is_empty() {
+                item.credential_ref.clone()
+            } else {
+                item.label.clone()
+            };
+            action_entry(
+                &format!("{} [{}] {}", label, item.status, item.active_version),
+                &catalog.t("menu.ssh_key.management.row.desc"),
+                ActionKind::OpenSshKeyDetail(item.credential_ref.clone()),
+            )
+        })
+        .collect()
+}
+
+fn ssh_key_detail_entries(
+    app: &MenuConfigApp,
+    catalog: &Catalog,
+    credential_ref: &str,
+) -> Vec<MenuEntry> {
+    if app.security_summary.lock_state != "unlocked" {
+        return vec![info_entry(
+            &catalog.t("menu.ssh_key.management.locked_hint"),
+            None,
+            &catalog.t("menu.ssh_key.management.locked_hint.desc"),
+        )];
+    }
+    let mut entries = Vec::new();
+    if let Some(row) = app
+        .ssh_key_rows
+        .iter()
+        .find(|item| item.credential_ref == credential_ref)
+    {
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.detail.credential_ref"),
+            Some(row.credential_ref.clone()),
+            &catalog.t("menu.ssh_key.detail.credential_ref.desc"),
+        ));
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.detail.label"),
+            Some(row.label.clone()),
+            &catalog.t("menu.ssh_key.detail.label.desc"),
+        ));
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.detail.kind"),
+            Some("ssh-private-key".to_string()),
+            &catalog.t("menu.ssh_key.detail.kind.desc"),
+        ));
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.detail.status"),
+            Some(row.status.clone()),
+            &catalog.t("menu.ssh_key.detail.status.desc"),
+        ));
+        entries.push(info_entry(
+            &catalog.t("menu.ssh_key.detail.active_version"),
+            Some(row.active_version.clone()),
+            &catalog.t("menu.ssh_key.detail.active_version.desc"),
+        ));
+    }
+    if let Some(router) = app.vault_router.as_ref() {
+        if let Ok(Some(metadata)) = router.secret_metadata(credential_ref) {
+            entries.push(info_entry(
+                &catalog.t("menu.ssh_key.detail.last_rotated"),
+                Some(
+                    metadata
+                        .record
+                        .last_rotated_at
+                        .and_then(format_short_utc_date)
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                &catalog.t("menu.ssh_key.detail.last_rotated.desc"),
+            ));
+            entries.push(info_entry(
+                &catalog.t("menu.ssh_key.detail.last_used"),
+                Some(
+                    metadata
+                        .record
+                        .last_used_at
+                        .and_then(format_short_utc_date)
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                &catalog.t("menu.ssh_key.detail.last_used.desc"),
+            ));
+        }
+    }
+    entries.push(action_entry(
+        &catalog.t("menu.ssh_key.detail.delete"),
+        &catalog.t("menu.ssh_key.detail.delete.desc"),
+        ActionKind::DeleteSshKey(credential_ref.to_string()),
+    ));
+    entries
+}
+
+fn target_credential_source_entries(
+    app: &MenuConfigApp,
+    index: usize,
+    catalog: &Catalog,
+) -> Vec<MenuEntry> {
+    let Some(target) = app.settings.targets.get(index) else {
+        return target_missing_entries(catalog);
+    };
+    if !matches!(target.kind, TargetKind::Ssh) {
+        return vec![info_entry(
+            &catalog.t("menu.target.credential_source_ssh_only"),
+            None,
+            &catalog.t("menu.target.credential_source_ssh_only.desc"),
+        )];
+    }
+    if is_sensitive_target(target) && app.security_summary.lock_state != "unlocked" {
+        return vec![
+            info_entry(
+                &catalog.t("menu.target.sensitive_locked_hint"),
+                None,
+                &catalog.t("menu.target.sensitive_locked_hint.desc"),
+            ),
+            action_entry(
+                &catalog.t("menu.security.unlock_action"),
+                &catalog.t("menu.security.unlock_action.desc"),
+                ActionKind::UnlockVault,
+            ),
+        ];
+    }
+    vec![
+        info_entry(
+            &catalog.t("menu.target.credential_ref"),
+            Some(target.credential_ref.as_deref().unwrap_or("").to_string()),
+            &catalog.t("menu.target.credential_ref.desc"),
+        ),
+        action_entry(
+            &catalog.t("menu.target.credential_picker"),
+            &catalog.t("menu.target.credential_picker.desc"),
+            ActionKind::OpenTargetCredentialPicker(index),
+        ),
+        action_entry(
+            &catalog.t("menu.target.import_local_ssh_key"),
+            &catalog.t("menu.target.import_local_ssh_key.desc"),
+            ActionKind::ImportLocalSshKeyIntoVault(index),
+        ),
+        action_entry(
+            &catalog.t("menu.target.manual_credential_ref"),
+            &catalog.t("menu.target.manual_credential_ref.desc"),
+            ActionKind::EditTargetCredentialRef(index),
+        ),
+        action_entry(
+            &catalog.t("menu.target.clear_credential_ref"),
+            &catalog.t("menu.target.clear_credential_ref.desc"),
+            ActionKind::ClearTargetCredentialRef(index),
+        ),
+    ]
+}
+
+fn target_credential_picker_entries(
+    app: &MenuConfigApp,
+    index: usize,
+    catalog: &Catalog,
+) -> Vec<MenuEntry> {
+    if app.security_summary.lock_state != "unlocked" {
+        return vec![info_entry(
+            &catalog.t("menu.ssh_key.management.locked_hint"),
+            None,
+            &catalog.t("menu.ssh_key.management.locked_hint.desc"),
+        )];
+    }
+    if app.ssh_key_rows.is_empty() {
+        return vec![
+            info_entry(
+                &catalog.t("menu.target.credential_picker_empty"),
+                None,
+                &catalog.t("menu.target.credential_picker_empty.desc"),
+            ),
+            action_entry(
+                &catalog.t("menu.target.import_local_ssh_key"),
+                &catalog.t("menu.target.import_local_ssh_key.desc"),
+                ActionKind::ImportLocalSshKeyIntoVault(index),
+            ),
+        ];
+    }
+    let selected_ref = app
+        .settings
+        .targets
+        .get(index)
+        .and_then(|target| target.credential_ref.as_deref())
+        .unwrap_or("");
+    let mut entries = app
+        .ssh_key_rows
+        .iter()
+        .map(|item| MenuEntry {
+            label: format!("{} [{}] {}", item.label, item.status, item.active_version),
+            value: Some(
+                if selected_ref == item.credential_ref {
+                    "selected"
+                } else {
+                    "unselected"
+                }
+                .to_string(),
+            ),
+            description: catalog.t("menu.target.credential_picker_row.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::Action(ActionKind::BindTargetCredentialRef {
+                target_index: index,
+                credential_ref: item.credential_ref.clone(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    entries.push(action_entry(
+        &catalog.t("menu.target.import_local_ssh_key"),
+        &catalog.t("menu.target.import_local_ssh_key.desc"),
+        ActionKind::ImportLocalSshKeyIntoVault(index),
+    ));
     entries
 }
 
@@ -2879,7 +3986,33 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-fn targets_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
+fn targets_entries(app: &MenuConfigApp, catalog: &Catalog) -> Vec<MenuEntry> {
+    let mut entries = app
+        .settings
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| MenuEntry {
+            label: format!(
+                "{} ({})",
+                target.display_name,
+                target_kind_label(&target.kind, catalog)
+            ),
+            value: Some(target.id.clone()),
+            description: catalog.t("menu.targets.editor_open"),
+            dirty_key: None,
+            kind: MenuEntryKind::Navigate(Screen::TargetEditor(index)),
+        })
+        .collect::<Vec<_>>();
+    entries.push(action_entry(
+        &catalog.t("menu.targets.add_target"),
+        &catalog.t("menu.targets.add_target.desc"),
+        ActionKind::OpenAddTarget,
+    ));
+    entries
+}
+
+fn targets_entries_from_settings(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
     let mut entries = settings
         .targets
         .iter()
@@ -2897,31 +4030,164 @@ fn targets_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry>
         })
         .collect::<Vec<_>>();
     entries.push(action_entry(
-        &catalog.t("menu.targets.add_ssh"),
-        &catalog.t("menu.targets.add_ssh.desc"),
-        ActionKind::AddSshTarget,
-    ));
-    entries.push(action_entry(
-        &catalog.t("menu.targets.add_adb"),
-        &catalog.t("menu.targets.add_adb.desc"),
-        ActionKind::AddAdbTarget,
+        &catalog.t("menu.targets.add_target"),
+        &catalog.t("menu.targets.add_target.desc"),
+        ActionKind::OpenAddTarget,
     ));
     entries
 }
 
-fn target_editor_entries(
+fn target_add_mode_entries(app: &MenuConfigApp, catalog: &Catalog) -> Vec<MenuEntry> {
+    let mut entries = vec![action_entry(
+        &catalog.t("menu.targets.mode_plain"),
+        &catalog.t("menu.targets.mode_plain.desc"),
+        ActionKind::ChoosePlainTargetMode,
+    )];
+    if app.security_summary.lock_state == "unlocked" {
+        entries.push(action_entry(
+            &catalog.t("menu.targets.mode_sensitive"),
+            &catalog.t("menu.targets.mode_sensitive.desc"),
+            ActionKind::ChooseSensitiveTargetMode,
+        ));
+    } else {
+        entries.push(action_entry(
+            &catalog.t("menu.targets.mode_sensitive_locked"),
+            &catalog.t("menu.targets.mode_sensitive_locked.desc"),
+            ActionKind::UnlockVault,
+        ));
+    }
+    entries
+}
+
+fn target_add_type_entries(sensitive: bool, catalog: &Catalog) -> Vec<MenuEntry> {
+    if sensitive {
+        return vec![
+            action_entry(
+                &catalog.t("menu.targets.add_ssh"),
+                &catalog.t("menu.targets.add_sensitive_ssh.desc"),
+                ActionKind::AddSensitiveSshTarget,
+            ),
+            action_entry(
+                &catalog.t("menu.targets.add_adb"),
+                &catalog.t("menu.targets.add_sensitive_adb.desc"),
+                ActionKind::AddSensitiveAdbTarget,
+            ),
+        ];
+    }
+    vec![
+        action_entry(
+            &catalog.t("menu.targets.add_ssh"),
+            &catalog.t("menu.targets.add_plain_ssh.desc"),
+            ActionKind::AddSshTarget,
+        ),
+        action_entry(
+            &catalog.t("menu.targets.add_adb"),
+            &catalog.t("menu.targets.add_plain_adb.desc"),
+            ActionKind::AddAdbTarget,
+        ),
+    ]
+}
+
+fn target_editor_entries(app: &MenuConfigApp, index: usize, catalog: &Catalog) -> Vec<MenuEntry> {
+    let Some(target) = app.settings.targets.get(index) else {
+        return target_missing_entries(catalog);
+    };
+    let creating = app
+        .target_edit_session
+        .as_ref()
+        .map(|session| session.index == index && session.is_new)
+        .unwrap_or(false);
+    let sensitive = is_sensitive_target(target);
+    let locked_sensitive = sensitive && app.security_summary.lock_state != "unlocked";
+    let apply_label = if creating {
+        catalog.t("menu.target.create_target")
+    } else {
+        catalog.t("menu.target.apply_target")
+    };
+    let apply_desc = if creating {
+        catalog.t("menu.target.create_target.desc")
+    } else {
+        catalog.t("menu.target.apply_target.desc")
+    };
+    let apply_entry = action_entry(
+        &apply_label,
+        &apply_desc,
+        ActionKind::ApplyTarget(index),
+    );
+    let mut entries = vec![nav_entry(
+        &catalog.t("menu.target.public_descriptor"),
+        &catalog.t("menu.target.public_descriptor.desc"),
+        Screen::TargetPublicDescriptor(index),
+    )];
+    if !sensitive {
+        entries.push(nav_entry(
+            &catalog.t("menu.target.connection_profile"),
+            &catalog.t("menu.target.connection_profile.desc"),
+            Screen::TargetConnectionProfile(index),
+        ));
+        entries.push(nav_entry(
+            &catalog.t("menu.target.policy"),
+            &catalog.t("menu.target.policy.desc"),
+            Screen::TargetPolicy(index),
+        ));
+        entries.push(apply_entry);
+        if !creating {
+            entries.push(action_entry(
+                &catalog.t("menu.target.delete"),
+                &catalog.t("menu.target.delete.desc"),
+                ActionKind::DeleteTarget(index),
+            ));
+        }
+        return entries;
+    }
+    if locked_sensitive {
+        entries.push(info_entry(
+            &catalog.t("menu.target.sensitive_locked_hint"),
+            None,
+            &catalog.t("menu.target.sensitive_locked_hint.desc"),
+        ));
+        entries.push(action_entry(
+            &catalog.t("menu.security.unlock_action"),
+            &catalog.t("menu.security.unlock_action.desc"),
+            ActionKind::UnlockVault,
+        ));
+        return entries;
+    }
+    entries.push(nav_entry(
+        &catalog.t("menu.target.sensitive_overlay"),
+        &catalog.t("menu.target.sensitive_overlay.desc"),
+        Screen::TargetSensitiveOverlay(index),
+    ));
+    entries.push(nav_entry(
+        &catalog.t("menu.target.policy"),
+        &catalog.t("menu.target.policy.desc"),
+        Screen::TargetPolicy(index),
+    ));
+    entries.push(apply_entry);
+    if !creating {
+        entries.push(action_entry(
+            &catalog.t("menu.target.delete"),
+            &catalog.t("menu.target.delete.desc"),
+            ActionKind::DeleteTarget(index),
+        ));
+    }
+    entries
+}
+
+fn target_public_descriptor_entries(
     settings: &CoreSettings,
     index: usize,
     catalog: &Catalog,
 ) -> Vec<MenuEntry> {
     let Some(target) = settings.targets.get(index) else {
-        return vec![info_entry(
-            &catalog.t("menu.target.missing"),
-            None,
-            &catalog.t("menu.target.missing.desc"),
-        )];
+        return target_missing_entries(catalog);
     };
-    let mut entries = vec![
+    vec![
+        info_entry(
+            &catalog.t("menu.target.kind"),
+            Some(target_kind_label(&target.kind, catalog)),
+            &catalog.t("menu.target.kind.desc"),
+        ),
         edit_entry(
             &catalog.t("menu.target.id"),
             &format!("targets[{index}].id"),
@@ -2946,19 +4212,175 @@ fn target_editor_entries(
             &target.aliases.join(","),
             &catalog.t("menu.target.aliases.desc"),
         ),
-        edit_entry(
+    ]
+}
+
+fn target_connection_profile_entries(
+    settings: &CoreSettings,
+    index: usize,
+    catalog: &Catalog,
+) -> Vec<MenuEntry> {
+    let Some(target) = settings.targets.get(index) else {
+        return target_missing_entries(catalog);
+    };
+    if is_sensitive_target(target) {
+        return vec![info_entry(
+            &catalog.t("menu.target.sensitive_only"),
+            None,
+            &catalog.t("menu.target.sensitive_only.desc"),
+        )];
+    }
+    let mut entries = vec![edit_entry(
+        &catalog.t("menu.target.notes"),
+        &format!("targets[{index}].notes"),
+        target.notes.as_deref().unwrap_or(""),
+        &catalog.t("menu.target.notes.desc"),
+    )];
+    match &target.kind {
+        TargetKind::Ssh => {
+            entries.insert(
+                0,
+                action_entry(
+                    &catalog.t("menu.target.credential_source"),
+                    &catalog.t("menu.target.credential_source.desc"),
+                    ActionKind::OpenTargetCredentialSource(index),
+                ),
+            );
+            entries.insert(
+                1,
+                info_entry(
+                    &catalog.t("menu.target.credential_ref"),
+                    Some(target.credential_ref.as_deref().unwrap_or("").to_string()),
+                    &catalog.t("menu.target.credential_ref.desc"),
+                ),
+            );
+            entries.push(edit_entry(
+                &catalog.t("menu.target.ssh_host"),
+                &format!("targets[{index}].connection.host"),
+                target.connection.host.as_deref().unwrap_or(""),
+                &catalog.t("menu.target.ssh_host.desc"),
+            ));
+            entries.push(edit_entry(
+                &catalog.t("menu.target.ssh_port"),
+                &format!("targets[{index}].connection.port"),
+                &target
+                    .connection
+                    .port
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                &catalog.t("menu.target.ssh_port.desc"),
+            ));
+            entries.push(edit_entry(
+                &catalog.t("menu.target.ssh_username"),
+                &format!("targets[{index}].connection.username"),
+                target.connection.username.as_deref().unwrap_or(""),
+                &catalog.t("menu.target.ssh_username.desc"),
+            ));
+        }
+        TargetKind::Adb => {
+            entries.insert(
+                0,
+                edit_entry(
+                    &catalog.t("menu.target.credential_ref"),
+                    &format!("targets[{index}].credential_ref"),
+                    target.credential_ref.as_deref().unwrap_or(""),
+                    &catalog.t("menu.target.credential_ref.desc"),
+                ),
+            );
+            entries.push(edit_entry(
+                &catalog.t("menu.target.selector_kind"),
+                &format!("targets[{index}].connection.selector_kind"),
+                target.connection.selector_kind.as_deref().unwrap_or(""),
+                &catalog.t("menu.target.selector_kind.desc"),
+            ));
+            entries.push(edit_entry(
+                &catalog.t("menu.target.selector_value"),
+                &format!("targets[{index}].connection.selector_value"),
+                target.connection.selector_value.as_deref().unwrap_or(""),
+                &catalog.t("menu.target.selector_value.desc"),
+            ));
+        }
+        _ => {
+            entries.insert(
+                0,
+                edit_entry(
+                    &catalog.t("menu.target.credential_ref"),
+                    &format!("targets[{index}].credential_ref"),
+                    target.credential_ref.as_deref().unwrap_or(""),
+                    &catalog.t("menu.target.credential_ref.desc"),
+                ),
+            );
+        }
+    }
+    entries
+}
+
+fn target_sensitive_overlay_entries(
+    app: &MenuConfigApp,
+    index: usize,
+    catalog: &Catalog,
+) -> Vec<MenuEntry> {
+    let Some(target) = app.settings.targets.get(index) else {
+        return target_missing_entries(catalog);
+    };
+    if !is_sensitive_target(target) {
+        return vec![info_entry(
+            &catalog.t("menu.target.plain_only"),
+            None,
+            &catalog.t("menu.target.plain_only.desc"),
+        )];
+    }
+    if app.security_summary.lock_state != "unlocked" {
+        return vec![
+            info_entry(
+                &catalog.t("menu.target.sensitive_locked_hint"),
+                None,
+                &catalog.t("menu.target.sensitive_locked_hint.desc"),
+            ),
+            action_entry(
+                &catalog.t("menu.security.unlock_action"),
+                &catalog.t("menu.security.unlock_action.desc"),
+                ActionKind::UnlockVault,
+            ),
+        ];
+    }
+    target_sensitive_overlay_entries_from_settings(&app.settings, index, catalog)
+}
+
+fn target_sensitive_overlay_entries_from_settings(
+    settings: &CoreSettings,
+    index: usize,
+    catalog: &Catalog,
+) -> Vec<MenuEntry> {
+    let Some(target) = settings.targets.get(index) else {
+        return target_missing_entries(catalog);
+    };
+    let mut entries = Vec::new();
+    if target.kind == TargetKind::Ssh {
+        entries.push(action_entry(
+            &catalog.t("menu.target.credential_source"),
+            &catalog.t("menu.target.credential_source.desc"),
+            ActionKind::OpenTargetCredentialSource(index),
+        ));
+        entries.push(info_entry(
+            &catalog.t("menu.target.credential_ref"),
+            Some(target.credential_ref.as_deref().unwrap_or("").to_string()),
+            &catalog.t("menu.target.credential_ref.desc"),
+        ));
+    } else {
+        entries.push(edit_entry(
             &catalog.t("menu.target.credential_ref"),
             &format!("targets[{index}].credential_ref"),
             target.credential_ref.as_deref().unwrap_or(""),
             &catalog.t("menu.target.credential_ref.desc"),
-        ),
-        edit_entry(
-            &catalog.t("menu.target.notes"),
-            &format!("targets[{index}].notes"),
-            target.notes.as_deref().unwrap_or(""),
-            &catalog.t("menu.target.notes.desc"),
-        ),
-    ];
+        ));
+    }
+    entries.push(edit_entry(
+        &catalog.t("menu.target.notes"),
+        &format!("targets[{index}].notes"),
+        target.notes.as_deref().unwrap_or(""),
+        &catalog.t("menu.target.notes.desc"),
+    ));
     match &target.kind {
         TargetKind::Ssh => {
             entries.push(edit_entry(
@@ -3003,6 +4425,117 @@ fn target_editor_entries(
     entries
 }
 
+fn target_policy_entries(app: &MenuConfigApp, index: usize, catalog: &Catalog) -> Vec<MenuEntry> {
+    let Some(target) = app.settings.targets.get(index) else {
+        return target_missing_entries(catalog);
+    };
+    if is_sensitive_target(target) && app.security_summary.lock_state != "unlocked" {
+        return vec![
+            info_entry(
+                &catalog.t("menu.target.sensitive_locked_hint"),
+                None,
+                &catalog.t("menu.target.sensitive_locked_hint.desc"),
+            ),
+            action_entry(
+                &catalog.t("menu.security.unlock_action"),
+                &catalog.t("menu.security.unlock_action.desc"),
+                ActionKind::UnlockVault,
+            ),
+        ];
+    }
+    vec![
+        edit_entry(
+            &catalog.t("menu.target.storage_class"),
+            &format!("targets[{index}].storage_class"),
+            &target.storage_class,
+            &catalog.t("menu.target.storage_class.desc"),
+        ),
+        edit_entry(
+            &catalog.t("menu.target.access_class"),
+            &format!("targets[{index}].access_class"),
+            &target.access_class,
+            &catalog.t("menu.target.access_class.desc"),
+        ),
+        edit_entry(
+            &catalog.t("menu.target.sealed_profile_ref"),
+            &format!("targets[{index}].sealed_profile_ref"),
+            target.sealed_profile_ref.as_deref().unwrap_or(""),
+            &catalog.t("menu.target.sealed_profile_ref.desc"),
+        ),
+    ]
+}
+
+fn target_editable_entries_from_settings(
+    settings: &CoreSettings,
+    index: usize,
+    catalog: &Catalog,
+) -> Vec<MenuEntry> {
+    let Some(target) = settings.targets.get(index) else {
+        return Vec::new();
+    };
+    let mut entries = target_public_descriptor_entries(settings, index, catalog)
+        .into_iter()
+        .filter(|entry| matches!(entry.kind, MenuEntryKind::EditField(_)))
+        .collect::<Vec<_>>();
+    if is_sensitive_target(target) {
+        entries.extend(
+            target_sensitive_overlay_entries_from_settings(settings, index, catalog)
+                .into_iter()
+                .filter(|entry| matches!(entry.kind, MenuEntryKind::EditField(_))),
+        );
+    } else {
+        entries.extend(
+            target_connection_profile_entries(settings, index, catalog)
+                .into_iter()
+                .filter(|entry| matches!(entry.kind, MenuEntryKind::EditField(_))),
+        );
+    }
+    entries.extend(
+        target_policy_entries_from_settings(settings, index, catalog)
+            .into_iter()
+            .filter(|entry| matches!(entry.kind, MenuEntryKind::EditField(_))),
+    );
+    entries
+}
+
+fn target_policy_entries_from_settings(
+    settings: &CoreSettings,
+    index: usize,
+    catalog: &Catalog,
+) -> Vec<MenuEntry> {
+    let Some(target) = settings.targets.get(index) else {
+        return target_missing_entries(catalog);
+    };
+    vec![
+        edit_entry(
+            &catalog.t("menu.target.storage_class"),
+            &format!("targets[{index}].storage_class"),
+            &target.storage_class,
+            &catalog.t("menu.target.storage_class.desc"),
+        ),
+        edit_entry(
+            &catalog.t("menu.target.access_class"),
+            &format!("targets[{index}].access_class"),
+            &target.access_class,
+            &catalog.t("menu.target.access_class.desc"),
+        ),
+        edit_entry(
+            &catalog.t("menu.target.sealed_profile_ref"),
+            &format!("targets[{index}].sealed_profile_ref"),
+            target.sealed_profile_ref.as_deref().unwrap_or(""),
+            &catalog.t("menu.target.sealed_profile_ref.desc"),
+        ),
+    ]
+}
+
+fn target_missing_entries(catalog: &Catalog) -> Vec<MenuEntry> {
+    vec![info_entry(
+        &catalog.t("menu.target.missing"),
+        None,
+        &catalog.t("menu.target.missing.desc"),
+    )]
+}
+
 fn search_entries(settings: &CoreSettings, query: &str, catalog: &Catalog) -> Vec<MenuEntry> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -3019,7 +4552,7 @@ fn search_entries(settings: &CoreSettings, query: &str, catalog: &Catalog) -> Ve
         .chain(storage_entries(settings, catalog))
         .chain(model_plane_entries(settings, catalog))
         .chain(vault_entries(settings, catalog))
-        .chain(targets_entries(settings, catalog))
+        .chain(targets_entries_from_settings(settings, catalog))
         .chain(flatten_target_fields(settings, catalog))
     {
         let text = format!(
@@ -3041,7 +4574,7 @@ fn search_entries(settings: &CoreSettings, query: &str, catalog: &Catalog) -> Ve
                     description: entry.description,
                     dirty_key: entry.dirty_key.clone(),
                     kind: MenuEntryKind::FocusField {
-                        screen: screen_for_field(&field),
+                        screen: screen_for_field(settings, &field),
                         field,
                     },
                 },
@@ -3070,7 +4603,9 @@ fn search_entries(settings: &CoreSettings, query: &str, catalog: &Catalog) -> Ve
 fn flatten_target_fields(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
     let mut entries = Vec::new();
     for index in 0..settings.targets.len() {
-        entries.extend(target_editor_entries(settings, index, catalog));
+        entries.extend(target_editable_entries_from_settings(
+            settings, index, catalog,
+        ));
     }
     entries
 }
@@ -3191,6 +4726,9 @@ fn target_field_value(settings: &CoreSettings, field: &str) -> Option<String> {
         "aliases" => Some(target.aliases.join(",")),
         "credential_ref" => Some(target.credential_ref.clone().unwrap_or_default()),
         "notes" => Some(target.notes.clone().unwrap_or_default()),
+        "storage_class" => Some(target.storage_class.clone()),
+        "access_class" => Some(target.access_class.clone()),
+        "sealed_profile_ref" => Some(target.sealed_profile_ref.clone().unwrap_or_default()),
         "connection.host" => Some(target.connection.host.clone().unwrap_or_default()),
         "connection.port" => Some(
             target
@@ -3278,6 +4816,15 @@ fn apply_target_field_edit(
                 Some(value.to_string())
             };
         }
+        "storage_class" => target.storage_class = value.to_string(),
+        "access_class" => target.access_class = value.to_string(),
+        "sealed_profile_ref" => {
+            target.sealed_profile_ref = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.trim().to_string())
+            };
+        }
         "connection.host" => {
             target.connection.host = if value.trim().is_empty() {
                 None
@@ -3330,7 +4877,7 @@ fn parse_target_field(field: &str) -> Option<(usize, &str)> {
     Some((index, suffix))
 }
 
-fn screen_for_field(field: &str) -> Screen {
+fn screen_for_field(settings: &CoreSettings, field: &str) -> Screen {
     match field {
         "core.instance_name" | "core.log_level" => Screen::Core,
         "core.operator_locale" => Screen::Core,
@@ -3339,9 +4886,39 @@ fn screen_for_field(field: &str) -> Screen {
         | "model_plane.http.port"
         | "model_plane.http.allow_non_loopback" => Screen::ModelPlane,
         "vault.unlock.trigger_policy" => Screen::Vault,
-        _ => parse_target_field(field)
-            .map(|(index, _)| Screen::TargetEditor(index))
-            .unwrap_or(Screen::Root),
+        _ => {
+            let Some((index, suffix)) = parse_target_field(field) else {
+                return Screen::Root;
+            };
+            let Some(target) = settings.targets.get(index) else {
+                return Screen::TargetEditor(index);
+            };
+            match suffix {
+                "id" | "display_name" | "enabled" | "aliases" => {
+                    Screen::TargetPublicDescriptor(index)
+                }
+                "storage_class" | "access_class" | "sealed_profile_ref" => {
+                    Screen::TargetPolicy(index)
+                }
+                "credential_ref"
+                | "notes"
+                | "connection.host"
+                | "connection.port"
+                | "connection.username"
+                | "connection.selector_kind"
+                | "connection.selector_value" => {
+                    if suffix == "credential_ref" && matches!(target.kind, TargetKind::Ssh) {
+                        return Screen::TargetCredentialSource(index);
+                    }
+                    if is_sensitive_target(target) {
+                        Screen::TargetSensitiveOverlay(index)
+                    } else {
+                        Screen::TargetConnectionProfile(index)
+                    }
+                }
+                _ => Screen::TargetEditor(index),
+            }
+        }
     }
 }
 
@@ -3393,6 +4970,7 @@ fn build_security_summary_from_projection(
         trigger_policy: settings.vault.unlock.trigger_policy.clone(),
         preferred_method: settings.vault.unlock.preferred_method.clone(),
         secret_count: projection.secret_count,
+        ssh_key_count: projection.secret_count,
         token_count: projection.token_count,
     }
 }
@@ -3401,12 +4979,17 @@ fn build_security_summary_from_router(
     settings: &CoreSettings,
     router: &mut SecretVaultRouter,
 ) -> SecuritySummary {
+    let secret_summaries = router.list_secret_summaries();
     SecuritySummary {
         backend: settings.vault.backend.clone(),
         lock_state: router.vault_lock_state().as_str().to_string(),
         trigger_policy: settings.vault.unlock.trigger_policy.clone(),
         preferred_method: settings.vault.unlock.preferred_method.clone(),
-        secret_count: router.list_secret_summaries().len(),
+        secret_count: secret_summaries.len(),
+        ssh_key_count: secret_summaries
+            .iter()
+            .filter(|item| item.kind.eq_ignore_ascii_case("ssh-private-key"))
+            .count(),
         token_count: router.list_agent_tokens().len(),
     }
 }
@@ -3453,6 +5036,17 @@ fn mint_local_admin_attestation(
         )
         .map_err(|err| format!("complete local admin attestation failed: {err:?}"))?;
     Ok(attestation.attestation_id)
+}
+
+fn is_sensitive_target(target: &StandaloneTargetProfile) -> bool {
+    target
+        .storage_class
+        .trim()
+        .eq_ignore_ascii_case("sealed-overlay")
+        || target
+            .storage_class
+            .trim()
+            .eq_ignore_ascii_case("sealed-full")
 }
 
 fn default_ssh_target(index: usize) -> StandaloneTargetProfile {
@@ -3515,6 +5109,26 @@ fn default_adb_target(index: usize) -> StandaloneTargetProfile {
     }
 }
 
+fn default_sensitive_ssh_target(index: usize) -> StandaloneTargetProfile {
+    let mut target = default_ssh_target(index);
+    target.id = format!("sensitive-ssh-{}", index + 1);
+    target.display_name = format!("Sensitive SSH {}", index + 1);
+    target.storage_class = "sealed-overlay".into();
+    target.access_class = "token-scoped".into();
+    target.sealed_profile_ref = Some(format!("vault://bridgingio/target-profile/{}", target.id));
+    target
+}
+
+fn default_sensitive_adb_target(index: usize) -> StandaloneTargetProfile {
+    let mut target = default_adb_target(index);
+    target.id = format!("sensitive-adb-{}", index + 1);
+    target.display_name = format!("Sensitive ADB {}", index + 1);
+    target.storage_class = "sealed-overlay".into();
+    target.access_class = "token-scoped".into();
+    target.sealed_profile_ref = Some(format!("vault://bridgingio/target-profile/{}", target.id));
+    target
+}
+
 fn target_kind_label(kind: &TargetKind, catalog: &Catalog) -> String {
     match kind {
         TargetKind::Ssh => catalog.t("menu.value.target_kind.ssh"),
@@ -3540,7 +5154,9 @@ mod tests {
     use super::{ActionKind, EditModeKind, MenuConfigApp, MenuEntryKind, Screen};
     use bridgingio_domain::TargetKind;
     use bridgingio_engine::CoreSettings;
-    use bridgingio_secrets::{SecretVaultRouter, VaultUnlockTriggerPolicy};
+    use bridgingio_secrets::{
+        SecretBytes, SecretVaultRouter, TrustedLocalSshKeyImportRequest, VaultUnlockTriggerPolicy,
+    };
     use crossterm::event::KeyCode;
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier};
@@ -3571,6 +5187,9 @@ mod tests {
         fs::write(config_path, updated).expect("write config with custom data dir");
     }
 
+    const TEST_PRIVATE_KEY_PEM: &str =
+        "-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n";
+
     #[test]
     fn search_results_find_trigger_policy_field() {
         let config_path = temp_config_path("search");
@@ -3590,9 +5209,224 @@ mod tests {
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         app.run_action(ActionKind::AddSshTarget)
             .expect("add ssh target");
+        assert!(matches!(
+            app.confirm_action,
+            Some(super::ConfirmAction::ConfirmPlainSshRisk)
+        ));
+        app.handle_confirm_key(KeyCode::Enter)
+            .expect("confirm plain ssh risk");
         assert_eq!(app.screen, Screen::TargetEditor(1));
         assert_eq!(app.settings.targets.len(), 2);
         assert_eq!(app.settings.targets[1].kind, TargetKind::Ssh);
+    }
+
+    #[test]
+    fn add_sensitive_target_action_requires_unlock_and_then_creates_target() {
+        let config_path = temp_config_path("add-sensitive-target");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+
+        app.security_summary.lock_state = "locked".into();
+        app.run_action(ActionKind::AddSensitiveSshTarget)
+            .expect("attempt add sensitive target while locked");
+        assert_eq!(app.settings.targets.len(), 1);
+        assert_eq!(
+            app.last_status,
+            app.t("menu.status.vault_locked_for_sensitive_target")
+        );
+
+        app.security_summary.lock_state = "unlocked".into();
+        app.run_action(ActionKind::AddSensitiveSshTarget)
+            .expect("add sensitive target while unlocked");
+        assert_eq!(app.settings.targets.len(), 2);
+        assert!(super::is_sensitive_target(&app.settings.targets[1]));
+        assert_eq!(app.screen, Screen::TargetEditor(1));
+    }
+
+    #[test]
+    fn target_editor_plain_target_uses_segmented_entries() {
+        let config_path = temp_config_path("plain-segmented-target-editor");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::TargetEditor(0);
+        let entries = app.entries();
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Navigate(Screen::TargetPublicDescriptor(0))
+        )));
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Navigate(Screen::TargetConnectionProfile(0))
+        )));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Navigate(Screen::TargetPolicy(0)))));
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::ApplyTarget(0))
+        )));
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::DeleteTarget(0))
+        )));
+    }
+
+    #[test]
+    fn target_editor_create_mode_shows_create_without_delete() {
+        let config_path = temp_config_path("target-create-mode-actions");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.run_action(ActionKind::AddAdbTarget)
+            .expect("open create target editor");
+        let entries = app.entries();
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::ApplyTarget(1))
+        )));
+        let create_entry = entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::ApplyTarget(1))
+                )
+            })
+            .expect("create action entry");
+        assert_eq!(create_entry.label, app.t("menu.target.create_target"));
+        assert!(!entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::DeleteTarget(1))
+        )));
+    }
+
+    #[test]
+    fn leaving_create_target_flow_prompts_and_discards_draft() {
+        let config_path = temp_config_path("target-create-discard-confirm");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.run_action(ActionKind::AddAdbTarget)
+            .expect("open create target editor");
+        app.apply_edit_value("targets[1].display_name", "Draft Target")
+            .expect("edit draft target");
+
+        let outcome = app.request_exit_or_back().expect("request back");
+        assert!(outcome.is_none());
+        assert!(matches!(
+            app.confirm_action,
+            Some(super::ConfirmAction::DiscardNewTarget(1))
+        ));
+        app.handle_confirm_key(KeyCode::Enter)
+            .expect("confirm discard draft");
+        assert_eq!(app.settings.targets.len(), 1);
+        assert_eq!(app.screen, Screen::Root);
+    }
+
+    #[test]
+    fn leaving_existing_target_without_apply_prompts_and_reverts_changes() {
+        let config_path = temp_config_path("target-existing-discard-confirm");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Targets;
+        app.selected = 0;
+        app.activate_selected()
+            .expect("open existing target editor");
+        assert_eq!(app.screen, Screen::TargetEditor(0));
+        let original = app.settings.targets[0].display_name.clone();
+        app.apply_edit_value("targets[0].display_name", "Changed Name")
+            .expect("edit existing target");
+
+        let outcome = app.request_exit_or_back().expect("request back");
+        assert!(outcome.is_none());
+        assert!(matches!(
+            app.confirm_action,
+            Some(super::ConfirmAction::DiscardTargetChanges(0))
+        ));
+        app.handle_confirm_key(KeyCode::Enter)
+            .expect("confirm discard existing target changes");
+        assert_eq!(app.screen, Screen::Targets);
+        assert_eq!(app.settings.targets[0].display_name, original);
+    }
+
+    #[test]
+    fn locked_sensitive_target_editor_hides_overlay_and_delete_entries() {
+        let config_path = temp_config_path("locked-sensitive-target-editor");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let index = app.settings.targets.len();
+        app.settings
+            .targets
+            .push(super::default_sensitive_ssh_target(index));
+        app.security_summary.lock_state = "locked".into();
+        app.screen = Screen::TargetEditor(index);
+        let entries = app.entries();
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Navigate(Screen::TargetPublicDescriptor(i)) if i == index
+        )));
+        assert!(!entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Navigate(Screen::TargetSensitiveOverlay(i)) if i == index
+        )));
+        assert!(!entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::DeleteTarget(i)) if i == index
+        )));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Action(ActionKind::UnlockVault))));
+    }
+
+    #[test]
+    fn sensitive_ssh_overlay_shows_credential_source_only_when_unlocked() {
+        let config_path = temp_config_path("sensitive-ssh-credential-source");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let index = app.settings.targets.len();
+        app.settings
+            .targets
+            .push(super::default_sensitive_ssh_target(index));
+
+        app.security_summary.lock_state = "unlocked".into();
+        app.screen = Screen::TargetSensitiveOverlay(index);
+        let unlocked_entries = app.entries();
+        let credential_entry = unlocked_entries.iter().find(|entry| {
+            matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::OpenTargetCredentialSource(i)) if i == index
+            )
+        });
+        assert!(credential_entry.is_some());
+        assert_eq!(
+            credential_entry.expect("credential source entry").label,
+            app.t("menu.target.credential_source")
+        );
+
+        app.security_summary.lock_state = "locked".into();
+        let locked_entries = app.entries();
+        assert!(!locked_entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::OpenTargetCredentialSource(i)) if i == index
+        )));
+        assert!(locked_entries
+            .iter()
+            .any(|entry| entry.label == app.t("menu.target.sensitive_locked_hint")));
+    }
+
+    #[test]
+    fn deleting_sensitive_target_when_unlocked_returns_to_targets_list() {
+        let config_path = temp_config_path("delete-sensitive-target");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let index = app.settings.targets.len();
+        app.settings
+            .targets
+            .push(super::default_sensitive_ssh_target(index));
+        app.security_summary.lock_state = "unlocked".into();
+        app.screen = Screen::TargetEditor(index);
+
+        app.run_action(ActionKind::DeleteTarget(index))
+            .expect("run delete target");
+        assert!(matches!(
+            app.confirm_action,
+            Some(super::ConfirmAction::DeleteTarget(i)) if i == index
+        ));
+        app.handle_confirm_key(KeyCode::Enter)
+            .expect("confirm delete target");
+
+        assert_eq!(app.screen, Screen::Targets);
+        assert_eq!(app.settings.targets.len(), index);
     }
 
     #[test]
@@ -3697,7 +5531,7 @@ mod tests {
     fn space_toggles_target_enabled_field() {
         let config_path = temp_config_path("space-toggle");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
-        app.screen = Screen::TargetEditor(0);
+        app.screen = Screen::TargetPublicDescriptor(0);
         app.select_field("targets[0].enabled");
         let before = app.settings.targets[0].enabled;
         app.handle_space_on_selected().expect("toggle enabled");
@@ -4294,6 +6128,104 @@ mod tests {
     }
 
     #[test]
+    fn ssh_key_detail_shows_record_id_and_delete_action() {
+        let config_path = temp_config_path("ssh-key-detail-record-id-delete");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.ssh_key_rows = vec![super::SshKeyManagementRow {
+            credential_ref: "vault://bridgingio/ssh-private-key/ops-main".into(),
+            label: "ops-main".into(),
+            status: "active".into(),
+            active_version: "ver-000001".into(),
+        }];
+        app.screen = Screen::SshKeyDetail("vault://bridgingio/ssh-private-key/ops-main".into());
+
+        let entries = app.entries();
+        assert!(entries.iter().any(|entry| {
+            entry.label == app.t("menu.ssh_key.detail.active_version")
+                && entry.value.as_deref() == Some("ver-000001")
+        }));
+        assert!(entries.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::DeleteSshKey(ref reference))
+                    if reference == "vault://bridgingio/ssh-private-key/ops-main"
+            )
+        }));
+    }
+
+    #[test]
+    fn deleting_ssh_key_clears_bound_target_credential_refs() {
+        let config_path = temp_config_path("ssh-key-delete-clears-target-bindings");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let mut router = SecretVaultRouter::default();
+        router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch backend");
+        router.unlock_with_os_native().expect("unlock vault");
+        let imported = router
+            .import_ssh_private_key_trusted_local(TrustedLocalSshKeyImportRequest {
+                key_name: "ops-main".into(),
+                label: Some("ops-main".into()),
+                private_key: SecretBytes::from_utf8(TEST_PRIVATE_KEY_PEM),
+                passphrase: None,
+                imported_by: "menuconfig:test".into(),
+                rotation_reason: None,
+            })
+            .expect("import key");
+        app.vault_router = Some(router);
+        app.settings.targets[0].kind = TargetKind::Ssh;
+        app.settings.targets[0].credential_ref = Some(imported.credential_ref.clone());
+        app.settings.targets.push(super::default_ssh_target(1));
+        app.settings.targets[1].credential_ref =
+            Some("vault://bridgingio/ssh-private-key/other".into());
+
+        app.delete_ssh_key_confirmed(&imported.credential_ref)
+            .expect("delete ssh key");
+
+        assert_eq!(app.settings.targets[0].credential_ref, None);
+        assert_eq!(
+            app.settings.targets[1].credential_ref.as_deref(),
+            Some("vault://bridgingio/ssh-private-key/other")
+        );
+        assert!(matches!(app.screen, Screen::SshKeyManagement));
+        assert!(app
+            .last_status
+            .contains("vault://bridgingio/ssh-private-key/ops-main"));
+    }
+
+    #[test]
+    fn successful_ssh_key_import_navigates_to_detail_screen() {
+        let config_path = temp_config_path("ssh-key-import-navigates-to-detail");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let mut router = SecretVaultRouter::default();
+        router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch backend");
+        router.unlock_with_os_native().expect("unlock vault");
+        app.vault_router = Some(router);
+
+        let key_path = config_path
+            .parent()
+            .expect("config parent")
+            .join("id_test_import");
+        fs::write(&key_path, TEST_PRIVATE_KEY_PEM).expect("write key file");
+        app.ssh_import_draft.key_name = "ops-main".into();
+        app.ssh_import_draft.label = "ops-main".into();
+        app.ssh_import_draft.source_path = key_path.to_string_lossy().to_string();
+        app.screen = Screen::SshKeyImport;
+
+        app.execute_ssh_key_import().expect("execute ssh import");
+
+        assert!(matches!(
+            app.screen,
+            Screen::SshKeyDetail(ref reference)
+                if reference == "vault://bridgingio/ssh-private-key/ops-main"
+        ));
+        assert!(app.ssh_import_draft.source_path.is_empty());
+    }
+
+    #[test]
     fn security_lock_state_line_uses_colored_status_value() {
         let config_path = temp_config_path("security-lock-state-color");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
@@ -4461,6 +6393,148 @@ mod tests {
             app.last_status,
             app.t("menu.status.token_access_space_only")
         );
+    }
+
+    #[test]
+    fn credential_picker_rows_use_single_choice_toggle_markers_without_arrow() {
+        let config_path = temp_config_path("credential-picker-toggle-style");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.settings.targets[0].kind = TargetKind::Ssh;
+        app.settings.targets[0].credential_ref =
+            Some("vault://bridgingio/ssh-private-key/ops-main".into());
+        app.ssh_key_rows = vec![
+            super::SshKeyManagementRow {
+                credential_ref: "vault://bridgingio/ssh-private-key/ops-main".into(),
+                label: "ops-main".into(),
+                status: "active".into(),
+                active_version: "v1".into(),
+            },
+            super::SshKeyManagementRow {
+                credential_ref: "vault://bridgingio/ssh-private-key/ops-fallback".into(),
+                label: "ops-fallback".into(),
+                status: "active".into(),
+                active_version: "v3".into(),
+            },
+        ];
+        app.screen = Screen::TargetCredentialPicker(0);
+
+        let entries = app.entries();
+        let selected_index = entries
+            .iter()
+            .position(|entry| matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::BindTargetCredentialRef { ref credential_ref, .. })
+                if credential_ref == "vault://bridgingio/ssh-private-key/ops-main"
+            ))
+            .expect("selected credential row");
+        let unselected_index = entries
+            .iter()
+            .position(|entry| matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::BindTargetCredentialRef { ref credential_ref, .. })
+                if credential_ref == "vault://bridgingio/ssh-private-key/ops-fallback"
+            ))
+            .expect("unselected credential row");
+
+        let selected_line =
+            super::format_menu_entry_line(&app, selected_index, &entries[selected_index]);
+        let unselected_line =
+            super::format_menu_entry_line(&app, unselected_index, &entries[unselected_index]);
+        assert!(selected_line.contains("<*>"));
+        assert!(unselected_line.contains("< >"));
+        assert!(!selected_line.contains("--->"));
+        assert!(!unselected_line.contains("--->"));
+    }
+
+    #[test]
+    fn credential_picker_enter_requires_space_instead_of_binding() {
+        let config_path = temp_config_path("credential-picker-enter-space-only");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.settings.targets[0].kind = TargetKind::Ssh;
+        app.settings.targets[0].credential_ref =
+            Some("vault://bridgingio/ssh-private-key/ops-main".into());
+        app.ssh_key_rows = vec![
+            super::SshKeyManagementRow {
+                credential_ref: "vault://bridgingio/ssh-private-key/ops-main".into(),
+                label: "ops-main".into(),
+                status: "active".into(),
+                active_version: "v1".into(),
+            },
+            super::SshKeyManagementRow {
+                credential_ref: "vault://bridgingio/ssh-private-key/ops-fallback".into(),
+                label: "ops-fallback".into(),
+                status: "active".into(),
+                active_version: "v3".into(),
+            },
+        ];
+        app.screen = Screen::TargetCredentialPicker(0);
+        let entries = app.entries();
+        app.selected = entries
+            .iter()
+            .position(|entry| matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::BindTargetCredentialRef { ref credential_ref, .. })
+                if credential_ref == "vault://bridgingio/ssh-private-key/ops-fallback"
+            ))
+            .expect("fallback credential row");
+
+        app.activate_selected()
+            .expect("enter should not bind credential row");
+        assert_eq!(
+            app.last_status,
+            app.t("menu.status.target_credential_picker_space_only")
+        );
+        assert_eq!(
+            app.settings.targets[0].credential_ref.as_deref(),
+            Some("vault://bridgingio/ssh-private-key/ops-main")
+        );
+    }
+
+    #[test]
+    fn credential_picker_space_binds_selected_reference() {
+        let config_path = temp_config_path("credential-picker-space-binds");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.settings.targets[0].kind = TargetKind::Ssh;
+        app.settings.targets[0].credential_ref =
+            Some("vault://bridgingio/ssh-private-key/ops-main".into());
+        app.ssh_key_rows = vec![
+            super::SshKeyManagementRow {
+                credential_ref: "vault://bridgingio/ssh-private-key/ops-main".into(),
+                label: "ops-main".into(),
+                status: "active".into(),
+                active_version: "v1".into(),
+            },
+            super::SshKeyManagementRow {
+                credential_ref: "vault://bridgingio/ssh-private-key/ops-fallback".into(),
+                label: "ops-fallback".into(),
+                status: "active".into(),
+                active_version: "v3".into(),
+            },
+        ];
+        app.screen = Screen::TargetCredentialPicker(0);
+        let entries = app.entries();
+        app.selected = entries
+            .iter()
+            .position(|entry| matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::BindTargetCredentialRef { ref credential_ref, .. })
+                if credential_ref == "vault://bridgingio/ssh-private-key/ops-fallback"
+            ))
+            .expect("fallback credential row");
+
+        app.handle_space_on_selected()
+            .expect("space binds selected credential row");
+        assert_eq!(
+            app.settings.targets[0].credential_ref.as_deref(),
+            Some("vault://bridgingio/ssh-private-key/ops-fallback")
+        );
+        assert!(app
+            .dirty_paths
+            .iter()
+            .any(|path| path == "targets[0].credential_ref"));
     }
 
     #[test]

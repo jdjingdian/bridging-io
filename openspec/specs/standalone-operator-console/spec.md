@@ -82,15 +82,22 @@ BridgingIO 的 `menuconfig` 操作面必须尽量对齐 Linux kernel `menuconfig
 - **那么** 系统必须只允许 `Space` 触发切换，`Enter` 不得隐式切换状态
 
 ### 需求:安全与生命周期页面必须只展示 display-safe 投影
-`menuconfig` 在展示 vault、token、runtime root、lifecycle 和诊断状态时，默认必须只使用 core 提供的 display-safe 投影。系统禁止在普通状态页、普通列表、搜索结果或重复进入的管理页面中直接展示 secret 明文、长期 token 明文或其他高敏内部字段。唯一允许的例外是：当操作员在受信任本地管理面中显式执行 `Create Token` 且本次签发成功后，系统可以通过独立的一次性结果弹窗承接该次响应中的明文 token；关闭该弹窗后，系统不得再从普通摘要路径重新回显该明文 token。
+`menuconfig` 在展示 vault、token、runtime root、lifecycle、诊断与 SSH key 摘要状态时，默认必须只使用 core 提供的 display-safe 投影。系统禁止在 Security 页面、SSH Key Management 列表页、普通详情页或 target 绑定 picker 中直接展示 secret 明文、长期 token 明文或其他高敏内部字段。
 
-#### 场景:用户查看 Vault 状态
-- **当** 操作员在 `menuconfig` 中进入 vault、Security 或 Token Management 页面
-- **那么** 系统必须展示 lock state、策略摘要、token 备注、token 状态或等价 display-safe 字段，而不得在普通列表中回显 secret 或长期 token 明文
+#### 场景:查看 SSH key 管理页
+- **当** 操作员在 menuconfig 中浏览 `SSH Key Management` 列表页或详情页
+- **那么** 系统只能展示 canonical ref、label、status、record-id 和等价 display-safe 摘要
+- **并且** 不得把私钥内容、passphrase、ciphertext locator 或等价秘密材料带入 UI 文本
 
-#### 场景:操作员显式创建 token
-- **当** 操作员在已解锁的 Security 页面中显式触发 `Create Token` 并成功创建一个长期 token
-- **那么** 系统必须展示一个包含该次明文 token 的一次性结果弹窗，并在关闭或离开后恢复为只显示 display-safe token 摘要，而不得从普通列表再次回显该明文 token
+#### 场景:vault locked 时查看 Security 摘要
+- **当** 操作员在 vault `locked` 状态下进入 Security 页面
+- **那么** SSH key 相关摘要最多只能显示聚合数量
+- **并且** 不得把单个 imported key 的 identity 信息作为“display-safe 摘要”带入 locked 态页面
+
+#### 场景:SSH target 选择 imported vault key
+- **当** 操作员在 SSH target 流程中选择一个已导入的 vault SSH key
+- **那么** picker 或选择页必须只展示 display-safe key 摘要
+- **并且** 不得把 underlying secret material 暴露给 target 编辑界面
 
 ### 需求:`menuconfig` 必须提供 core-owned 语言配置入口
 `bridgingio-core menuconfig` 必须在 core/general 等通用设置区域中提供独立的 core 语言配置入口，用于声明 core-owned operator surfaces 使用的语言。该配置项必须只允许选择 `zh-CN` 与 `en-US`，并且不得被 future UI 解释为其自身的通用多语言设置。
@@ -313,3 +320,149 @@ BridgingIO 的 `menuconfig` 操作面必须尽量对齐 Linux kernel `menuconfig
 - **当** 搜索结果为空、页面被锁定、对象缺失或系统需要展示只读提示
 - **那么** 该提示行必须使用 `---`、`- -`、`-*-` 或等价的 non-focusable 语法，并在导航中被自动跳过
 
+### 需求:Targets 页面必须按 vault 锁状态裁剪 sensitive target 管理动作
+`bridgingio-core menuconfig` 的 Targets 页面必须根据当前 vault 锁状态裁剪 sensitive target 的创建、编辑和删除入口。系统不得使用“先进入流程，最后保存时报错”的弱门控替代正式状态裁剪。
+
+#### 场景:vault locked 时进入 Targets 页面
+- **当** 操作员进入 Targets 页面，且当前 vault 状态为 `locked`
+- **那么** 系统必须继续显示 plain target 与 sensitive target 的 public cache 摘要
+- **并且** 系统必须允许继续创建 plain target
+- **并且** 系统不得允许创建、编辑或删除 sensitive target
+
+#### 场景:vault unlocked 时进入 sensitive target 详情页
+- **当** 操作员进入一个**已存在**的 sensitive target 的详情页，且当前 vault 状态为 `unlocked`
+- **那么** 系统必须提供 `Public Descriptor --->`、`Sensitive Overlay --->`、`Policy --->`、`Apply Target --->` 与 `Delete Target --->` 等正式管理入口
+- **并且** 若该 target 的 kind 为 `ssh`，`Sensitive Overlay` 中必须允许进入 `Credential Source --->` 绑定流程
+
+#### 场景:vault locked 时进入 sensitive target 详情页
+- **当** 操作员进入一个 sensitive target 的详情页，且当前 vault 状态为 `locked`
+- **那么** 系统必须只展示 public cache 与锁定提示
+- **并且** 系统必须提供 `Unlock Vault --->` 或等价入口
+- **并且** 系统不得显示 sensitive overlay 编辑入口或删除入口
+- **并且** 若该 target 的 kind 为 `ssh`，系统不得显示当前绑定 imported key 的 label、canonical `credential_ref` 或等价 inventory 信息
+
+### 需求:Add Target 必须先选择 storage mode 再选择 target type
+`menuconfig` 的 `Add Target` 流程必须先让操作员在 `plain` 与 `sensitive` 之间做出明确选择，再进入受支持 target 类型的选择与后续详情编辑。
+
+#### 场景:操作员开始创建 target
+- **当** 操作员在 Targets 页面触发 `Add Target --->`
+- **那么** 系统必须先进入 `Choose Storage Mode` 或等价步骤，并提供 `Plain Target --->` 与 `Sensitive Target --->` 两个入口
+
+#### 场景:vault locked 时创建 target
+- **当** 操作员在 vault 为 `locked` 的状态下进入 `Choose Storage Mode`
+- **那么** 系统必须只允许继续进入 `Plain Target --->`
+- **并且** `Sensitive Target` 必须显示为禁用或引导到 `Unlock Vault --->`
+
+#### 场景:操作员选择 plain ssh target
+- **当** 操作员选择 `Plain Target` 并继续选择 `SSH`
+- **那么** 系统必须在进入字段编辑前显示正式风险确认
+- **并且** 该确认必须明确说明相关连接描述字段将保留在 `config.toml`
+
+### 需求:Target 创建与管理必须区分会话动作并采用显式 `Create/Apply`
+`menuconfig` 的 target 详情页必须区分“创建会话”和“管理会话”。系统不得在用户仅选择 target 类型后就把该 target 视为已创建完成；必须通过显式 `Create Target --->` 或 `Apply Target --->` 动作确认当前会话结果。离开会话时若存在未提交内容，必须先确认是否丢弃。
+
+#### 场景:创建会话进入 target 详情页
+- **当** 操作员从 `Add Target` 流程进入某个新 target 详情页
+- **那么** 系统必须提供 `Create Target --->` 作为会话提交动作
+- **并且** 系统不得在该创建会话里显示 `Delete Target --->`
+
+#### 场景:管理会话进入 target 详情页
+- **当** 操作员从现有 target 列表进入某个已存在 target 详情页
+- **那么** 系统必须提供 `Apply Target --->` 与 `Delete Target --->`
+- **并且** 仅当操作者触发 `Apply Target --->` 时，当前会话编辑结果才视为已提交
+
+#### 场景:创建会话未提交即离开
+- **当** 操作员在创建会话中修改了 target 字段，但未触发 `Create Target --->` 就按 `Esc` 或触发 `Exit`
+- **那么** 系统必须先弹出“未创建 target 草稿是否丢弃”的确认
+- **并且** 若确认丢弃，系统必须删除该草稿 target 并返回上一级
+
+#### 场景:管理会话未提交即离开
+- **当** 操作员在管理会话中修改了 target 字段，但未触发 `Apply Target --->` 就按 `Esc` 或触发 `Exit`
+- **那么** 系统必须先弹出“未应用变更是否丢弃”的确认
+- **并且** 若确认丢弃，系统必须回滚该 target 到进入详情页前的基线状态
+
+### 需求:Security 页面必须产品化 SSH key import 与管理入口
+`menuconfig` 的 Security 页面在 vault `unlocked` 时必须提供 `Import SSH Key --->` 与 `SSH Key Management --->`；在 `locked` 时不得开放这两个入口，仅允许显示聚合 `SSH Key Count`。
+
+#### 场景:vault unlocked 时进入 Security 页面
+- **当** 操作员进入 Security 页面且 vault 为 `unlocked`
+- **那么** 系统必须显示 `Import SSH Key --->` 与 `SSH Key Management --->`
+- **并且** 导入/管理流程必须只返回 display-safe 字段
+
+#### 场景:SSH key 详情页展示 record-id 与删除动作
+- **当** 操作员进入某个已导入 SSH key 的详情页
+- **那么** 系统必须以 `record id` 作为当前记录标识字段进行展示
+- **并且** 详情页必须提供 `Delete SSH Key --->` 二次确认动作
+
+#### 场景:menuconfig 重复 key name 导入走 delete-first
+- **当** 操作员在 menuconfig 中使用同一 `key name` 重复导入 SSH key
+- **那么** 系统必须拒绝重复导入并提示先删除旧 key
+- **并且** 不得在详情页暴露就地 `Import New Version` 入口
+
+#### 场景:vault locked 时进入 Security 页面
+- **当** 操作员进入 Security 页面且 vault 为 `locked`
+- **那么** 系统不得开放 SSH key 导入或列表详情浏览
+- **并且** 最多只显示聚合 `SSH Key Count`
+
+### 需求:SSH target 的 credential source 必须支持 picker 与 inline import
+对于 `kind = ssh` target，`menuconfig` 必须提供 `Credential Source --->` 子流程，支持选择已导入 vault SSH key、在流程内联导入本地 key、以及手工 reference 回退。敏感 SSH target 的该流程仅允许在 unlocked `Sensitive Overlay` 中访问。
+
+#### 场景:操作员为 SSH target 选择 imported key
+- **当** 操作员在 SSH target 的 `Credential Source` 里选择 `Use Imported Vault SSH Key`
+- **那么** 系统必须展示 display-safe picker，并在选择后把 canonical `credential_ref` 回填到当前 target
+- **并且** picker 列表必须使用 `Single-choice Toggle` 行语义（`< >` / `<*>`）
+- **并且** 对 picker 当前行必须仅允许 `Space` 触发绑定，`Enter` 不得触发绑定
+
+#### 场景:操作员在 target 流程内联导入 key
+- **当** 操作员在 `Credential Source` 里选择 `Import Local SSH Key Into Vault`
+- **那么** 系统必须在导入成功后自动把新 canonical `credential_ref` 回填到当前 target
+- **并且** 不得要求用户返回后手工粘贴 raw URI
+
+### 需求:Security 页面必须提供正式的 SSH key import 与管理入口
+`bridgingio-core menuconfig` 的 Security 页面在 vault 已解锁时，必须提供 `Import SSH Key --->` 与 `SSH Key Management --->` 等正式入口，而不是继续只产品化 vault 状态和 token 管理。系统不得继续要求 operator 退出到外部 CLI 完成 SSH key import，再回到 menuconfig 手填 raw `credential_ref`。
+
+#### 场景:vault unlocked 时进入 Security 页面
+- **当** 操作员进入 Security 页面，且当前 vault 状态为 `unlocked`
+- **那么** 系统必须展示 `Import SSH Key --->` 与 `SSH Key Management --->`
+- **并且** 这些入口必须与 `Create Token --->`、`Token Management --->` 共同构成正式安全管理面，而不是仅作为帮助文本或未实现占位
+
+#### 场景:vault locked 时进入 Security 页面
+- **当** 操作员进入 Security 页面，且当前 vault 状态为 `locked`
+- **那么** 系统不得允许进入 SSH key import 流程
+- **并且** 系统最多只能展示聚合 `SSH Key Count` 或等价静态数量摘要
+- **并且** 系统不得展示任何单个 imported SSH key 的 label、canonical `credential_ref`、status 或 record-id 摘要
+- **并且** 系统不得把 `SSH Key Management` 伪装为可执行的完整管理入口后再在保存阶段报错
+
+### 需求:menuconfig SSH key import 流程必须使用 display-safe metadata 与受控本地 secret capture
+`menuconfig` 的 SSH key import 流程必须把普通可见 metadata 输入与实际私钥材料读取分离。系统必须允许 operator 通过 `key name`、`label`、`source path` 或等价 display-safe 字段组织导入流程，但不得把私钥内容或 passphrase 放进普通单行编辑弹窗、状态栏或常规列表行中。
+
+#### 场景:操作员导入本地 SSH key 文件
+- **当** 操作员在 menuconfig 中触发 `Import SSH Key --->`
+- **那么** 系统必须先采集 display-safe metadata，再在受控本地流程中读取对应 SSH key 文件
+- **并且** 导入成功后的结果页面只能展示 canonical `credential_ref`、label、status、record-id 等安全摘要，而不得再次展示私钥内容
+- **并且** 若 canonical ref 已存在，系统必须拒绝重复导入并要求先删除旧 key
+
+#### 场景:导入 encrypted SSH key
+- **当** 操作员导入一个 passphrase-protected 的 SSH key 文件
+- **那么** 系统必须通过受控本地隐藏输入处理该 passphrase
+- **并且** 不得把该 passphrase 写入普通 popup 文本、日志、搜索结果或状态提示
+
+### 需求:SSH Key Management 必须采用列表页 -> 详情页拓扑
+`menuconfig` 必须为已导入的 `ssh-private-key` 提供正式的 `SSH Key Management` 列表页与详情页，而不是继续把这类对象隐藏在 generic secret count 或抽象的 vault summary 背后。
+
+#### 场景:查看已导入 SSH key 列表
+- **当** 操作员进入 `SSH Key Management`
+- **那么** 系统必须以摘要列表展示每个已导入 key 的 label、canonical ref 或等价稳定标识、status 和 record-id 摘要
+- **并且** 列表项必须使用 `--->` 导航语义进入详情页
+
+#### 场景:查看 SSH key 详情页
+- **当** 操作员进入某个已导入 SSH key 的详情页
+- **那么** 系统必须至少展示 canonical `credential_ref`、label、kind、status、record-id 与 rotation / usage 摘要
+- **并且** 详情页必须提供 `Delete SSH Key --->` 并要求二次确认
+- **并且** 删除成功后必须清理所有绑定该 key 的 target `credential_ref`
+- **并且** 详情页不得展示私钥明文、ciphertext locator、unwrap material 或其他非 display-safe 内部字段
+
+#### 场景:vault locked 时不得浏览 SSH key 列表
+- **当** 操作员处于 vault `locked` 状态
+- **那么** 系统不得开放 `SSH Key Management` 的列表页或详情页浏览
+- **并且** 不得通过 locked 态列表泄露任何单个 key inventory 信息

@@ -36,13 +36,18 @@ BridgingIO 必须维护一份正式的本地 operator interface matrix，用于�
 ### 需求:本地安全管理接口矩阵必须记录 menuconfig Security 页的状态裁剪行为
 对于 `menuconfig` 这类本地 TUI surface，接口矩阵必须记录不同 vault 状态下可见动作的裁剪行为，而不是只记录“Security 页面存在 vault 管理入口”的笼统描述。
 
-#### 场景:矩阵记录 uninitialized 状态下的 Security 页
-- **当** `menuconfig` 的 Security 页面在 `uninitialized` 状态下只暴露 `Init Vault`
-- **那么** 接口矩阵必须明确记载该状态下不显示 `Unlock Vault`、`Create Token`、`Token Management`
-
 #### 场景:矩阵记录 unlocked 状态下的 Security 页
-- **当** `menuconfig` 的 Security 页面在 `unlocked` 状态下暴露 `Create Token` 与 `Token Management`
-- **那么** 接口矩阵必须明确记载这些入口的可见条件，以及普通列表继续遵守 display-safe projection 的限制
+- **当** `menuconfig` 的 Security 页面在 `unlocked` 状态下暴露 `Import SSH Key`、`SSH Key Management`、`Create Token` 与 `Token Management`
+- **那么** 接口矩阵必须明确记载这些入口各自的可见条件、导入/管理语义与 display-safe 限制
+
+#### 场景:矩阵记录 locked 状态下的 Security 页
+- **当** `menuconfig` 的 Security 页面在 `locked` 状态下显示 SSH key 相关信息
+- **那么** 接口矩阵必须明确记载该状态只允许显示聚合 `SSH Key Count`
+- **并且** 不得暴露任何单个 imported key 的可识别摘要或管理入口
+
+#### 场景:矩阵记录 SSH target key binding 输出
+- **当** 本地 operator surface 允许 SSH target 通过 picker 选择某个 imported vault key
+- **那么** 接口矩阵必须明确记录该流程的最终输出是 canonical `credential_ref`，而不是 secret 明文或非正式 display label
 
 ### 需求:token 管理接口矩阵必须记录列表页与详情页拓扑
 当本地 operator surface 为 token 管理提供“列表页 -> 详情页”的两级结构时，接口矩阵必须明确记录这两个页面/接口各自展示的字段、可触发动作、状态可见性和受控未实现语义，而不是继续只写一个抽象的 `Token Management` 入口。
@@ -73,4 +78,68 @@ BridgingIO 必须维护一份正式的本地 operator interface matrix，用于�
 #### 场景:矩阵记录 revoked 与 expired token 的认证拒绝
 - **当** bearer token 因 `revoked` 或 `expired` 被拒绝
 - **那么** 接口矩阵必须分别记录其稳定拒绝语义，而不得继续合并成同一个错误描述
+
+### 需求:本地 operator interface matrix 必须记录 Targets 页的 storage mode 流程与风险确认
+当 `menuconfig` 的 Targets 页面提供 `Add Target` 流程时，接口矩阵必须明确记录该流程先选择 `plain/sensitive` 模式、再选择 target type 的顺序，以及 `plain + ssh` 需要显式风险确认的合同。
+
+#### 场景:矩阵记录 vault locked 时的 Add Target
+- **当** `menuconfig` 的 vault 为 `locked`，且 Targets 页面暴露 `Add Target`
+- **那么** 接口矩阵必须明确记录此时只允许继续创建 plain target，sensitive target 需要先 unlock vault
+
+#### 场景:矩阵记录 plain ssh 风险确认
+- **当** `menuconfig` 允许在 plain 模式下创建 SSH target
+- **那么** 接口矩阵必须明确记录该流程在进入字段编辑前要求正式风险确认，而不是把该风险只留在零散文案中
+
+### 需求:本地 operator interface matrix 必须记录 sensitive target 的 reconcile 与删除门控
+当 `menuconfig` 允许管理 sensitive target 时，接口矩阵必须明确记录 unlock 后 reconcile、locked 态删除裁剪以及 unlocked 态删除语义，而不是继续把 sensitive target 当作普通 config 行编辑入口。
+
+#### 场景:矩阵记录 unlock 后 reconcile
+- **当** `menuconfig` 的 vault 从 `locked` 进入 `unlocked`
+- **那么** 接口矩阵必须明确记录系统会重新读取 vault authoritative sensitive target，并修复或刷新 `config.toml` 中的 public cache
+
+#### 场景:矩阵记录 sensitive target 的删除前置条件
+- **当** `menuconfig` 暴露 `Delete Target --->` 用于 sensitive target
+- **那么** 接口矩阵必须明确记录该入口只在 vault `unlocked` 时可见，并且删除同时作用于 vault authoritative `target-profile` 与 `config.toml` public cache
+
+### 需求:本地 operator interface matrix 必须记录 SSH key import/management 与 target binding 合同
+当 `menuconfig` 产品化 SSH key 管理面时，接口矩阵必须明确记录 `Import SSH Key`、`SSH Key Management`、`Delete SSH Key` 与 `Credential Source` 流程的输入输出、状态门控与 display-safe 约束。
+
+#### 场景:矩阵记录 Security 页 SSH key 状态裁剪
+- **当** Security 页在 vault `locked` 与 `unlocked` 两种状态下展示 SSH key 入口
+- **那么** 接口矩阵必须明确记录 `locked` 仅暴露聚合 `SSH Key Count`，`unlocked` 才开放导入与管理入口
+
+#### 场景:矩阵记录 target credential source 输出
+- **当** SSH target 通过 picker 或 inline import 绑定 imported vault key
+- **那么** 接口矩阵必须明确记录流程输出只允许 canonical `credential_ref`
+- **并且** 不得把私钥明文、passphrase 或非 canonical label 作为持久化输出
+
+### 需求:本地安全管理接口矩阵必须记录 SSH key import / management 的正式合同
+当本地 operator surface 为 `ssh-private-key` 提供 import、列表、详情与删除管理流时，接口矩阵必须明确记录这些接口的输入、输出、状态前置条件与 display-safe 约束，而不是继续只记载一个抽象的 `vault import` 或 generic secret count。
+
+#### 场景:矩阵记录 SSH key import 的输入输出
+- **当** 团队为本地 operator surface 新增 `Import SSH Key`
+- **那么** 接口矩阵必须明确记录该动作至少包含 `key name`、`label`、source path 或等价本地 secret route、成功后的 canonical `credential_ref` / record-id 摘要，以及“不得回显私钥内容”的合同
+- **并且** 必须明确记录重复 `key name` 会被拒绝，操作员需要先删除旧 key 再导入新 key
+
+#### 场景:矩阵记录 SSH key delete-first 轮换流程
+- **当** 团队在 SSH key 详情页提供 `Delete SSH Key`
+- **那么** 接口矩阵必须明确记录该动作会删除当前 canonical ref，并清理所有绑定该 ref 的 target `credential_ref`
+- **并且** 更新 key 的正式路径是删除后重新导入，而不是在详情页执行就地覆盖更新
+
+### 需求:本地安全管理接口矩阵必须记录 SSH Key Management 的列表页与详情页拓扑
+当 `menuconfig` 或其他 trusted local surface 为 `ssh-private-key` 提供管理页时，接口矩阵必须明确记录其列表页与详情页各自展示的字段、导航关系、锁状态门控与 display-safe 语义，而不是继续把其视为未定义的 future UI。
+
+#### 场景:矩阵记录 SSH key 列表页摘要字段
+- **当** `menuconfig` 的 `SSH Key Management` 采用摘要列表展示已导入 key
+- **那么** 接口矩阵必须明确记录每一行至少包含 label、canonical ref 或等价稳定标识、status、record-id 摘要与 `--->` 导航入口
+
+#### 场景:矩阵记录 SSH key 详情页字段
+- **当** `menuconfig` 为单个 imported SSH key 提供统一详情页
+- **那么** 接口矩阵必须明确记录该页面至少包含 canonical `credential_ref`、label、kind、status、record-id、last rotated / last used，以及 `Delete SSH Key --->` 等动作
+- **并且** 不得把私钥明文或密文 locator 作为详情字段写入矩阵
+
+#### 场景:矩阵记录 locked 状态下的 SSH key 聚合摘要
+- **当** `menuconfig` 的 vault 状态为 `locked`
+- **那么** 接口矩阵必须明确记录 SSH key 相关摘要最多只暴露聚合 `count`
+- **并且** 不得在该状态下列出 label、canonical ref、status、record-id 或其他单个 key inventory 字段
 

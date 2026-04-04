@@ -457,15 +457,16 @@ core-owned settings 必须允许操作员配置 MCP target resolution policy，�
 - **那么** 配置文件必须能够表达这一 unlock 策略，但不得要求把实际 passphrase 或其他明文解锁材料写入配置
 
 ### 需求:standalone 的 vault / auth 管理入口必须与 `run` 分离并避免明文 argv
-standalone 模式下，系统必须为 vault 初始化、secret 导入、vault 解锁、agent token 创建和 revoke 等管理动作提供显式的本地管理入口，例如独立 CLI 子命令或等价的受信任本地 control-plane 动作。该管理入口必须支持通过 stdin、file、fd 或受控本地 prompt 传递 secret 材料，并且不得要求操作员通过命令行参数直接传入 secret 明文。
+standalone 模式下，系统必须为 vault 初始化、SSH key 导入、vault 解锁、agent token 创建和 revoke 等管理动作提供显式的本地管理入口，例如独立 CLI 子命令、menuconfig 安全管理页或等价的受信任本地 control-plane 动作。该管理入口必须支持通过受控本地文件读取、prompt 或等价 secret route 传递 SSH key 材料，并且不得要求操作员通过命令行参数直接传入 secret 明文。
 
-#### 场景:操作员导入 SSH 私钥
-- **当** 操作员在 standalone 环境中为某个 target 导入 SSH 私钥
-- **那么** 系统必须允许其通过 `stdin`、文件、fd 或受控本地 prompt 导入该私钥，而不能要求使用 `--private-key <plaintext>` 一类的 argv 明文方式
+#### 场景:操作员在 menuconfig 中导入 SSH 私钥
+- **当** 操作员在 standalone 环境的 menuconfig 中为某个 target 准备导入 SSH 私钥
+- **那么** 系统必须允许其通过受控本地导入流程完成该操作，而不能要求其切换到“把私钥内容粘到普通文本字段”或 `--private-key <plaintext>` 之类的 argv 明文方式
 
-#### 场景:standalone 运行时提供 unlock 材料
-- **当** 操作员需要在 standalone `run` 流程中向 core 提供 vault 解锁材料
-- **那么** 系统可以允许声明 unlock source，例如 env / fd / prompt，但不得把 unlock secret 本身设计成命令行字面量参数
+#### 场景:target 绑定已导入 key 后保存配置
+- **当** 操作员为 SSH target 选中了某个已导入 vault key 并保存配置
+- **那么** standalone 配置文件中必须只保存 canonical `credential_ref`
+- **并且** 不得因为 target 绑定流程而把私钥明文、passphrase 或其他 secret material 写入配置文件
 
 ### 需求:standalone secret 输入路线必须具备确定优先级与审计语义
 系统必须为 `stdin`、`file`、`fd`、`tty prompt` 四类 secret 输入路线定义确定优先级与冲突处理语义，避免多输入源并存时的歧义。推荐优先级为 `fd > stdin > file > tty prompt`。若一次管理动作显式声明了多个输入源，系统必须 fail closed 并返回可诊断错误。
@@ -602,6 +603,41 @@ target 运行时索引在支持 sealed target 后，必须允许对未解锁 tar
 - **当** vault 从 locked 进入 unlocked，且某个 sealed target 的 public descriptor 位于 vault 外层
 - **那么** 系统必须允许使用 vault 内绑定的 digest 或 manifest 校验该 descriptor 的完整性，并在发现不一致时返回明确的 tamper diagnostics
 
+### 需求:sensitive target 的 public descriptor digest 必须只覆盖公开字段
+当系统为 sensitive target 计算 public descriptor digest 时，摘要必须仅覆盖 `id`、`display_name`、`aliases`、`kind`、`enabled`、`storage_class`、`access_class` 与 `sealed_profile_ref` 等公开字段。系统禁止把 `notes`、连接参数、credential 引用或等价 sensitive overlay 字段混入 public descriptor digest。
+
+#### 场景:仅修改 sensitive overlay 字段
+- **当** 操作员仅修改某个 sensitive target 的 `notes`、连接参数、policy 或 `credential_ref`
+- **那么** 系统不得把该修改视为 public descriptor 漂移
+- **并且** public descriptor digest 必须保持稳定
+
+#### 场景:修改 public descriptor 字段
+- **当** 操作员修改某个 sensitive target 的 `display_name`、`aliases` 或 `enabled`
+- **那么** 系统必须更新该 target 的 public descriptor digest，并使后续 public cache 与 vault authoritative descriptor 保持一致
+
+### 需求:vault unlock 后必须执行 sensitive target reconcile
+当 vault 从 `locked` 进入 `unlocked` 时，系统必须执行一次正式的 sensitive target reconcile。该 reconcile 必须重新读取 vault authoritative target-profile、校验 public descriptor，并修复或刷新 `config.toml` 中的 sensitive target public cache。
+
+#### 场景:unlock 后修复缺失的 public cache
+- **当** vault 解锁成功，且某个 sensitive target 在 `config.toml` 中的 public cache 缺失
+- **那么** 系统必须从 vault authoritative target-profile 重新生成该 public cache，并使该 target 重新出现在正式 catalog 中
+
+#### 场景:unlock 后修复过期的 public cache
+- **当** vault 解锁成功，且某个 sensitive target 在 `config.toml` 中的 public cache 与 vault authoritative public descriptor 不一致
+- **那么** 系统必须以 vault authoritative public descriptor 为准刷新该 public cache，而不得继续信任陈旧外层配置
+
+### 需求:sensitive target projection 必须提供 locked/resolved/repair-needed/tamper 正式语义
+target catalog 在 sensitive target 路径必须提供正式 projection state 语义：`locked`、`resolved`、`repair-needed` 与 `tamper`。其中 locked 状态下只允许返回 public cache。
+
+#### 场景:未解锁时列出 sensitive target
+- **当** vault 尚未解锁，且某个 target 的真相位于 vault authoritative `target-profile`
+- **那么** 系统必须至少返回该 target 的 canonical id、display name、aliases、kind、enabled 与安全状态摘要
+- **并且** 不得暴露完整 host、username、selector、notes 或等价 sensitive overlay 字段
+
+#### 场景:解锁后发现 public descriptor digest 不匹配
+- **当** vault 从 `locked` 进入 `unlocked`，且某个 sensitive target 的 public descriptor digest 与 authoritative descriptor 不匹配
+- **那么** 系统必须返回明确的 `tamper` 或 `repair-needed` diagnostics，而不得继续把该 target 视为正常 resolved target
+
 ### 需求:standalone 配置必须规范化到 canonical vault 结构
 standalone 的 core-owned 配置在实现 canonical vault runtime 后，必须能够表达 `builtin-encrypted`、`vault.unlock`、`vault.protectors` 和 `vault.ssh` 语义。legacy `[vault] backend = "os-native"` 只能作为兼容输入读取，不得继续作为规范化回写格式。
 
@@ -716,4 +752,40 @@ core operator locale 字段必须执行严格枚举校验，并且在配置装�
 #### 场景:menuconfig 保存 core locale
 - **当** 操作员在 `menuconfig` 中修改 core operator locale 并保存
 - **那么** 配置写回后的 TOML 必须稳定保留该字段和值，而不是只在内存中生效或在下一次序列化时丢失
+
+### 需求:SSH target 绑定 imported vault key 时必须只持久化 canonical `credential_ref`
+当操作员在 target 编辑流程中通过 picker 或 inline import 绑定 SSH key 时，系统必须只把 canonical `vault://.../ssh-private-key/<name>` 写回 target 配置。系统禁止把私钥明文、passphrase 或其他 secret material 写回 `config.toml`。
+
+#### 场景:picker 绑定 imported SSH key 后保存 target
+- **当** 操作员通过 `Credential Source` picker 选中 imported vault SSH key 并保存 target
+- **那么** target 配置中必须只保存 canonical `credential_ref`
+- **并且** 不得写入 key 内容、passphrase 或密文 locator
+
+#### 场景:locked sensitive SSH target
+- **当** sensitive SSH target 处于 vault `locked` 状态
+- **那么** target 列表/详情不得泄露已绑定 key 的 label、canonical ref、status 或 version 摘要
+- **并且** imported key picker 必须在该状态下不可用
+
+### 需求:SSH target 的凭据绑定流程必须支持选择已导入的 vault SSH key
+当本地 operator 在受信任管理面中编辑 SSH target 时，系统必须允许其通过正式选择流程绑定已导入的 `ssh-private-key`，而不是继续把“手工输入 raw `credential_ref`”作为使用 vault-managed SSH key 的主要路径。该流程必须最终把 canonical `vault://...` 引用写入 target 配置，而不是把 key material 写回 profile。
+
+#### 场景:操作员为 SSH target 选择 imported key
+- **当** 操作员在 menuconfig 中编辑一个 SSH target，并选择使用某个已导入的 vault SSH key
+- **那么** 系统必须提供 display-safe 的 key picker 或等价子流程
+- **并且** target 落盘结果必须只保存被选中的 canonical `credential_ref`
+
+#### 场景:操作员为 sensitive ssh target 选择 imported key
+- **当** 操作员在 menuconfig 中编辑一个 `kind = ssh` 的 sensitive target，且当前 vault 已 `unlocked`
+- **那么** 系统必须在 `Sensitive Overlay` 中提供等价的 imported key picker / 绑定子流程
+- **并且** 最终写回结果必须进入 sensitive overlay，而不得复制进 public cache
+
+#### 场景:操作员在 target 流程内联导入本地 key
+- **当** 操作员在 SSH target 的凭据绑定流程中发现当前没有合适的 imported key
+- **那么** 系统必须允许其进入受控的 `Import Local SSH Key Into Vault` 或等价子流程
+- **并且** 导入成功后必须能够把新生成的 canonical `credential_ref` 回填到当前 target，而不是要求用户返回后手工输入 URI
+
+#### 场景:locked 的 sensitive ssh target 不得暴露已绑定 key 身份
+- **当** 某个 `kind = ssh` 的 sensitive target 当前仍依赖 vault authoritative overlay，且 vault 状态为 `locked`
+- **那么** 系统不得在 target 列表、target detail 或任何等价投影中暴露所绑定 imported key 的 label、canonical `credential_ref`、status 或 record-id
+- **并且** 不得在该状态下开放 imported key picker
 

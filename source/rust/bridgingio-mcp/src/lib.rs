@@ -64,6 +64,11 @@ const TARGET_SEALED_PROFILE_REF_METADATA_KEY: &str = "target.sealed_profile_ref"
 const TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY: &str = "target.catalog_projection_state";
 const TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY: &str =
     "target.sealed_descriptor_diagnostic";
+const TARGET_PROFILE_SECRET_KIND: &str = "target-profile";
+const TARGET_PROJECTION_STATE_LOCKED: &str = "locked";
+const TARGET_PROJECTION_STATE_RESOLVED: &str = "resolved";
+const TARGET_PROJECTION_STATE_REPAIR_NEEDED: &str = "repair-needed";
+const TARGET_PROJECTION_STATE_TAMPER: &str = "tamper";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityEnvelope {
@@ -931,6 +936,19 @@ impl McpTargetDescriptor {
     }
 }
 
+#[derive(Clone, Debug)]
+struct TargetProfileSecretPayload {
+    public_descriptor: Value,
+    sensitive_overlay: Value,
+}
+
+#[derive(Debug)]
+enum SensitiveTargetLoadError {
+    Tamper(String),
+    RepairNeeded(String),
+    Runtime(CoreRuntimeError),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TargetResolutionResolved {
     requested_target_ref: String,
@@ -1248,6 +1266,7 @@ impl StandaloneCoreRuntime {
             return Ok(());
         }
         if matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+            self.reconcile_sensitive_targets_after_unlock()?;
             return Ok(());
         }
         if let Some(secret) = secret {
@@ -1256,7 +1275,10 @@ impl StandaloneCoreRuntime {
                 .map_err(vault_error_to_runtime)?;
         }
         match self.vault_router.vault_lock_state() {
-            VaultLockState::Unlocked => Ok(()),
+            VaultLockState::Unlocked => {
+                self.reconcile_sensitive_targets_after_unlock()?;
+                Ok(())
+            }
             VaultLockState::Unavailable => Err(CoreRuntimeError::Config(
                 "vault startup unlock is unavailable".into(),
             )),
@@ -1447,25 +1469,36 @@ impl StandaloneCoreRuntime {
         if !matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
             return Ok(redacted_sealed_catalog_profile(
                 &profile,
-                "sealed-redacted-locked",
-                Some("sealed target descriptor is redacted while vault is locked"),
+                TARGET_PROJECTION_STATE_LOCKED,
+                Some("sensitive target is locked; returning public cache only"),
             ));
         }
 
-        match self.load_verified_sealed_overlay(&descriptor) {
-            Ok(overlay) => {
+        match self.load_target_profile_secret_payload(&descriptor) {
+            Ok(payload) => {
                 let mut projected = profile;
-                apply_sealed_overlay_to_target_profile(&mut projected, &overlay)
+                apply_sealed_overlay_to_target_profile(&mut projected, &payload.sensitive_overlay)
                     .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?;
-                apply_target_catalog_projection_metadata(&mut projected, "sealed-resolved", None);
+                apply_target_catalog_projection_metadata(
+                    &mut projected,
+                    TARGET_PROJECTION_STATE_RESOLVED,
+                    None,
+                );
                 Ok(projected)
             }
-            Err(CoreRuntimeError::Config(message)) => Ok(redacted_sealed_catalog_profile(
+            Err(SensitiveTargetLoadError::Tamper(message)) => Ok(redacted_sealed_catalog_profile(
                 &profile,
-                "sealed-redacted-tamper",
+                TARGET_PROJECTION_STATE_TAMPER,
                 Some(&message),
             )),
-            Err(other) => Err(other),
+            Err(SensitiveTargetLoadError::RepairNeeded(message)) => {
+                Ok(redacted_sealed_catalog_profile(
+                    &profile,
+                    TARGET_PROJECTION_STATE_REPAIR_NEEDED,
+                    Some(&message),
+                ))
+            }
+            Err(SensitiveTargetLoadError::Runtime(other)) => Err(other),
         }
     }
 
@@ -1497,21 +1530,23 @@ impl StandaloneCoreRuntime {
                 descriptor.target_id
             )));
         }
-        let overlay = self.load_verified_sealed_overlay(&descriptor)?;
-        apply_sealed_overlay_to_target_profile(&mut target, &overlay)
+        let payload = self
+            .load_target_profile_secret_payload(&descriptor)
+            .map_err(sensitive_load_error_to_runtime)?;
+        apply_sealed_overlay_to_target_profile(&mut target, &payload.sensitive_overlay)
             .map_err(|err| CoreRuntimeError::Config(format!("{err:?}")))?;
         Ok(target)
     }
 
-    fn load_verified_sealed_overlay(
+    fn load_target_profile_secret_payload(
         &mut self,
         descriptor: &McpTargetDescriptor,
-    ) -> Result<Value, CoreRuntimeError> {
+    ) -> Result<TargetProfileSecretPayload, SensitiveTargetLoadError> {
         let sealed_profile_ref = descriptor
             .sealed_profile_ref
             .as_deref()
             .ok_or_else(|| {
-                CoreRuntimeError::Config(format!(
+                SensitiveTargetLoadError::RepairNeeded(format!(
                     "sealed target `{}` is missing sealed_profile_ref",
                     descriptor.target_id
                 ))
@@ -1522,32 +1557,107 @@ impl StandaloneCoreRuntime {
                 sealed_profile_ref,
                 format!("target-overlay:{}", descriptor.target_id),
             )
-            .map_err(vault_error_to_runtime)?;
-        let overlay_bytes = lease.with_secret_bytes(|bytes| bytes.to_vec());
-        let overlay: Value = serde_json::from_slice(&overlay_bytes).map_err(|err| {
-            CoreRuntimeError::Config(format!(
-                "sealed target `{}` overlay payload is not valid json: {err}",
+            .map_err(|err| SensitiveTargetLoadError::Runtime(vault_error_to_runtime(err)))?;
+        let payload_bytes = lease.with_secret_bytes(|bytes| bytes.to_vec());
+        let payload_value: Value = serde_json::from_slice(&payload_bytes).map_err(|err| {
+            SensitiveTargetLoadError::RepairNeeded(format!(
+                "sealed target `{}` payload is not valid json: {err}",
                 descriptor.target_id
             ))
         })?;
-        let actual_digest = overlay
+        let Some(map) = payload_value.as_object() else {
+            return Err(SensitiveTargetLoadError::RepairNeeded(format!(
+                "sealed target `{}` payload must be a JSON object",
+                descriptor.target_id
+            )));
+        };
+
+        if map.contains_key("public_descriptor") || map.contains_key("sensitive_overlay") {
+            let public_descriptor = map
+                .get("public_descriptor")
+                .cloned()
+                .ok_or_else(|| {
+                    SensitiveTargetLoadError::RepairNeeded(format!(
+                        "sealed target `{}` payload missing public_descriptor",
+                        descriptor.target_id
+                    ))
+                })?;
+            let sensitive_overlay = map
+                .get("sensitive_overlay")
+                .cloned()
+                .ok_or_else(|| {
+                    SensitiveTargetLoadError::RepairNeeded(format!(
+                        "sealed target `{}` payload missing sensitive_overlay",
+                        descriptor.target_id
+                    ))
+                })?;
+            let actual_digest = map
+                .get("public_descriptor_digest")
+                .and_then(Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .ok_or_else(|| {
+                    SensitiveTargetLoadError::RepairNeeded(format!(
+                        "sealed target `{}` payload missing public_descriptor_digest",
+                        descriptor.target_id
+                    ))
+                })?;
+            let expected_digest = public_descriptor_digest_for_public_descriptor(&public_descriptor)?;
+            if actual_digest != expected_digest {
+                return Err(SensitiveTargetLoadError::Tamper(format!(
+                    "sealed target `{}` descriptor tamper detected (expected digest {}, got {})",
+                    descriptor.target_id, expected_digest, actual_digest
+                )));
+            }
+            return Ok(TargetProfileSecretPayload {
+                public_descriptor,
+                sensitive_overlay,
+            });
+        }
+
+        // Legacy sealed-overlay payload: upgrade path when public descriptor still exists.
+        let actual_digest = map
             .get("public_descriptor_digest")
             .and_then(Value::as_str)
             .map(|value| value.trim().to_ascii_lowercase())
             .ok_or_else(|| {
-                CoreRuntimeError::Config(format!(
-                    "sealed target `{}` overlay missing public_descriptor_digest",
+                SensitiveTargetLoadError::RepairNeeded(format!(
+                    "sealed target `{}` legacy payload missing public_descriptor_digest",
                     descriptor.target_id
                 ))
             })?;
-        let expected_digest = public_descriptor_digest_for_target_descriptor(descriptor);
-        if actual_digest != expected_digest {
-            return Err(CoreRuntimeError::Config(format!(
+        let legacy_public_descriptor = public_descriptor_json_for_descriptor(descriptor);
+        let legacy_expected_digest =
+            public_descriptor_digest_for_public_descriptor(&legacy_public_descriptor)?;
+        if actual_digest != legacy_expected_digest {
+            return Err(SensitiveTargetLoadError::Tamper(format!(
                 "sealed target `{}` descriptor tamper detected (expected digest {}, got {})",
-                descriptor.target_id, expected_digest, actual_digest
+                descriptor.target_id, legacy_expected_digest, actual_digest
             )));
         }
-        Ok(overlay)
+        let canonical_ref = canonical_target_profile_ref_for_target(&descriptor.target_id)?;
+        let mut migrated_descriptor = descriptor.clone();
+        migrated_descriptor.sealed_profile_ref = Some(canonical_ref.clone());
+        let public_descriptor = public_descriptor_json_for_descriptor(&migrated_descriptor);
+        let migrated_digest = public_descriptor_digest_for_public_descriptor(&public_descriptor)?;
+
+        let sensitive_overlay = payload_value.clone();
+        let upgraded_payload = json!({
+            "public_descriptor": public_descriptor,
+            "sensitive_overlay": sensitive_overlay,
+            "public_descriptor_digest": migrated_digest,
+        });
+        self.vault_router
+            .put(
+                &canonical_ref,
+                upgraded_payload.to_string(),
+                format!("target-profile:{}", descriptor.target_id),
+            )
+            .map_err(|err| SensitiveTargetLoadError::Runtime(vault_error_to_runtime(err)))?;
+
+        Ok(TargetProfileSecretPayload {
+            public_descriptor,
+            sensitive_overlay: payload_value,
+        })
     }
 
     fn anonymous_loopback_compat_enabled(&self) -> bool {
@@ -2828,11 +2938,159 @@ impl StandaloneCoreRuntime {
         Ok(())
     }
 
+    fn reconcile_sensitive_targets_after_unlock(&mut self) -> Result<(), CoreRuntimeError> {
+        if !matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+            return Ok(());
+        }
+
+        let mut settings = self.settings_store.settings.clone();
+        let mut changed = false;
+        let mut target_profile_refs = self
+            .vault_router
+            .list_secret_summaries()
+            .into_iter()
+            .filter(|summary| summary.kind.eq_ignore_ascii_case(TARGET_PROFILE_SECRET_KIND))
+            .map(|summary| summary.reference)
+            .collect::<Vec<_>>();
+
+        for target in &settings.targets {
+            if parse_target_storage_class_or_default(&target.storage_class).is_plain() {
+                continue;
+            }
+            if let Some(reference) = target.sealed_profile_ref.as_ref() {
+                if !target_profile_refs
+                    .iter()
+                    .any(|entry| entry.eq_ignore_ascii_case(reference))
+                {
+                    target_profile_refs.push(reference.clone());
+                }
+            }
+        }
+        target_profile_refs.sort();
+        target_profile_refs.dedup();
+
+        let mut reconciled = HashMap::<String, StandaloneTargetProfile>::new();
+        for target in settings.targets.clone() {
+            if parse_target_storage_class_or_default(&target.storage_class).is_plain() {
+                continue;
+            }
+            let descriptor = mcp_target_descriptor_from_config(&target);
+            let Some(reference) = descriptor.sealed_profile_ref.as_ref() else {
+                continue;
+            };
+            if secret_kind_from_reference(reference).as_deref() == Some(TARGET_PROFILE_SECRET_KIND) {
+                continue;
+            }
+            let payload = match self.load_target_profile_secret_payload(&descriptor) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let mut migrated_descriptor =
+                match target_descriptor_from_public_descriptor(&payload.public_descriptor) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+            if migrated_descriptor.sealed_profile_ref.is_none() {
+                migrated_descriptor.sealed_profile_ref =
+                    canonical_target_profile_ref_for_target(&descriptor.target_id).ok();
+            }
+            let existing = settings
+                .targets
+                .iter()
+                .find(|item| item.id == migrated_descriptor.target_id);
+            reconciled.insert(
+                migrated_descriptor.target_id.clone(),
+                reconciled_sensitive_public_cache_target(&migrated_descriptor, existing),
+            );
+        }
+
+        for reference in target_profile_refs {
+            let lease = match self
+                .vault_router
+                .use_for_signing(&reference, format!("target-profile-reconcile:{reference}"))
+            {
+                Ok(lease) => lease,
+                Err(_) => continue,
+            };
+            let payload_bytes = lease.with_secret_bytes(|bytes| bytes.to_vec());
+            let payload_value: Value = match serde_json::from_slice(&payload_bytes) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let map = match payload_value.as_object() {
+                Some(map) => map,
+                None => continue,
+            };
+            let Some(public_descriptor) = map.get("public_descriptor") else {
+                continue;
+            };
+            let Some(actual_digest) = map
+                .get("public_descriptor_digest")
+                .and_then(Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+            else {
+                continue;
+            };
+            let expected_digest = match public_descriptor_digest_for_public_descriptor(public_descriptor)
+            {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if actual_digest != expected_digest {
+                continue;
+            }
+
+            let mut descriptor = match target_descriptor_from_public_descriptor(public_descriptor) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if descriptor.sealed_profile_ref.is_none() {
+                descriptor.sealed_profile_ref = Some(reference.clone());
+            }
+
+            let existing = settings
+                .targets
+                .iter()
+                .find(|target| target.id == descriptor.target_id);
+            reconciled.insert(
+                descriptor.target_id.clone(),
+                reconciled_sensitive_public_cache_target(&descriptor, existing),
+            );
+        }
+
+        for (target_id, target) in reconciled {
+            if let Some(index) = settings.targets.iter().position(|existing| existing.id == target_id) {
+                if settings.targets[index] != target {
+                    settings.targets[index] = target;
+                    changed = true;
+                }
+            } else {
+                settings.targets.push(target);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            return Ok(());
+        }
+
+        settings.validate().map_err(|err| {
+            CoreRuntimeError::Config(format!("sensitive target reconcile failed validation: {err:?}"))
+        })?;
+        self.settings_store.settings = settings;
+        self.rebuild_profile_cache_from_settings()?;
+        self.refresh_toolchain_diagnostics();
+        if self.settings_store.runtime_metadata.config_path.is_some() {
+            self.persist_settings_to_disk()?;
+        }
+        Ok(())
+    }
+
     fn upsert_profile_and_persist(
         &mut self,
         profile: TargetProfile,
     ) -> Result<String, CoreRuntimeError> {
-        let profile = normalize_profile_credential_ref(profile)?;
+        let mut profile = normalize_profile_credential_ref(profile)?;
         if profile.id.trim().is_empty() {
             return Err(CoreRuntimeError::Config("target id is required".into()));
         }
@@ -2840,7 +3098,56 @@ impl StandaloneCoreRuntime {
             return Err(CoreRuntimeError::Config("target name is required".into()));
         }
 
-        let standalone = to_standalone_target_profile(&profile)?;
+        let mut descriptor = mcp_target_descriptor_from_profile(&profile);
+        let storage_class = descriptor.storage_class;
+        let mut access_class = descriptor.access_class;
+        let standalone = if storage_class.is_plain() {
+            to_standalone_target_profile(&profile)?
+        } else {
+            if access_class.allows_anonymous_local() {
+                access_class = TargetAccessClass::TokenScoped;
+            }
+            let existing_ref = descriptor
+                .sealed_profile_ref
+                .clone()
+                .filter(|value| secret_kind_from_reference(value).as_deref() == Some(TARGET_PROFILE_SECRET_KIND));
+            let sealed_profile_ref = match existing_ref {
+                Some(value) => value,
+                None => canonical_target_profile_ref_for_target(&profile.id)
+                    .map_err(sensitive_load_error_to_runtime)?,
+            };
+
+            profile.metadata.insert(
+                TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+                storage_class.as_str().to_string(),
+            );
+            profile.metadata.insert(
+                TARGET_ACCESS_CLASS_METADATA_KEY.to_string(),
+                access_class.as_str().to_string(),
+            );
+            profile.metadata.insert(
+                TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(),
+                sealed_profile_ref.clone(),
+            );
+
+            descriptor = mcp_target_descriptor_from_profile(&profile);
+            let payload_json = authoritative_target_profile_payload_json(&profile, &descriptor)
+                .map_err(sensitive_load_error_to_runtime)?;
+            self.vault_router
+                .put(
+                    &sealed_profile_ref,
+                    payload_json,
+                    format!("target-profile:{}", profile.id),
+                )
+                .map_err(vault_error_to_runtime)?;
+
+            to_sensitive_public_cache_target_profile(
+                &profile,
+                storage_class,
+                access_class,
+                &sealed_profile_ref,
+            )?
+        };
         let mut settings = self.settings_store.settings.clone();
         if let Some(index) = settings
             .targets
@@ -3805,9 +4112,16 @@ impl StandaloneCoreRuntime {
                     requested_by: actor,
                     attestation_id,
                 }) {
-                    Ok(()) => ApiResponse::VaultUnlocked {
-                        request_id: request.request_id,
-                        lock_state: self.vault_router.vault_lock_state().as_str().to_string(),
+                    Ok(()) => match self.reconcile_sensitive_targets_after_unlock() {
+                        Ok(()) => ApiResponse::VaultUnlocked {
+                            request_id: request.request_id,
+                            lock_state: self.vault_router.vault_lock_state().as_str().to_string(),
+                        },
+                        Err(err) => error_response(
+                            request.request_id,
+                            ApiErrorCode::ValidationFailed,
+                            &format!("{err:?}"),
+                        ),
                     },
                     Err(err) => token_vault_error_response(request.request_id, err),
                 }
@@ -4633,6 +4947,42 @@ fn apply_sealed_overlay_to_target_profile(
         }
     }
 
+    if let Some(policy_value) = map.get("policy") {
+        let policy = policy_value.as_object().ok_or_else(|| {
+            CoreRuntimeError::Config("sealed overlay field `policy` must be a JSON object".into())
+        })?;
+        if let Some(value) = policy.get("require_approval_for_write") {
+            profile.default_policy.require_approval_for_write = value.as_bool().ok_or_else(|| {
+                CoreRuntimeError::Config(
+                    "sealed overlay policy.require_approval_for_write must be bool".into(),
+                )
+            })?;
+        }
+        if let Some(value) = policy.get("require_approval_for_delete") {
+            profile.default_policy.require_approval_for_delete = value.as_bool().ok_or_else(|| {
+                CoreRuntimeError::Config(
+                    "sealed overlay policy.require_approval_for_delete must be bool".into(),
+                )
+            })?;
+        }
+        if let Some(value) = policy.get("require_approval_for_privileged") {
+            profile.default_policy.require_approval_for_privileged =
+                value.as_bool().ok_or_else(|| {
+                    CoreRuntimeError::Config(
+                        "sealed overlay policy.require_approval_for_privileged must be bool".into(),
+                    )
+                })?;
+        }
+        if let Some(value) = policy.get("require_approval_for_sensitive_read") {
+            profile.default_policy.require_approval_for_sensitive_read =
+                value.as_bool().ok_or_else(|| {
+                    CoreRuntimeError::Config(
+                        "sealed overlay policy.require_approval_for_sensitive_read must be bool".into(),
+                    )
+                })?;
+        }
+    }
+
     if let Some(toolchains_value) = map.get("toolchains") {
         let toolchains = toolchains_value.as_object().ok_or_else(|| {
             CoreRuntimeError::Config("sealed overlay field `toolchains` must be a JSON object".into())
@@ -4663,22 +5013,39 @@ fn apply_sealed_overlay_to_target_profile(
     Ok(())
 }
 
-fn public_descriptor_digest_for_target_descriptor(descriptor: &McpTargetDescriptor) -> String {
-    let payload = json!({
-        "target_id": descriptor.target_id,
-        "enabled": descriptor.enabled,
+fn public_descriptor_json_for_descriptor(descriptor: &McpTargetDescriptor) -> Value {
+    json!({
+        "id": descriptor.target_id,
         "display_name": descriptor.display_name,
-        "kind": target_kind_label(&descriptor.kind),
         "aliases": descriptor.aliases,
-        "notes": descriptor.notes,
-        "connection_summary": descriptor.connection_summary,
+        "kind": target_kind_label(&descriptor.kind),
+        "enabled": descriptor.enabled,
         "storage_class": descriptor.storage_class.as_str(),
         "access_class": descriptor.access_class.as_str(),
         "sealed_profile_ref": descriptor.sealed_profile_ref,
-    });
+    })
+}
+
+#[cfg(test)]
+fn public_descriptor_digest_for_target_descriptor(
+    descriptor: &McpTargetDescriptor,
+) -> Result<String, SensitiveTargetLoadError> {
+    public_descriptor_digest_for_public_descriptor(&public_descriptor_json_for_descriptor(
+        descriptor,
+    ))
+}
+
+fn public_descriptor_digest_for_public_descriptor(
+    public_descriptor: &Value,
+) -> Result<String, SensitiveTargetLoadError> {
+    if !public_descriptor.is_object() {
+        return Err(SensitiveTargetLoadError::RepairNeeded(
+            "public_descriptor must be JSON object".into(),
+        ));
+    }
     let mut hasher = Sha256::new();
-    hasher.update(payload.to_string().as_bytes());
-    hex_encode_lower(&hasher.finalize())
+    hasher.update(public_descriptor.to_string().as_bytes());
+    Ok(hex_encode_lower(&hasher.finalize()))
 }
 
 fn hex_encode_lower(bytes: &[u8]) -> String {
@@ -4697,6 +5064,27 @@ fn parse_target_storage_class_or_default(raw: &str) -> TargetStorageClass {
 
 fn parse_target_access_class_or_default(raw: &str) -> TargetAccessClass {
     TargetAccessClass::parse(raw).unwrap_or(TargetAccessClass::AnonymousLocal)
+}
+
+fn secret_kind_from_reference(reference: &str) -> Option<String> {
+    let rest = reference.trim().strip_prefix("vault://")?;
+    let mut segments = rest.split('/');
+    let _namespace = segments.next()?;
+    segments
+        .next()
+        .map(|kind| kind.trim().to_ascii_lowercase())
+        .filter(|kind| !kind.is_empty())
+}
+
+fn canonical_target_profile_ref_for_target(
+    target_id: &str,
+) -> Result<String, SensitiveTargetLoadError> {
+    let raw = format!("vault://bridgingio/{TARGET_PROFILE_SECRET_KIND}/{target_id}");
+    normalize_credential_ref(&raw).map_err(|err| {
+        SensitiveTargetLoadError::RepairNeeded(format!(
+            "cannot build target-profile secret ref for target `{target_id}`: {err:?}"
+        ))
+    })
 }
 
 fn mcp_target_descriptor_from_config(configured: &StandaloneTargetProfile) -> McpTargetDescriptor {
@@ -4718,6 +5106,308 @@ fn mcp_target_descriptor_from_config(configured: &StandaloneTargetProfile) -> Mc
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
     }
+}
+
+fn mcp_target_descriptor_from_profile(profile: &TargetProfile) -> McpTargetDescriptor {
+    let storage_class = profile
+        .metadata
+        .get(TARGET_STORAGE_CLASS_METADATA_KEY)
+        .and_then(|value| TargetStorageClass::parse(value))
+        .unwrap_or(TargetStorageClass::Plain);
+    let access_class = profile
+        .metadata
+        .get(TARGET_ACCESS_CLASS_METADATA_KEY)
+        .and_then(|value| TargetAccessClass::parse(value))
+        .unwrap_or(TargetAccessClass::AnonymousLocal);
+    let aliases = profile
+        .metadata
+        .get("alias")
+        .map(|alias| vec![alias.clone()])
+        .unwrap_or_default();
+    McpTargetDescriptor {
+        target_id: profile.id.clone(),
+        enabled: true,
+        display_name: profile.name.clone(),
+        kind: profile.kind.clone(),
+        aliases,
+        notes: profile.notes.clone(),
+        connection_summary: connection_summary_from_profile(profile),
+        storage_class,
+        access_class,
+        sealed_profile_ref: profile
+            .metadata
+            .get(TARGET_SEALED_PROFILE_REF_METADATA_KEY)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    }
+}
+
+fn connection_summary_from_profile(profile: &TargetProfile) -> String {
+    match &profile.connection {
+        ConnectionConfig::Ssh {
+            host,
+            port,
+            username,
+        } => format!("{username}@{host}:{port}"),
+        ConnectionConfig::Adb { serial, transport } => {
+            let serial = serial.as_deref().unwrap_or("<any>");
+            let transport = transport.as_deref().unwrap_or("<default>");
+            format!("adb:{transport}:{serial}")
+        }
+        ConnectionConfig::Serial { device, baud_rate } => format!("serial:{device}@{baud_rate}"),
+        ConnectionConfig::Docker { container, context } => {
+            let context = context.as_deref().unwrap_or("<default>");
+            format!("docker:{context}:{container}")
+        }
+        ConnectionConfig::Custom { description } => description.clone(),
+    }
+}
+
+fn public_cache_connection_for_kind(kind: &TargetKind) -> StandaloneConnectionSection {
+    match kind {
+        TargetKind::Ssh => StandaloneConnectionSection {
+            host: Some("<vault-managed>".into()),
+            port: Some(22),
+            username: Some("<vault-managed>".into()),
+            known_hosts_policy: None,
+            selector_kind: None,
+            selector_value: None,
+        },
+        TargetKind::Adb => StandaloneConnectionSection {
+            host: None,
+            port: None,
+            username: None,
+            known_hosts_policy: None,
+            selector_kind: Some("serial".into()),
+            selector_value: Some("<vault-managed>".into()),
+        },
+        TargetKind::Serial => StandaloneConnectionSection {
+            host: None,
+            port: None,
+            username: None,
+            known_hosts_policy: None,
+            selector_kind: Some("baud_rate".into()),
+            selector_value: Some("<vault-managed>".into()),
+        },
+        TargetKind::Docker => StandaloneConnectionSection {
+            host: None,
+            port: None,
+            username: None,
+            known_hosts_policy: None,
+            selector_kind: Some("context".into()),
+            selector_value: Some("<vault-managed>".into()),
+        },
+        TargetKind::Other(_) => StandaloneConnectionSection {
+            host: None,
+            port: None,
+            username: None,
+            known_hosts_policy: None,
+            selector_kind: Some("public-cache".into()),
+            selector_value: Some("<vault-managed>".into()),
+        },
+    }
+}
+
+fn to_sensitive_public_cache_target_profile(
+    profile: &TargetProfile,
+    storage_class: TargetStorageClass,
+    access_class: TargetAccessClass,
+    sealed_profile_ref: &str,
+) -> Result<StandaloneTargetProfile, CoreRuntimeError> {
+    let mut standalone = to_standalone_target_profile(profile)?;
+    standalone.storage_class = storage_class.as_str().to_string();
+    standalone.access_class = access_class.as_str().to_string();
+    standalone.sealed_profile_ref = Some(sealed_profile_ref.to_string());
+    standalone.credential_ref = None;
+    standalone.notes = None;
+    standalone.connection = public_cache_connection_for_kind(&profile.kind);
+    standalone.toolchains.clear();
+    Ok(standalone)
+}
+
+fn sensitive_overlay_json_from_profile(profile: &TargetProfile) -> Value {
+    let connection = match &profile.connection {
+        ConnectionConfig::Ssh {
+            host,
+            port,
+            username,
+        } => json!({
+            "host": host,
+            "port": port,
+            "username": username,
+        }),
+        ConnectionConfig::Adb { serial, transport } => json!({
+            "serial": serial,
+            "transport": transport,
+        }),
+        ConnectionConfig::Serial { device, baud_rate } => json!({
+            "device": device,
+            "baud_rate": baud_rate,
+        }),
+        ConnectionConfig::Docker { container, context } => json!({
+            "container": container,
+            "context": context,
+        }),
+        ConnectionConfig::Custom { description } => json!({
+            "description": description,
+        }),
+    };
+    let mut toolchains = serde_json::Map::new();
+    for (command, path_override) in &profile.toolchains {
+        if !command.trim().is_empty() && !path_override.trim().is_empty() {
+            toolchains.insert(command.clone(), Value::String(path_override.clone()));
+        }
+    }
+    json!({
+        "notes": profile.notes,
+        "credential_ref": profile.credential_ref.as_ref().map(|value| value.id.clone()),
+        "connection": connection,
+        "toolchains": Value::Object(toolchains),
+        "policy": {
+            "require_approval_for_write": profile.default_policy.require_approval_for_write,
+            "require_approval_for_delete": profile.default_policy.require_approval_for_delete,
+            "require_approval_for_privileged": profile.default_policy.require_approval_for_privileged,
+            "require_approval_for_sensitive_read": profile.default_policy.require_approval_for_sensitive_read,
+        },
+    })
+}
+
+fn authoritative_target_profile_payload_json(
+    profile: &TargetProfile,
+    descriptor: &McpTargetDescriptor,
+) -> Result<String, SensitiveTargetLoadError> {
+    let public_descriptor = public_descriptor_json_for_descriptor(descriptor);
+    let public_descriptor_digest = public_descriptor_digest_for_public_descriptor(&public_descriptor)?;
+    let sensitive_overlay = sensitive_overlay_json_from_profile(profile);
+    Ok(json!({
+        "public_descriptor": public_descriptor,
+        "sensitive_overlay": sensitive_overlay,
+        "public_descriptor_digest": public_descriptor_digest,
+    })
+    .to_string())
+}
+
+fn target_kind_from_label(raw: &str) -> TargetKind {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ssh" => TargetKind::Ssh,
+        "adb" => TargetKind::Adb,
+        "serial" => TargetKind::Serial,
+        "docker" => TargetKind::Docker,
+        other => TargetKind::Other(other.to_string()),
+    }
+}
+
+fn target_descriptor_from_public_descriptor(
+    public_descriptor: &Value,
+) -> Result<McpTargetDescriptor, SensitiveTargetLoadError> {
+    let map = public_descriptor.as_object().ok_or_else(|| {
+        SensitiveTargetLoadError::RepairNeeded("public_descriptor must be JSON object".into())
+    })?;
+    let target_id = map
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            SensitiveTargetLoadError::RepairNeeded(
+                "public_descriptor.id must be non-empty string".into(),
+            )
+        })?
+        .to_string();
+    let display_name = map
+        .get("display_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(target_id.as_str())
+        .to_string();
+    let aliases = map
+        .get("aliases")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let kind = map
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(target_kind_from_label)
+        .unwrap_or(TargetKind::Other("custom".into()));
+    let enabled = map.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let storage_class = map
+        .get("storage_class")
+        .and_then(Value::as_str)
+        .and_then(TargetStorageClass::parse)
+        .unwrap_or(TargetStorageClass::SealedOverlay);
+    let access_class = map
+        .get("access_class")
+        .and_then(Value::as_str)
+        .and_then(TargetAccessClass::parse)
+        .unwrap_or(TargetAccessClass::TokenScoped);
+    let sealed_profile_ref = map
+        .get("sealed_profile_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Ok(McpTargetDescriptor {
+        target_id,
+        enabled,
+        display_name,
+        kind,
+        aliases,
+        notes: None,
+        connection_summary: "sensitive target public cache".into(),
+        storage_class,
+        access_class,
+        sealed_profile_ref,
+    })
+}
+
+fn reconciled_sensitive_public_cache_target(
+    descriptor: &McpTargetDescriptor,
+    existing: Option<&StandaloneTargetProfile>,
+) -> StandaloneTargetProfile {
+    let mut target = existing.cloned().unwrap_or(StandaloneTargetProfile {
+        id: descriptor.target_id.clone(),
+        display_name: descriptor.display_name.clone(),
+        kind: descriptor.kind.clone(),
+        enabled: descriptor.enabled,
+        aliases: descriptor.aliases.clone(),
+        storage_class: descriptor.storage_class.as_str().to_string(),
+        access_class: descriptor.access_class.as_str().to_string(),
+        sealed_profile_ref: descriptor.sealed_profile_ref.clone(),
+        credential_ref: None,
+        notes: None,
+        connection: public_cache_connection_for_kind(&descriptor.kind),
+        terminal: StandaloneTerminalSection::default(),
+        toolchains: HashMap::new(),
+        terminal_provider: bridgingio_engine::TerminalProviderSection {
+            enabled: true,
+            shell: None,
+        },
+        git_repositories: Vec::new(),
+    });
+
+    target.id = descriptor.target_id.clone();
+    target.display_name = descriptor.display_name.clone();
+    target.kind = descriptor.kind.clone();
+    target.enabled = descriptor.enabled;
+    target.aliases = descriptor.aliases.clone();
+    target.storage_class = descriptor.storage_class.as_str().to_string();
+    target.access_class = descriptor.access_class.as_str().to_string();
+    target.sealed_profile_ref = descriptor.sealed_profile_ref.clone();
+    target.credential_ref = None;
+    target.notes = None;
+    target.connection = public_cache_connection_for_kind(&descriptor.kind);
+    target.toolchains.clear();
+    target
 }
 
 fn build_target_runtime_indexes(
@@ -5491,6 +6181,14 @@ fn target_profile_json_value(profile: &TargetProfile) -> Value {
 
 fn vault_error_to_runtime(err: VaultError) -> CoreRuntimeError {
     CoreRuntimeError::Config(format!("{err:?}"))
+}
+
+fn sensitive_load_error_to_runtime(err: SensitiveTargetLoadError) -> CoreRuntimeError {
+    match err {
+        SensitiveTargetLoadError::Tamper(message)
+        | SensitiveTargetLoadError::RepairNeeded(message) => CoreRuntimeError::Config(message),
+        SensitiveTargetLoadError::Runtime(err) => err,
+    }
 }
 
 pub fn control_plane_socket_path(settings: &CoreSettings) -> PathBuf {
@@ -7760,7 +8458,10 @@ enabled = true
             .expect("sealed target descriptor");
         let digest = digest_override
             .map(ToString::to_string)
-            .unwrap_or_else(|| super::public_descriptor_digest_for_target_descriptor(&descriptor));
+            .unwrap_or_else(|| {
+                super::public_descriptor_digest_for_target_descriptor(&descriptor)
+                    .expect("descriptor digest")
+            });
         let overlay_ref = descriptor
             .sealed_profile_ref
             .clone()
@@ -7783,6 +8484,43 @@ enabled = true
             .vault_router
             .put(&overlay_ref, &overlay_payload, "sealed overlay")
             .expect("store sealed overlay");
+    }
+
+    fn install_target_profile_payload(
+        runtime: &mut StandaloneCoreRuntime,
+        target_id: &str,
+        notes: Option<&str>,
+    ) {
+        let public_descriptor = serde_json::json!({
+            "id": target_id,
+            "display_name": "Sealed Shell",
+            "aliases": ["sealed-shell"],
+            "kind": "localshell",
+            "enabled": true,
+            "storage_class": "sealed-overlay",
+            "access_class": "token-scoped",
+            "sealed_profile_ref": format!("vault://bridgingio/target-profile/{target_id}"),
+        });
+        let digest = super::public_descriptor_digest_for_public_descriptor(&public_descriptor)
+            .expect("public descriptor digest");
+        let payload = serde_json::json!({
+            "public_descriptor": public_descriptor,
+            "sensitive_overlay": {
+                "notes": notes,
+                "connection": {"description": "sealed-overlay-connection"},
+                "credential_ref": "vault://bridgingio/ssh-private-key/sealed-overlay",
+            },
+            "public_descriptor_digest": digest,
+        })
+        .to_string();
+        runtime
+            .vault_router
+            .put(
+                format!("vault://bridgingio/target-profile/{target_id}"),
+                payload,
+                "target-profile",
+            )
+            .expect("store target profile payload");
     }
 
     #[test]
@@ -9174,7 +9912,7 @@ enabled = true
                 .metadata
                 .get(super::TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
                 .map(String::as_str),
-            Some("sealed-redacted-locked")
+            Some(super::TARGET_PROJECTION_STATE_LOCKED)
         );
         assert!(sealed.notes.is_none());
         assert!(sealed.credential_ref.is_none());
@@ -9183,7 +9921,7 @@ enabled = true
                 .metadata
                 .get(super::TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY)
                 .map(String::as_str),
-            Some("sealed target descriptor is redacted while vault is locked")
+            Some("sensitive target is locked; returning public cache only")
         );
     }
 
@@ -9216,7 +9954,7 @@ enabled = true
                 .metadata
                 .get(super::TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
                 .map(String::as_str),
-            Some("sealed-resolved")
+            Some(super::TARGET_PROJECTION_STATE_RESOLVED)
         );
         assert_eq!(sealed.notes.as_deref(), Some("sealed notes resolved"));
         assert_eq!(
@@ -9258,7 +9996,7 @@ enabled = true
                 .metadata
                 .get(super::TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
                 .map(String::as_str),
-            Some("sealed-redacted-tamper")
+            Some(super::TARGET_PROJECTION_STATE_TAMPER)
         );
         assert!(sealed.notes.is_none());
         assert!(sealed.credential_ref.is_none());
@@ -9268,6 +10006,128 @@ enabled = true
             .map(String::as_str)
             .unwrap_or_default()
             .contains("descriptor tamper detected"));
+    }
+
+    #[test]
+    fn list_profiles_reports_repair_needed_for_broken_sensitive_payload() {
+        let mut runtime = sealed_overlay_runtime("sealed-catalog-repair-needed");
+        let descriptor = runtime
+            .resolve_target_descriptor_by_ref("sealed-shell")
+            .cloned()
+            .expect("sealed target descriptor");
+        let reference = descriptor
+            .sealed_profile_ref
+            .clone()
+            .expect("sealed profile ref");
+        runtime
+            .vault_router
+            .put(reference, r#"{"notes":"broken-without-digest"}"#, "broken overlay")
+            .expect("store broken payload");
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "list-profiles-repair-needed".into(),
+            context: request_context(),
+            command: AppCommand::ListProfiles,
+        });
+        let items = match response {
+            ApiResponse::Profiles { items, .. } => items,
+            other => panic!("unexpected list profiles response: {other:?}"),
+        };
+        let sealed = items
+            .into_iter()
+            .find(|item| item.id == "sealed-shell")
+            .expect("sealed profile");
+        assert_eq!(
+            sealed
+                .metadata
+                .get(super::TARGET_CATALOG_PROJECTION_STATE_METADATA_KEY)
+                .map(String::as_str),
+            Some(super::TARGET_PROJECTION_STATE_REPAIR_NEEDED)
+        );
+        assert!(sealed
+            .metadata
+            .get(super::TARGET_SEALED_DESCRIPTOR_DIAGNOSTIC_METADATA_KEY)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .contains("missing public_descriptor_digest"));
+    }
+
+    #[test]
+    fn unlock_reconcile_restores_missing_sensitive_public_cache_from_vault() {
+        let mut runtime = sealed_overlay_runtime("sealed-reconcile-restore-cache");
+        install_target_profile_payload(&mut runtime, "sealed-shell", Some("restored notes"));
+        runtime.settings_store.settings.targets.clear();
+        runtime
+            .rebuild_profile_cache_from_settings()
+            .expect("rebuild profile cache without targets");
+
+        runtime
+            .vault_router
+            .set_unlock_policy(VaultUnlockPolicy {
+                trigger_policy: VaultUnlockTriggerPolicy::ManualOnly,
+                allowed_methods: vec!["os-native".into(), "passphrase".into()],
+                preferred_method: "os-native".into(),
+                cache_ttl_sec: 600,
+                require_fresh_user_verification: true,
+            })
+            .expect("manual unlock policy");
+        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+
+        let attestation_id = unlock_attestation_id(&mut runtime, "os-native");
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "unlock-with-reconcile".into(),
+            context: request_context(),
+            command: AppCommand::UnlockVault {
+                method: "os-native".into(),
+                passphrase: None,
+                attestation_id,
+            },
+        });
+        match response {
+            ApiResponse::VaultUnlocked { lock_state, .. } => assert_eq!(lock_state, "unlocked"),
+            other => panic!("expected vault unlocked response, got {other:?}"),
+        }
+        assert!(runtime
+            .settings_store
+            .settings
+            .targets
+            .iter()
+            .any(|target| {
+                target.id == "sealed-shell"
+                    && target.storage_class == "sealed-overlay"
+                    && target
+                        .sealed_profile_ref
+                        .as_deref()
+                        == Some("vault://bridgingio/target-profile/sealed-shell")
+            }));
+    }
+
+    #[test]
+    fn legacy_sealed_overlay_upgrade_writes_target_profile_payload() {
+        let mut runtime = sealed_overlay_runtime("sealed-legacy-upgrade-target-profile");
+        install_sealed_overlay(
+            &mut runtime,
+            "sealed-shell",
+            None,
+            Some("legacy overlay note"),
+        );
+
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "list-profiles-legacy-upgrade".into(),
+            context: request_context(),
+            command: AppCommand::ListProfiles,
+        });
+        match response {
+            ApiResponse::Profiles { .. } => {}
+            other => panic!("unexpected list profiles response: {other:?}"),
+        }
+        let upgraded_ref = "vault://bridgingio/target-profile/sealed-shell";
+        let metadata = runtime
+            .vault_router
+            .secret_metadata(upgraded_ref)
+            .expect("load metadata")
+            .expect("target-profile metadata");
+        assert_eq!(metadata.record.kind, "target-profile");
     }
 
     #[test]
