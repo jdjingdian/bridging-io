@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use bridgingio_domain::{
@@ -1776,6 +1776,212 @@ fn target_kind_to_str(kind: &TargetKind) -> &str {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshProbeToolchainSource {
+    TargetOverride,
+    GlobalOverride,
+    SystemPath,
+}
+
+impl SshProbeToolchainSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TargetOverride => "target_override",
+            Self::GlobalOverride => "global_override",
+            Self::SystemPath => "system_path",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrepareSshProbeError {
+    UnsupportedTargetKind { kind: TargetKind },
+    MissingHost,
+    MissingUsername,
+    InvalidCredentialRef { reason: String },
+    ToolchainUnavailable {
+        target_override: Option<String>,
+        global_override: Option<String>,
+    },
+}
+
+impl PrepareSshProbeError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedTargetKind { .. } => "unsupported-target-kind",
+            Self::MissingHost => "missing-host",
+            Self::MissingUsername => "missing-username",
+            Self::InvalidCredentialRef { .. } => "invalid-credential-ref",
+            Self::ToolchainUnavailable { .. } => "toolchain-unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedSshProbe {
+    pub target_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub credential_ref: Option<String>,
+    pub vault_delivery_mode: String,
+    pub vault_fallback_delivery_mode: String,
+    pub toolchain_source: SshProbeToolchainSource,
+    pub executable_path: PathBuf,
+    pub known_hosts_policy: Option<String>,
+}
+
+impl PreparedSshProbe {
+    pub fn one_shot_args(&self, remote_command: &str) -> Vec<String> {
+        let strict_host_key = strict_host_key_checking_value(self.known_hosts_policy.as_deref());
+        vec![
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "NumberOfPasswordPrompts=0".to_string(),
+            "-o".to_string(),
+            format!("StrictHostKeyChecking={strict_host_key}"),
+            "-p".to_string(),
+            self.port.to_string(),
+            format!("{}@{}", self.username, self.host),
+            remote_command.to_string(),
+        ]
+    }
+
+    pub fn toolchain_summary(&self) -> String {
+        format!(
+            "{}:{}",
+            self.toolchain_source.as_str(),
+            self.executable_path.display()
+        )
+    }
+}
+
+pub fn prepare_standalone_ssh_probe(
+    settings: &CoreSettings,
+    target: &StandaloneTargetProfile,
+) -> Result<PreparedSshProbe, PrepareSshProbeError> {
+    if target.kind != TargetKind::Ssh {
+        return Err(PrepareSshProbeError::UnsupportedTargetKind {
+            kind: target.kind.clone(),
+        });
+    }
+    let host = target
+        .connection
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(PrepareSshProbeError::MissingHost)?
+        .to_string();
+    let username = target
+        .connection
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(PrepareSshProbeError::MissingUsername)?
+        .to_string();
+    let credential_ref = target
+        .credential_ref
+        .as_ref()
+        .map(|raw| {
+            canonicalize_credential_ref_input(raw).map_err(|err| {
+                PrepareSshProbeError::InvalidCredentialRef {
+                    reason: format!("{err:?}"),
+                }
+            })
+        })
+        .transpose()?;
+    let target_override = target
+        .toolchains
+        .get("ssh")
+        .map(|section| section.path_override.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let global_override = settings
+        .toolchains
+        .get("ssh")
+        .map(|section| section.path_override.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let (executable_path, toolchain_source) =
+        resolve_ssh_toolchain_path(target_override.as_deref(), global_override.as_deref()).ok_or(
+            PrepareSshProbeError::ToolchainUnavailable {
+                target_override,
+                global_override,
+            },
+        )?;
+    Ok(PreparedSshProbe {
+        target_id: target.id.clone(),
+        host,
+        port: target.connection.port.unwrap_or(22),
+        username,
+        credential_ref,
+        vault_delivery_mode: settings.vault.ssh.delivery_mode.clone(),
+        vault_fallback_delivery_mode: settings.vault.ssh.fallback_delivery_mode.clone(),
+        toolchain_source,
+        executable_path,
+        known_hosts_policy: target.connection.known_hosts_policy.clone(),
+    })
+}
+
+fn resolve_ssh_toolchain_path(
+    target_override: Option<&str>,
+    global_override: Option<&str>,
+) -> Option<(PathBuf, SshProbeToolchainSource)> {
+    if let Some(raw) = target_override {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_file() {
+            return Some((candidate, SshProbeToolchainSource::TargetOverride));
+        }
+    }
+    if let Some(raw) = global_override {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_file() {
+            return Some((candidate, SshProbeToolchainSource::GlobalOverride));
+        }
+    }
+    resolve_system_command_path("ssh").map(|path| (path, SshProbeToolchainSource::SystemPath))
+}
+
+fn resolve_system_command_path(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for candidate in command_variants(command) {
+            let full = dir.join(candidate);
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+fn command_variants(command: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            command.to_string(),
+            format!("{command}.exe"),
+            format!("{command}.bat"),
+        ]
+    } else {
+        vec![command.to_string()]
+    }
+}
+
+fn strict_host_key_checking_value(raw: Option<&str>) -> &'static str {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "strict".to_string())
+        .as_str()
+    {
+        "accept-new" | "accept_new" => "accept-new",
+        "insecure-no-check" | "insecure_no_check" | "off" | "no" => "no",
+        _ => "yes",
+    }
+}
+
 fn reuse_policy_to_str(policy: &SessionReusePolicy) -> &'static str {
     match policy {
         SessionReusePolicy::AlwaysNew => "always_new",
@@ -2407,7 +2613,23 @@ mod tests {
 
 #[cfg(test)]
 mod config_tests {
-    use super::{ConfigError, CoreSettings};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        prepare_standalone_ssh_probe, ConfigError, CoreSettings, PrepareSshProbeError,
+        SshProbeToolchainSource, ToolchainSection,
+    };
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bridgingio-engine-{label}-{stamp}"));
+        fs::create_dir_all(&root).expect("create temp dir");
+        root
+    }
 
     #[test]
     fn parses_minimal_standalone_example() {
@@ -2628,5 +2850,73 @@ mod config_tests {
             Some("config.non_loopback_auth_required")
         );
         assert!(shared.recovery_hint.is_some());
+    }
+
+    #[test]
+    fn ssh_probe_prefers_target_toolchain_override() {
+        let mut settings =
+            CoreSettings::from_toml_str(CoreSettings::minimal_example()).expect("parse minimal");
+        let root = temp_dir("ssh-probe-target-override");
+        let global_ssh = root.join("global-ssh");
+        let target_ssh = root.join("target-ssh");
+        fs::write(&global_ssh, "global").expect("write global toolchain");
+        fs::write(&target_ssh, "target").expect("write target toolchain");
+        settings.toolchains.insert(
+            "ssh".to_string(),
+            ToolchainSection {
+                path_override: global_ssh.to_string_lossy().to_string(),
+                prefer_builtin_fallback: false,
+            },
+        );
+        settings.targets[0].toolchains.insert(
+            "ssh".to_string(),
+            ToolchainSection {
+                path_override: target_ssh.to_string_lossy().to_string(),
+                prefer_builtin_fallback: false,
+            },
+        );
+
+        let prepared =
+            prepare_standalone_ssh_probe(&settings, &settings.targets[0]).expect("prepare ssh");
+        assert_eq!(
+            prepared.toolchain_source,
+            SshProbeToolchainSource::TargetOverride
+        );
+        assert_eq!(prepared.executable_path, target_ssh);
+    }
+
+    #[test]
+    fn ssh_probe_builds_one_shot_args_with_batch_mode_and_strict_policy() {
+        let settings =
+            CoreSettings::from_toml_str(CoreSettings::minimal_example()).expect("parse minimal");
+        let prepared =
+            prepare_standalone_ssh_probe(&settings, &settings.targets[0]).expect("prepare ssh");
+
+        let args = prepared.one_shot_args("exit 0");
+        assert_eq!(args[0], "-o");
+        assert_eq!(args[1], "BatchMode=yes");
+        assert_eq!(args[4], "-o");
+        assert_eq!(args[5], "StrictHostKeyChecking=yes");
+        assert_eq!(args[6], "-p");
+        assert_eq!(args[7], "22");
+        assert_eq!(args[8], "dev@127.0.0.1");
+        assert_eq!(args[9], "exit 0");
+    }
+
+    #[test]
+    fn ssh_probe_rejects_non_ssh_target_kind() {
+        let mut settings =
+            CoreSettings::from_toml_str(CoreSettings::minimal_example()).expect("parse minimal");
+        settings.targets[0].kind = bridgingio_domain::TargetKind::Adb;
+
+        let err = prepare_standalone_ssh_probe(&settings, &settings.targets[0])
+            .expect_err("non-ssh target should fail");
+        assert!(matches!(
+            err,
+            PrepareSshProbeError::UnsupportedTargetKind {
+                kind: bridgingio_domain::TargetKind::Adb
+            }
+        ));
+        assert_eq!(err.code(), "unsupported-target-kind");
     }
 }

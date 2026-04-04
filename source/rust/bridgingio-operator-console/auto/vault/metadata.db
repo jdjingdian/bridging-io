@@ -32,6 +32,7 @@
   "next_intent_seq": 0,
   "next_attestation_seq": 0,
   "next_ssh_broker_seq": 0,
+  "clock_watermark_unix_sec": 0,
   "key_envelope": {
     "format_version": 1,
     "vault_key_id": "vrk-000001",
@@ -51,7 +52,7 @@
       "wrapped_key_locator": "blob://vault/wrap/wrap-000001.vrk.bin",
       "wrapped_key_digest": "7037017c6bcbcd6c",
       "created_at_unix_sec": 1775129077,
-      "last_verified_at_unix_sec": 1775140754,
+      "last_verified_at_unix_sec": 1775314556,
       "status": "Degraded"
     }
   ],

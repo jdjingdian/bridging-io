@@ -72,6 +72,7 @@ grammar. New menu fields should match one of these mappings.
 | Targets | `Add Target -> Choose Storage Mode` | Submenu/action entry | blank prefix column | `Plain Target --->` / `Sensitive Target --->` | `Enter` follows; sensitive path is replaced by `Unlock Vault --->` while vault is locked |
 | Targets | `sensitive target detail (vault locked)` | Placeholder/read-only | `---` + action row | `--- Sensitive overlay is locked` + `Unlock Vault --->` | read-only + unlock action only |
 | Targets | `SSH target -> Credential Source` | Submenu/action entry + info rows | blank prefix column / `---` | `Credential Source --->`, `Use Imported Vault SSH Key --->`, `Import Local SSH Key Into Vault --->`, `Manual Reference --->`, `No Credential --->` | picker/import actions are unlocked-only for sensitive SSH overlays |
+| Targets | `SSH target -> Test Connection` | Submenu/action entry | blank prefix column | `Test Connection --->` | `Enter` opens timeout input popup; plain SSH row lives in `Connection Profile`; sealed SSH row lives in `Sensitive Overlay` and is hidden while vault is locked |
 | Security | lock/backend/count summary rows | Read-only info | `---` | `--- Label = value` | none |
 | Security | unlocked notice | Fixed enabled feature | `-*-` | `-*- Credential Management Unlocked` | none |
 | Security | `Init/Unlock/Import SSH Key/SSH Key Management/Create Token/Token Management/Delete Vault` | Submenu/action entry | blank prefix column | `Label --->` | `Enter` follows action flow; locked state shows aggregate `SSH Key Count` only |
@@ -90,6 +91,9 @@ grammar. New menu fields should match one of these mappings.
 | Confirm popup | centered modal with message and inline button row | buttons only | `←/→` move; `Enter` confirms current button; `Esc` cancels | current button must use same reverse / fallback as menu rows | applies to save/discard, delete, revoke, etc. |
 | Choice popup | centered modal with vertical options list | list rows | `↑/↓` move; `Enter` or `Space` confirms; `Esc` cancels | current row must use same reverse / fallback as menu rows | single-choice editor |
 | Text input popup | centered modal with one input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` commits; `Esc` cancels | caret must be visible | all text fields share one editing contract |
+| SSH test timeout popup | centered modal with one input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` starts probe; `Esc` cancels | caret must be visible | default timeout is `2000` milliseconds |
+| SSH test waiting popup | centered modal waiting state | none | `Esc` cancels pending probe | none required | background menu navigation is blocked while waiting |
+| SSH test result popup | centered modal with short status text | none | `Enter` or `Esc` closes | none required | result text is concise only (`succeeded`/`failed`/`cancelled`/`timed out`) |
 | Hidden passphrase popup | centered modal with one masked input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` commits; `Esc` cancels | caret visible; characters rendered as mask glyph | used for encrypted SSH key import passphrase capture |
 | Help popup | centered modal with read-only content | none | `Esc` closes; help shortcut may toggle | none required | read-only overlay |
 | One-time reveal popup | centered modal with read-only sensitive result | none or one acknowledge button | `Enter` / `Esc` closes according to concrete flow | if an acknowledge button exists, it follows shared selected feedback | closing the popup ends the one-time reveal path |
@@ -105,6 +109,8 @@ grammar. New menu fields should match one of these mappings.
 | Confirm popup | none | move across popup buttons | optional alias of confirm only when explicitly allowed | activate current popup button | close/cancel popup |
 | Choice popup | move across choice rows | none | confirm current choice | confirm current choice | close/cancel popup |
 | Text input popup | none | move caret | insert space if text input allows it | commit input | close/cancel popup |
+| SSH test waiting popup | none | none | none | none | cancel probe and close waiting popup |
+| SSH test result popup | none | none | none | close result popup | close result popup |
 
 ## Minimum Viewport And Overflow Rules
 
