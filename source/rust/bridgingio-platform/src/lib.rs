@@ -1,8 +1,13 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bridgingio_domain::ContractStatus;
+use serde::Serialize;
 
 mod local_shell_runtime;
 
@@ -348,6 +353,202 @@ pub trait RuntimeLogger: Send + Sync {
     fn status(&self) -> CapabilityStatus;
     fn level(&self) -> RuntimeLogLevel;
     fn log(&self, level: RuntimeLogLevel, category: RuntimeLogCategory, message: &str);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalOperatorSurface {
+    Menuconfig,
+    StandaloneCli,
+}
+
+impl LocalOperatorSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocalOperatorSurface::Menuconfig => "menuconfig",
+            LocalOperatorSurface::StandaloneCli => "standalone-cli",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalAuthorizationLogStream {
+    Authorization,
+    MenuconfigSession,
+}
+
+impl LocalAuthorizationLogStream {
+    pub fn relative_path(self) -> &'static str {
+        match self {
+            LocalAuthorizationLogStream::Authorization => "logs/local-authorization.jsonl",
+            LocalAuthorizationLogStream::MenuconfigSession => "logs/menuconfig-session.jsonl",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LocalAuthorizationEvent {
+    pub timestamp_unix_ms: u64,
+    pub flow_id: String,
+    pub surface: LocalOperatorSurface,
+    pub screen: String,
+    pub action: String,
+    pub operation: String,
+    pub phase: String,
+    pub result: String,
+    pub dedupe_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_locator_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_index: Option<usize>,
+}
+
+impl LocalAuthorizationEvent {
+    pub fn new(
+        flow_id: impl Into<String>,
+        surface: LocalOperatorSurface,
+        screen: impl Into<String>,
+        action: impl Into<String>,
+        operation: impl Into<String>,
+        phase: impl Into<String>,
+        result: impl Into<String>,
+        dedupe_state: impl Into<String>,
+    ) -> Self {
+        Self {
+            timestamp_unix_ms: unix_time_ms_now(),
+            flow_id: flow_id.into(),
+            surface,
+            screen: screen.into(),
+            action: action.into(),
+            operation: operation.into(),
+            phase: phase.into(),
+            result: result.into(),
+            dedupe_state: dedupe_state.into(),
+            operator_principal: None,
+            error_code: None,
+            intent_id: None,
+            source_kind: None,
+            source_summary: None,
+            source_locator_digest: None,
+            byte_length: None,
+            field_path: None,
+            token_id: None,
+            credential_ref: None,
+            target_index: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAuthorizationRecorder {
+    logs_dir: PathBuf,
+    level: RuntimeLogLevel,
+}
+
+impl LocalAuthorizationRecorder {
+    pub fn for_runtime_root(runtime_root: &Path, level: RuntimeLogLevel) -> Self {
+        Self {
+            logs_dir: runtime_root.join("logs"),
+            level,
+        }
+    }
+
+    pub fn for_logs_dir(logs_dir: &Path, level: RuntimeLogLevel) -> Self {
+        Self {
+            logs_dir: logs_dir.to_path_buf(),
+            level,
+        }
+    }
+
+    pub fn append_event(
+        &self,
+        stream: LocalAuthorizationLogStream,
+        level: RuntimeLogLevel,
+        event: &LocalAuthorizationEvent,
+    ) -> Result<(), String> {
+        if !self.level.enabled(level) {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.logs_dir).map_err(|err| {
+            format!(
+                "create local authorization logs dir failed: {} ({err})",
+                self.logs_dir.display()
+            )
+        })?;
+        let path = self.stream_path(stream);
+        let line = serde_json::to_string(event)
+            .map_err(|err| format!("encode local authorization event failed: {err}"))?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .map_err(|err| format!("open local authorization log failed: {} ({err})", path.display()))?;
+        writeln!(file, "{line}")
+            .map_err(|err| format!("append local authorization log failed: {} ({err})", path.display()))?;
+        Ok(())
+    }
+
+    pub fn append_event_with_fallback(
+        &self,
+        stream: LocalAuthorizationLogStream,
+        level: RuntimeLogLevel,
+        event: &LocalAuthorizationEvent,
+    ) {
+        if let Err(err) = self.append_event(stream, level, event) {
+            eprintln!("[bridgingio:authorization:warn] {err}");
+        }
+    }
+
+    fn stream_path(&self, stream: LocalAuthorizationLogStream) -> PathBuf {
+        let file = match stream {
+            LocalAuthorizationLogStream::Authorization => "local-authorization.jsonl",
+            LocalAuthorizationLogStream::MenuconfigSession => "menuconfig-session.jsonl",
+        };
+        self.logs_dir.join(file)
+    }
+}
+
+static LOCAL_AUTH_FLOW_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_local_authorization_flow_id(operation: &str) -> String {
+    let op = operation
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let stamp = unix_time_ms_now();
+    let seq = LOCAL_AUTH_FLOW_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("flow-{op}-{stamp}-{seq:08x}")
+}
+
+fn unix_time_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1357,11 +1558,14 @@ fn unknown_baseline_adapter(log_level: &str) -> BaselineHostPlatformAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_host_platform_adapter, named_pipe_endpoint, normalize_newlines,
-        unix_baseline_adapter, windows_baseline_adapter, CapabilityStatus, HostPlatform,
-        HostPlatformAdapter, RuntimeLogCategory, RuntimeLogLevel,
+        detect_host_platform_adapter, named_pipe_endpoint, next_local_authorization_flow_id,
+        normalize_newlines, unix_baseline_adapter, windows_baseline_adapter, CapabilityStatus,
+        HostPlatform, HostPlatformAdapter, LocalAuthorizationEvent, LocalAuthorizationLogStream,
+        LocalAuthorizationRecorder, LocalOperatorSurface, RuntimeLogCategory, RuntimeLogLevel,
     };
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn normalizes_newlines_consistently() {
@@ -1449,5 +1653,72 @@ mod tests {
         assert_eq!(adapter.host_platform(), HostPlatform::Unix);
         #[cfg(windows)]
         assert_eq!(adapter.host_platform(), HostPlatform::Windows);
+    }
+
+    #[test]
+    fn local_authorization_recorder_writes_jsonl() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = Path::new("/tmp").join(format!("bridgingio-local-auth-{stamp}"));
+        let recorder = LocalAuthorizationRecorder::for_runtime_root(&root, RuntimeLogLevel::Info);
+        let event = LocalAuthorizationEvent::new(
+            "flow-test",
+            LocalOperatorSurface::StandaloneCli,
+            "Security",
+            "vault.unlock",
+            "vault.unlock",
+            "succeeded",
+            "ok",
+            "leader",
+        );
+        recorder
+            .append_event(
+                LocalAuthorizationLogStream::Authorization,
+                RuntimeLogLevel::Info,
+                &event,
+            )
+            .expect("append auth event");
+        let written = fs::read_to_string(root.join("logs/local-authorization.jsonl"))
+            .expect("read authorization log");
+        assert!(written.contains("\"flow_id\":\"flow-test\""));
+        assert!(written.contains("\"surface\":\"standalone-cli\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_authorization_recorder_filters_debug_when_level_is_info() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = Path::new("/tmp").join(format!("bridgingio-local-auth-debug-{stamp}"));
+        let recorder = LocalAuthorizationRecorder::for_runtime_root(&root, RuntimeLogLevel::Info);
+        let event = LocalAuthorizationEvent::new(
+            "flow-debug",
+            LocalOperatorSurface::Menuconfig,
+            "Security",
+            "screen.change",
+            "menuconfig.session",
+            "breadcrumb",
+            "ok",
+            "not-applicable",
+        );
+        recorder
+            .append_event(
+                LocalAuthorizationLogStream::MenuconfigSession,
+                RuntimeLogLevel::Debug,
+                &event,
+            )
+            .expect("append debug breadcrumb should be a no-op");
+        assert!(!root.join("logs/menuconfig-session.jsonl").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_authorization_flow_id_is_stable_and_scoped() {
+        let flow = next_local_authorization_flow_id("vault.unlock");
+        assert!(flow.starts_with("flow-vault.unlock-"));
     }
 }

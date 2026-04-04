@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::sync::{mpsc, Condvar, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -5884,6 +5887,50 @@ const OS_NATIVE_PROTECTOR_ACCOUNT: &str = "os-native-protector-kek-v1";
 const OS_NATIVE_VERIFIED_TIMEOUT_SECS: u64 = 120;
 static OS_NATIVE_PROTECTOR_KEK_CACHE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 static OS_NATIVE_VERIFIED_KEK_CACHE: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+static OS_NATIVE_VERIFIED_FLOW_COUNTER: OnceLock<Mutex<u64>> = OnceLock::new();
+static OS_NATIVE_VERIFIED_SINGLEFLIGHT: OnceLock<VerifiedOsNativeSingleflight> = OnceLock::new();
+#[cfg(test)]
+static TEST_OS_NATIVE_VERIFIED_LOADER: OnceLock<
+    Mutex<Option<Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>>>,
+> = OnceLock::new();
+#[cfg(test)]
+static TEST_OS_NATIVE_VERIFIED_TIMEOUT_MS: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedOsNativeEvent {
+    pub flow_id: String,
+    pub dedupe_state: String,
+    pub phase: String,
+    pub result: String,
+    pub cache_state: String,
+}
+
+thread_local! {
+    static LAST_VERIFIED_OS_NATIVE_EVENT: RefCell<Option<VerifiedOsNativeEvent>> = const { RefCell::new(None) };
+}
+
+pub fn take_last_verified_os_native_event() -> Option<VerifiedOsNativeEvent> {
+    LAST_VERIFIED_OS_NATIVE_EVENT.with(|slot| slot.borrow_mut().take())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedOsNativeAttempt {
+    value: Option<Vec<u8>>,
+    event: VerifiedOsNativeEvent,
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedOsNativeInFlight {
+    flow_id: String,
+    participants: usize,
+    completed: bool,
+    result: Option<Vec<u8>>,
+}
+
+struct VerifiedOsNativeSingleflight {
+    state: Mutex<Option<VerifiedOsNativeInFlight>>,
+    cv: Condvar,
+}
 
 fn os_native_platform_binding_ready() -> bool {
     // Readiness reporting must be side-effect free: do not touch keyring here,
@@ -5929,34 +5976,311 @@ fn os_native_protector_kek() -> Option<Vec<u8>> {
 }
 
 fn os_native_protector_kek_verified() -> Option<Vec<u8>> {
+    let attempt = os_native_protector_kek_verified_attempt();
+    if let Some(value) = attempt.value.clone() {
+        cache_verified_os_native_kek(Some(value));
+    }
+    LAST_VERIFIED_OS_NATIVE_EVENT.with(|slot| {
+        *slot.borrow_mut() = Some(attempt.event);
+    });
+    attempt.value
+}
+
+fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
     if let Some(cached) = cached_verified_os_native_kek() {
-        return Some(cached);
+        return VerifiedOsNativeAttempt {
+            value: Some(cached),
+            event: VerifiedOsNativeEvent {
+                flow_id: "cached-verified-os-native-kek".to_string(),
+                dedupe_state: "not-applicable".to_string(),
+                phase: "succeeded".to_string(),
+                result: "ok".to_string(),
+                cache_state: "hit".to_string(),
+            },
+        };
     }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         if !os_native_platform_binding_supported() {
-            return None;
+            return VerifiedOsNativeAttempt {
+                value: None,
+                event: VerifiedOsNativeEvent {
+                    flow_id: "unsupported-os-native".to_string(),
+                    dedupe_state: "not-applicable".to_string(),
+                    phase: "failed".to_string(),
+                    result: "unsupported".to_string(),
+                    cache_state: "skip".to_string(),
+                },
+            };
         }
-        let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(1);
-        let spawned = std::thread::Builder::new()
-            .name("bridgingio-os-native-kek-verified".into())
-            .spawn(move || {
-                let _ = tx.send(os_native_protector_kek_blocking());
-            });
-        if spawned.is_err() {
-            return None;
-        }
-        let value = match rx.recv_timeout(Duration::from_secs(OS_NATIVE_VERIFIED_TIMEOUT_SECS)) {
-            Ok(value) => value,
-            Err(_) => None,
+        let singleflight = verified_os_native_singleflight();
+        let timeout = verified_os_native_timeout();
+        let joined_started_at = Instant::now();
+        let mut guard = match singleflight.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return VerifiedOsNativeAttempt {
+                    value: None,
+                    event: VerifiedOsNativeEvent {
+                        flow_id: "lock-poisoned-os-native".to_string(),
+                        dedupe_state: "not-applicable".to_string(),
+                        phase: "failed".to_string(),
+                        result: "error".to_string(),
+                        cache_state: "skip".to_string(),
+                    },
+                };
+            }
         };
-        cache_verified_os_native_kek(value.clone());
-        value
+        if let Some(inflight) = guard.as_mut() {
+            inflight.participants = inflight.participants.saturating_add(1);
+            let flow_id = inflight.flow_id.clone();
+            loop {
+                if let Some(current) = guard.as_mut() {
+                    if current.flow_id == flow_id && current.completed {
+                        let value = current.result.clone();
+                        current.participants = current.participants.saturating_sub(1);
+                        let should_clear = current.participants == 0;
+                        if should_clear {
+                            *guard = None;
+                        }
+                        drop(guard);
+                        return VerifiedOsNativeAttempt {
+                            value: value.clone(),
+                            event: VerifiedOsNativeEvent {
+                                flow_id,
+                                dedupe_state: "joined".to_string(),
+                                phase: if value.is_some() {
+                                    "succeeded".to_string()
+                                } else {
+                                    "failed".to_string()
+                                },
+                                result: if value.is_some() {
+                                    "ok".to_string()
+                                } else {
+                                    "error".to_string()
+                                },
+                                cache_state: if value.is_some() {
+                                    "stored".to_string()
+                                } else {
+                                    "skip".to_string()
+                                },
+                            },
+                        };
+                    }
+                }
+                let elapsed = joined_started_at.elapsed();
+                if elapsed >= timeout {
+                    if let Some(current) = guard.as_mut() {
+                        if current.flow_id == flow_id {
+                            current.participants = current.participants.saturating_sub(1);
+                            if current.completed && current.participants == 0 {
+                                *guard = None;
+                            }
+                        }
+                    }
+                    drop(guard);
+                    return VerifiedOsNativeAttempt {
+                        value: None,
+                        event: VerifiedOsNativeEvent {
+                            flow_id,
+                            dedupe_state: "joined".to_string(),
+                            phase: "cancelled".to_string(),
+                            result: "cancelled".to_string(),
+                            cache_state: "skip".to_string(),
+                        },
+                    };
+                }
+                let remaining = timeout.saturating_sub(elapsed);
+                let (next_guard, _) = match singleflight.cv.wait_timeout(guard, remaining) {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        return VerifiedOsNativeAttempt {
+                            value: None,
+                            event: VerifiedOsNativeEvent {
+                                flow_id,
+                                dedupe_state: "joined".to_string(),
+                                phase: "failed".to_string(),
+                                result: "error".to_string(),
+                                cache_state: "skip".to_string(),
+                            },
+                        };
+                    }
+                };
+                guard = next_guard;
+            }
+        }
+
+        let flow_id = next_verified_os_native_flow_id();
+        *guard = Some(VerifiedOsNativeInFlight {
+            flow_id: flow_id.clone(),
+            participants: 1,
+            completed: false,
+            result: None,
+        });
+        drop(guard);
+
+        let (value, timed_out) = run_os_native_verified_loader(timeout);
+        if let Ok(mut guard) = singleflight.state.lock() {
+            if let Some(current) = guard.as_mut() {
+                if current.flow_id == flow_id {
+                    current.completed = true;
+                    current.result = value.clone();
+                    current.participants = current.participants.saturating_sub(1);
+                    let should_clear = current.participants == 0;
+                    singleflight.cv.notify_all();
+                    if should_clear {
+                        *guard = None;
+                    }
+                }
+            }
+        }
+        return VerifiedOsNativeAttempt {
+            value: value.clone(),
+            event: VerifiedOsNativeEvent {
+                flow_id,
+                dedupe_state: "leader".to_string(),
+                phase: if timed_out {
+                    "cancelled".to_string()
+                } else if value.is_some() {
+                    "succeeded".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                result: if timed_out {
+                    "cancelled".to_string()
+                } else if value.is_some() {
+                    "ok".to_string()
+                } else {
+                    "error".to_string()
+                },
+                cache_state: if value.is_some() {
+                    "stored".to_string()
+                } else {
+                    "skip".to_string()
+                },
+            },
+        };
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        None
+        VerifiedOsNativeAttempt {
+            value: None,
+            event: VerifiedOsNativeEvent {
+                flow_id: "unsupported-os-native".to_string(),
+                dedupe_state: "not-applicable".to_string(),
+                phase: "failed".to_string(),
+                result: "unsupported".to_string(),
+                cache_state: "skip".to_string(),
+            },
+        }
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn run_os_native_verified_loader(timeout: Duration) -> (Option<Vec<u8>>, bool) {
+    let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(1);
+    #[cfg(test)]
+    let test_loader = TEST_OS_NATIVE_VERIFIED_LOADER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let spawned = std::thread::Builder::new()
+        .name("bridgingio-os-native-kek-verified".into())
+        .spawn(move || {
+            #[cfg(test)]
+            if let Some(loader) = test_loader {
+                let _ = tx.send(loader());
+                return;
+            }
+            let _ = tx.send(os_native_protector_kek_blocking());
+        });
+    if spawned.is_err() {
+        return (None, false);
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(value) => (value, false),
+        Err(mpsc::RecvTimeoutError::Timeout) => (None, true),
+        Err(mpsc::RecvTimeoutError::Disconnected) => (None, false),
+    }
+}
+
+fn verified_os_native_singleflight() -> &'static VerifiedOsNativeSingleflight {
+    OS_NATIVE_VERIFIED_SINGLEFLIGHT.get_or_init(|| VerifiedOsNativeSingleflight {
+        state: Mutex::new(None),
+        cv: Condvar::new(),
+    })
+}
+
+fn next_verified_os_native_flow_id() -> String {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0);
+    let counter = OS_NATIVE_VERIFIED_FLOW_COUNTER
+        .get_or_init(|| Mutex::new(1))
+        .lock()
+        .map(|mut value| {
+            let current = *value;
+            *value = value.saturating_add(1);
+            current
+        })
+        .unwrap_or(0);
+    format!("verified-os-native-{stamp}-{counter:08x}")
+}
+
+fn verified_os_native_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(value) = TEST_OS_NATIVE_VERIFIED_TIMEOUT_MS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+    {
+        return Duration::from_millis(value);
+    }
+    Duration::from_secs(OS_NATIVE_VERIFIED_TIMEOUT_SECS)
+}
+
+#[cfg(test)]
+fn set_test_os_native_verified_timeout_ms(timeout_ms: Option<u64>) {
+    if let Ok(mut guard) = TEST_OS_NATIVE_VERIFIED_TIMEOUT_MS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *guard = timeout_ms;
+    }
+}
+
+#[cfg(test)]
+fn set_test_os_native_verified_loader(
+    loader: Option<Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>>,
+) {
+    if let Ok(mut guard) = TEST_OS_NATIVE_VERIFIED_LOADER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *guard = loader;
+    }
+}
+
+#[cfg(test)]
+fn reset_verified_os_native_state_for_tests() {
+    cache_verified_os_native_kek(None);
+    if let Ok(mut guard) = verified_os_native_singleflight().state.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = OS_NATIVE_VERIFIED_FLOW_COUNTER
+        .get_or_init(|| Mutex::new(1))
+        .lock()
+    {
+        *guard = 1;
+    }
+    set_test_os_native_verified_timeout_ms(None);
+    set_test_os_native_verified_loader(None);
+    LAST_VERIFIED_OS_NATIVE_EVENT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 fn os_native_protector_kek_inner() -> Option<Vec<u8>> {
@@ -6125,10 +6449,17 @@ mod tests {
         TrustedLocalSshKeyImportRequest, UpdateAgentTokenAccessRequest,
         UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
         VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
+        os_native_protector_kek_verified_attempt, reset_verified_os_native_state_for_tests,
+        set_test_os_native_verified_loader, set_test_os_native_verified_timeout_ms,
     };
     use base64::Engine as _;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
+    use std::thread;
     use std::time::Duration;
 
     fn new_temp_vault_dir(label: &str) -> PathBuf {
@@ -6608,6 +6939,106 @@ mod tests {
             .find(|item| item.wrap_id == manifest.wrap_id)
             .expect("updated manifest");
         assert_eq!(manifest_after.status, super::ProtectorWrapStatus::Ready);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn verified_os_native_singleflight_joins_and_calls_provider_once() {
+        reset_verified_os_native_state_for_tests();
+        set_test_os_native_verified_timeout_ms(Some(2_000));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let loader = {
+            let provider_calls = provider_calls.clone();
+            Arc::new(move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(120));
+                Some(vec![7u8; 32])
+            })
+        };
+        set_test_os_native_verified_loader(Some(loader));
+
+        let handles = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    os_native_protector_kek_verified_attempt()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for handle in handles {
+            let attempt = handle.join().expect("join verification thread");
+            assert!(attempt.value.is_some());
+            events.push(attempt.event.dedupe_state);
+        }
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        events.sort();
+        assert_eq!(events, vec!["joined".to_string(), "leader".to_string()]);
+        reset_verified_os_native_state_for_tests();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn verified_os_native_joined_waiter_can_timeout_and_cancel() {
+        reset_verified_os_native_state_for_tests();
+        set_test_os_native_verified_timeout_ms(Some(30));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let loader = {
+            let provider_calls = provider_calls.clone();
+            Arc::new(move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+                Some(vec![9u8; 32])
+            })
+        };
+        set_test_os_native_verified_loader(Some(loader));
+
+        let handles = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    os_native_protector_kek_verified_attempt()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let attempts = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert!(attempts
+            .iter()
+            .any(|attempt| attempt.event.phase == "cancelled"));
+        reset_verified_os_native_state_for_tests();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn verified_os_native_failure_is_not_cached_as_success() {
+        reset_verified_os_native_state_for_tests();
+        set_test_os_native_verified_timeout_ms(Some(1_000));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let loader = {
+            let provider_calls = provider_calls.clone();
+            Arc::new(move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+        };
+        set_test_os_native_verified_loader(Some(loader));
+
+        let first = os_native_protector_kek_verified_attempt();
+        let second = os_native_protector_kek_verified_attempt();
+        assert!(first.value.is_none());
+        assert!(second.value.is_none());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        reset_verified_os_native_state_for_tests();
     }
 
     #[test]

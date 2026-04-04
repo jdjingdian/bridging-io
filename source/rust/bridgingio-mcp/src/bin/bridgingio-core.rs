@@ -27,8 +27,9 @@ use bridgingio_mcp::{
 };
 use bridgingio_operator_console::run_menuconfig;
 use bridgingio_platform::{
-    detect_host_platform_adapter, CapabilityStatus, HostPlatform, RuntimeLogCategory,
-    RuntimeLogLevel,
+    detect_host_platform_adapter, next_local_authorization_flow_id, CapabilityStatus, HostPlatform,
+    LocalAuthorizationEvent, LocalAuthorizationLogStream, LocalAuthorizationRecorder,
+    LocalOperatorSurface, RuntimeLogCategory, RuntimeLogLevel,
 };
 use bridgingio_providers::TerminalProvider;
 use bridgingio_secrets::{
@@ -268,9 +269,26 @@ fn run(args: CliArgs) -> Result<(), String> {
 
 fn run_management_command(config_path: &Path, command: ManagementCommand) -> Result<(), String> {
     let (settings, mut router) = load_management_router(config_path)?;
+    let authorization_recorder = LocalAuthorizationRecorder::for_runtime_root(
+        Path::new(&settings.core.data_dir),
+        RuntimeLogLevel::parse(&settings.core.log_level),
+    );
     let operator_principal = management_operator_principal();
     match command {
         ManagementCommand::VaultInit => {
+            let flow_id = next_local_authorization_flow_id("vault.init");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "vault.init",
+                &operator_principal,
+                None,
+                None,
+                "started",
+                "pending",
+                "not-applicable",
+                None,
+            );
             let _ = router
                 .init_vault_store()
                 .map_err(|err| format!("vault init failed: {err:?}"))?;
@@ -282,10 +300,34 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
                 router.active_backend(),
                 lock_state,
             );
-            emit_management_audit("vault.init", &operator_principal, None, None, "ok");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "vault.init",
+                &operator_principal,
+                None,
+                None,
+                "succeeded",
+                "ok",
+                "not-applicable",
+                None,
+            );
             Ok(())
         }
         ManagementCommand::VaultDelete => {
+            let flow_id = next_local_authorization_flow_id("vault.delete");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "vault.delete",
+                &operator_principal,
+                None,
+                None,
+                "started",
+                "pending",
+                "leader",
+                None,
+            );
             let payload_digest = local_admin_payload_digest_for_delete_vault();
             let intent = router
                 .create_local_admin_intent_with_digest(
@@ -316,11 +358,16 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
                 lock_state.as_str()
             );
             emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
                 "vault.delete",
                 &operator_principal,
                 Some(&intent.intent_id),
                 None,
+                "succeeded",
                 "ok",
+                "leader",
+                None,
             );
             Ok(())
         }
@@ -329,6 +376,19 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
             label,
             input,
         } => {
+            let flow_id = next_local_authorization_flow_id("vault.import");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "vault.import",
+                &operator_principal,
+                None,
+                None,
+                "started",
+                "pending",
+                "not-applicable",
+                None,
+            );
             validate_secret_input_route(&input)?;
             let capture = read_secret_input(&input, "Enter secret to import: ")?;
             let final_label = label.unwrap_or_else(|| reference.clone());
@@ -348,15 +408,33 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
                 imported.version
             );
             emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
                 "vault.import",
                 &operator_principal,
                 None,
                 Some(&capture),
+                "succeeded",
                 "ok",
+                "not-applicable",
+                None,
             );
             Ok(())
         }
         ManagementCommand::VaultUnlock { method, input } => {
+            let flow_id = next_local_authorization_flow_id("vault.unlock");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "vault.unlock",
+                &operator_principal,
+                None,
+                None,
+                "started",
+                "pending",
+                "leader",
+                None,
+            );
             validate_secret_input_route(&input)?;
             let unlock_method = normalize_cli_vault_method(
                 &method.unwrap_or_else(|| router.unlock_policy().preferred_method.clone()),
@@ -405,11 +483,16 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
             let state = router.vault_lock_state().as_str().to_string();
             println!("vault unlock completed: method={unlock_method} lock_state={state}");
             emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
                 "vault.unlock",
                 &operator_principal,
                 Some(&intent.intent_id),
                 passphrase_capture.as_ref(),
+                "succeeded",
                 "ok",
+                "leader",
+                None,
             );
             Ok(())
         }
@@ -417,6 +500,19 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
             label,
             expires_in_seconds,
         } => {
+            let flow_id = next_local_authorization_flow_id("auth.token.create");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "auth.token.create",
+                &operator_principal,
+                None,
+                None,
+                "started",
+                "pending",
+                "leader",
+                None,
+            );
             let mut create_request = CreateAgentTokenRequest {
                 label,
                 created_by: operator_principal.clone(),
@@ -466,15 +562,33 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
                 created.summary.target_scope_summary
             );
             emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
                 "auth.token.create",
                 &operator_principal,
                 Some(&intent.intent_id),
                 None,
+                "succeeded",
                 "ok",
+                "leader",
+                Some(created.summary.token_id.as_str()),
             );
             Ok(())
         }
         ManagementCommand::AuthTokenRevoke { token_id, reason } => {
+            let flow_id = next_local_authorization_flow_id("auth.token.revoke");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "auth.token.revoke",
+                &operator_principal,
+                None,
+                None,
+                "started",
+                "pending",
+                "not-applicable",
+                Some(token_id.as_str()),
+            );
             let summary = router
                 .revoke_agent_token(&token_id, reason)
                 .map_err(|err| format!("revoke token failed: {err:?}"))?;
@@ -484,10 +598,34 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
                 summary.status.as_str(),
                 summary.revoke_reason.as_deref().unwrap_or("none")
             );
-            emit_management_audit("auth.token.revoke", &operator_principal, None, None, "ok");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "auth.token.revoke",
+                &operator_principal,
+                None,
+                None,
+                "succeeded",
+                "ok",
+                "not-applicable",
+                Some(summary.token_id.as_str()),
+            );
             Ok(())
         }
         ManagementCommand::AuthTokenDelete { token_id } => {
+            let flow_id = next_local_authorization_flow_id("auth.token.delete");
+            emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
+                "auth.token.delete",
+                &operator_principal,
+                None,
+                None,
+                "started",
+                "pending",
+                "leader",
+                Some(token_id.as_str()),
+            );
             let payload_digest = local_admin_payload_digest_for_delete_agent_token(&token_id);
             let intent = router
                 .create_local_admin_intent_with_digest(
@@ -519,11 +657,16 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
                 summary.status.as_str()
             );
             emit_management_audit(
+                &authorization_recorder,
+                &flow_id,
                 "auth.token.delete",
                 &operator_principal,
                 Some(&intent.intent_id),
                 None,
+                "succeeded",
                 "ok",
+                "leader",
+                Some(summary.token_id.as_str()),
             );
             Ok(())
         }
@@ -2297,26 +2440,44 @@ fn stable_locator_digest(locator: &str) -> String {
 }
 
 fn emit_management_audit(
+    recorder: &LocalAuthorizationRecorder,
+    flow_id: &str,
     action: &str,
     operator_principal: &str,
     intent_id: Option<&str>,
     input: Option<&SecretInputCapture>,
-    status: &str,
+    phase: &str,
+    result: &str,
+    dedupe_state: &str,
+    token_id: Option<&str>,
 ) {
-    let payload = json!({
-        "kind": "standalone_management_audit",
-        "action": action,
-        "status": status,
-        "operator_principal": operator_principal,
-        "intent_id": intent_id,
-        "source_kind": input.map(|capture| capture.source_kind.as_str()),
-        "source_summary": input.map(|capture| capture.source_summary.clone()),
-        "source_locator_digest": input.map(|capture| capture.source_locator_digest.clone()),
-        "byte_length": input.map(|capture| capture.byte_length),
-    });
+    let mut event = LocalAuthorizationEvent::new(
+        flow_id,
+        LocalOperatorSurface::StandaloneCli,
+        "Security",
+        action,
+        action,
+        phase,
+        result,
+        dedupe_state,
+    );
+    event.operator_principal = Some(operator_principal.to_string());
+    event.intent_id = intent_id.map(ToString::to_string);
+    event.token_id = token_id.map(ToString::to_string);
+    event.source_kind = input.map(|capture| capture.source_kind.as_str().to_string());
+    event.source_summary = input.map(|capture| capture.source_summary.clone());
+    event.source_locator_digest = input.map(|capture| capture.source_locator_digest.clone());
+    event.byte_length = input.map(|capture| capture.byte_length);
+    recorder.append_event_with_fallback(
+        LocalAuthorizationLogStream::Authorization,
+        RuntimeLogLevel::Info,
+        &event,
+    );
     eprintln!(
         "{}",
-        serde_json::to_string(&payload).unwrap_or_else(|_| "{\"kind\":\"standalone_management_audit\",\"status\":\"encode-failed\"}".to_string())
+        serde_json::to_string(&event).unwrap_or_else(|_| {
+            "{\"surface\":\"standalone-cli\",\"operation\":\"audit-encode-failed\"}".to_string()
+        })
     );
 }
 

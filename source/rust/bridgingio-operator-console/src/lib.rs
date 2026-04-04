@@ -10,16 +10,21 @@ use bridgingio_engine::{
     i18n::Catalog, CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile,
     StandaloneTerminalSection, TerminalProviderSection,
 };
+use bridgingio_platform::{
+    next_local_authorization_flow_id, LocalAuthorizationEvent, LocalAuthorizationLogStream,
+    LocalAuthorizationRecorder, LocalOperatorSurface, RuntimeLogLevel,
+};
 #[cfg(test)]
 use bridgingio_secrets::VaultUnlockTriggerPolicy;
 use bridgingio_secrets::{
     canonical_ssh_private_key_ref_from_key_name, local_admin_create_token_target,
     local_admin_delete_vault_target, local_admin_payload_digest_for_create_agent_token,
     local_admin_payload_digest_for_delete_agent_token, local_admin_payload_digest_for_delete_vault,
-    read_passive_vault_projection, CreateAgentTokenRequest, DeleteAgentTokenRequest,
-    DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter, TokenScopeInput,
-    TrustedLocalSshKeyImportRequest, TrustedLocalSshKeyImportResult, UpdateAgentTokenAccessRequest,
-    UpdateAgentTokenLabelRequest, VaultError, VaultPassiveProjection,
+    read_passive_vault_projection, take_last_verified_os_native_event, CreateAgentTokenRequest,
+    DeleteAgentTokenRequest, DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter,
+    TokenScopeInput, TrustedLocalSshKeyImportRequest, TrustedLocalSshKeyImportResult,
+    UpdateAgentTokenAccessRequest, UpdateAgentTokenLabelRequest, VaultError, VaultPassiveProjection,
+    VerifiedOsNativeEvent,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -267,12 +272,19 @@ const SSH_IMPORT_KEY_NAME_FIELD: &str = "__ssh_import_key_name__";
 const SSH_IMPORT_LABEL_FIELD: &str = "__ssh_import_label__";
 const SSH_IMPORT_SOURCE_PATH_FIELD: &str = "__ssh_import_source_path__";
 const SSH_IMPORT_PASSPHRASE_FIELD: &str = "__ssh_import_passphrase__";
+const OP_VAULT_UNLOCK: &str = "vault.unlock";
+const OP_VAULT_DELETE: &str = "vault.delete";
+const OP_SSH_KEY_IMPORT: &str = "ssh_key.import";
+const OP_SSH_KEY_DELETE: &str = "ssh_key.delete";
+const OP_AUTH_TOKEN_CREATE: &str = "auth.token.create";
+const OP_AUTH_TOKEN_DELETE: &str = "auth.token.delete";
 const MENUCONFIG_MIN_VIEWPORT_WIDTH: u16 = 80;
 const MENUCONFIG_MIN_VIEWPORT_HEIGHT: u16 = 24;
 
 struct UnlockWorkerOutcome {
     router: SecretVaultRouter,
     result: Result<(), String>,
+    verified_event: Option<VerifiedOsNativeEvent>,
 }
 
 struct UnlockWorkerHandle {
@@ -284,6 +296,8 @@ pub struct MenuConfigApp {
     config_path: PathBuf,
     settings: CoreSettings,
     catalog: Catalog,
+    authorization_recorder: LocalAuthorizationRecorder,
+    session_flow_id: String,
     vault_router: Option<SecretVaultRouter>,
     security_summary: SecuritySummary,
     screen: Screen,
@@ -304,6 +318,7 @@ pub struct MenuConfigApp {
     exit_confirm_mode: bool,
     exit_confirm_selected: usize,
     unlock_flow_state: UnlockFlowState,
+    unlock_flow_id: Option<String>,
     unlock_flow_pending: bool,
     unlock_worker: Option<UnlockWorkerHandle>,
     token_rows: Vec<TokenManagementRow>,
@@ -312,6 +327,7 @@ pub struct MenuConfigApp {
     ssh_import_last_result: Option<TrustedLocalSshKeyImportResult>,
     target_edit_session: Option<TargetEditSession>,
     confirm_action: Option<ConfirmAction>,
+    confirm_flow_id: Option<String>,
     confirm_selected: usize,
     token_reveal: Option<String>,
     pending_token_label: Option<String>,
@@ -333,10 +349,16 @@ impl MenuConfigApp {
         })?;
         let initial_status = catalog.t("menu.status.initial");
         let security_summary = build_security_summary_passive(&settings);
+        let authorization_recorder = LocalAuthorizationRecorder::for_runtime_root(
+            Path::new(&settings.core.data_dir),
+            RuntimeLogLevel::parse(&settings.core.log_level),
+        );
         Ok(Self {
             config_path,
             settings,
             catalog,
+            authorization_recorder,
+            session_flow_id: next_local_authorization_flow_id("menuconfig.session"),
             vault_router: None,
             security_summary,
             screen: Screen::Root,
@@ -357,6 +379,7 @@ impl MenuConfigApp {
             exit_confirm_mode: false,
             exit_confirm_selected: 0,
             unlock_flow_state: UnlockFlowState::Idle,
+            unlock_flow_id: None,
             unlock_flow_pending: false,
             unlock_worker: None,
             token_rows: Vec::new(),
@@ -365,6 +388,7 @@ impl MenuConfigApp {
             ssh_import_last_result: None,
             target_edit_session: None,
             confirm_action: None,
+            confirm_flow_id: None,
             confirm_selected: 0,
             token_reveal: None,
             pending_token_label: None,
@@ -382,7 +406,124 @@ impl MenuConfigApp {
         self.catalog.tf(key, vars)
     }
 
+    fn current_screen_id(&self) -> String {
+        match &self.screen {
+            Screen::Root => "Root".to_string(),
+            Screen::Core => "Core".to_string(),
+            Screen::Storage => "Storage".to_string(),
+            Screen::ModelPlane => "ModelPlane".to_string(),
+            Screen::Vault => "Vault".to_string(),
+            Screen::Targets => "Targets".to_string(),
+            Screen::Security => "Security".to_string(),
+            Screen::SshKeyImport => "SshKeyImport".to_string(),
+            Screen::SshKeyManagement => "SshKeyManagement".to_string(),
+            Screen::SshKeyDetail(token) => format!("SshKeyDetail:{token}"),
+            Screen::TokenManagement => "TokenManagement".to_string(),
+            Screen::TokenDetail(token) => format!("TokenDetail:{token}"),
+            Screen::TargetAddMode => "TargetAddMode".to_string(),
+            Screen::TargetAddTypePlain => "TargetAddTypePlain".to_string(),
+            Screen::TargetAddTypeSensitive => "TargetAddTypeSensitive".to_string(),
+            Screen::TargetEditor(index) => format!("TargetEditor:{index}"),
+            Screen::TargetPublicDescriptor(index) => format!("TargetPublicDescriptor:{index}"),
+            Screen::TargetConnectionProfile(index) => format!("TargetConnectionProfile:{index}"),
+            Screen::TargetSensitiveOverlay(index) => format!("TargetSensitiveOverlay:{index}"),
+            Screen::TargetCredentialSource(index) => format!("TargetCredentialSource:{index}"),
+            Screen::TargetCredentialPicker(index) => format!("TargetCredentialPicker:{index}"),
+            Screen::TargetPolicy(index) => format!("TargetPolicy:{index}"),
+            Screen::SearchResults => "SearchResults".to_string(),
+        }
+    }
+
+    fn record_authorization_event(
+        &self,
+        flow_id: &str,
+        action: &str,
+        operation: &str,
+        phase: &str,
+        result: &str,
+        dedupe_state: &str,
+        error_code: Option<&str>,
+        token_id: Option<&str>,
+        credential_ref: Option<&str>,
+    ) {
+        let mut event = LocalAuthorizationEvent::new(
+            flow_id,
+            LocalOperatorSurface::Menuconfig,
+            self.current_screen_id(),
+            action,
+            operation,
+            phase,
+            result,
+            dedupe_state,
+        );
+        event.error_code = error_code.map(ToString::to_string);
+        event.token_id = token_id.map(ToString::to_string);
+        event.credential_ref = credential_ref.map(ToString::to_string);
+        self.authorization_recorder.append_event_with_fallback(
+            LocalAuthorizationLogStream::Authorization,
+            RuntimeLogLevel::Info,
+            &event,
+        );
+    }
+
+    fn record_session_event(
+        &self,
+        action: &str,
+        phase: &str,
+        result: &str,
+        level: RuntimeLogLevel,
+        error_code: Option<&str>,
+    ) {
+        self.record_session_event_with_flow(
+            &self.session_flow_id,
+            action,
+            phase,
+            result,
+            level,
+            error_code,
+        );
+    }
+
+    fn record_session_event_with_flow(
+        &self,
+        flow_id: &str,
+        action: &str,
+        phase: &str,
+        result: &str,
+        level: RuntimeLogLevel,
+        error_code: Option<&str>,
+    ) {
+        let mut event = LocalAuthorizationEvent::new(
+            flow_id,
+            LocalOperatorSurface::Menuconfig,
+            self.current_screen_id(),
+            action,
+            "menuconfig.session",
+            phase,
+            result,
+            "not-applicable",
+        );
+        event.error_code = error_code.map(ToString::to_string);
+        self.authorization_recorder.append_event_with_fallback(
+            LocalAuthorizationLogStream::MenuconfigSession,
+            level,
+            &event,
+        );
+    }
+
+    fn finish_session(&self, outcome: MenuConfigOutcome) -> MenuConfigOutcome {
+        self.record_session_event("menuconfig.exit", "completed", "ok", RuntimeLogLevel::Info, None);
+        outcome
+    }
+
     pub fn run(&mut self) -> Result<MenuConfigOutcome, String> {
+        self.record_session_event(
+            "menuconfig.start",
+            "started",
+            "ok",
+            RuntimeLogLevel::Info,
+            None,
+        );
         let mut ui =
             TerminalUi::enter().map_err(|err| format!("enter menuconfig ui failed: {err}"))?;
         loop {
@@ -416,7 +557,7 @@ impl MenuConfigApp {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
                         if let Some(outcome) = self.request_exit_or_back()? {
-                            return Ok(outcome);
+                            return Ok(self.finish_session(outcome));
                         }
                     }
                     _ => {}
@@ -438,7 +579,7 @@ impl MenuConfigApp {
             }
             if self.exit_confirm_mode {
                 if let Some(outcome) = self.handle_exit_confirm_key(key.code)? {
-                    return Ok(outcome);
+                    return Ok(self.finish_session(outcome));
                 }
                 continue;
             }
@@ -454,7 +595,7 @@ impl MenuConfigApp {
             match key.code {
                 KeyCode::Char('q') => {
                     if let Some(outcome) = self.request_exit_or_back()? {
-                        return Ok(outcome);
+                        return Ok(self.finish_session(outcome));
                     }
                 }
                 KeyCode::Esc => {
@@ -462,7 +603,7 @@ impl MenuConfigApp {
                         self.show_help = false;
                         self.last_status = self.t("menu.status.help_closed");
                     } else if let Some(outcome) = self.request_exit_or_back()? {
-                        return Ok(outcome);
+                        return Ok(self.finish_session(outcome));
                     }
                 }
                 KeyCode::Left => self.move_footer_selection(-1),
@@ -480,7 +621,7 @@ impl MenuConfigApp {
                 KeyCode::Char(' ') => self.handle_space_on_selected()?,
                 KeyCode::Enter => {
                     if let Some(outcome) = self.activate_footer_button()? {
-                        return Ok(outcome);
+                        return Ok(self.finish_session(outcome));
                     }
                 }
                 _ => {}
@@ -996,24 +1137,69 @@ impl MenuConfigApp {
             "menu.status.saved",
             &[("path", &self.config_path.display().to_string())],
         );
+        self.record_session_event("menuconfig.save", "succeeded", "ok", RuntimeLogLevel::Info, None);
         Ok(())
     }
 
     fn begin_unlock_flow(&mut self) {
         if self.security_summary.lock_state == "unlocked" {
             self.last_status = self.t("menu.status.vault_already_unlocked");
+            self.record_session_event(
+                "vault.unlock",
+                "ignored",
+                "already-unlocked",
+                RuntimeLogLevel::Debug,
+                None,
+            );
             return;
         }
         if self.unlock_worker.is_some() {
             self.last_status = self.t("menu.status.vault_unlock_inflight");
+            self.record_authorization_event(
+                self.unlock_flow_id.as_deref().unwrap_or("flow-inflight"),
+                "Unlock Vault",
+                OP_VAULT_UNLOCK,
+                "joined",
+                "inflight",
+                "joined",
+                None,
+                None,
+                None,
+            );
             return;
         }
+        let flow_id = next_local_authorization_flow_id(OP_VAULT_UNLOCK);
+        self.unlock_flow_id = Some(flow_id.clone());
         self.unlock_flow_state = UnlockFlowState::Waiting;
         self.unlock_flow_pending = true;
         self.last_status = self.t("menu.status.vault_unlock_waiting");
+        self.record_authorization_event(
+            &flow_id,
+            "Unlock Vault",
+            OP_VAULT_UNLOCK,
+            "requested",
+            "pending",
+            "leader",
+            None,
+            None,
+            None,
+        );
+        self.record_session_event_with_flow(
+            &flow_id,
+            "unlock.worker",
+            "requested",
+            "pending",
+            RuntimeLogLevel::Debug,
+            None,
+        );
     }
 
     fn start_unlock_worker(&mut self) {
+        let flow_id = self
+            .unlock_flow_id
+            .clone()
+            .unwrap_or_else(|| next_local_authorization_flow_id(OP_VAULT_UNLOCK));
+        self.unlock_flow_id = Some(flow_id.clone());
         let mut router = match self.ensure_vault_router_loaded() {
             Ok(_) => self
                 .vault_router
@@ -1030,9 +1216,39 @@ impl MenuConfigApp {
                         ("methods", &ordered_unlock_methods(&self.settings).join(",")),
                     ],
                 );
+                self.record_authorization_event(
+                    &flow_id,
+                    "Unlock Vault",
+                    OP_VAULT_UNLOCK,
+                    "failed",
+                    "error",
+                    "leader",
+                    Some("router-load-failed"),
+                    None,
+                    None,
+                );
                 return;
             }
         };
+        self.record_authorization_event(
+            &flow_id,
+            "Unlock Vault",
+            OP_VAULT_UNLOCK,
+            "started",
+            "pending",
+            "leader",
+            None,
+            None,
+            None,
+        );
+        self.record_session_event_with_flow(
+            &flow_id,
+            "unlock.worker",
+            "started",
+            "pending",
+            RuntimeLogLevel::Debug,
+            None,
+        );
         let settings = self.settings.clone();
         let (tx, rx) = mpsc::channel::<UnlockWorkerOutcome>();
         thread::Builder::new()
@@ -1040,6 +1256,7 @@ impl MenuConfigApp {
             .spawn(move || {
                 let methods = ordered_unlock_methods(&settings);
                 let mut last_error = None::<String>;
+                let mut last_verified_event = None::<VerifiedOsNativeEvent>;
                 let mut attempted_os_native = false;
                 for method in methods {
                     if method.as_str() != "os-native" {
@@ -1048,13 +1265,16 @@ impl MenuConfigApp {
                     attempted_os_native = true;
                     match router.unlock_with_os_native_verified() {
                         Ok(()) => {
+                            let verified_event = take_last_verified_os_native_event();
                             let _ = tx.send(UnlockWorkerOutcome {
                                 router,
                                 result: Ok(()),
+                                verified_event,
                             });
                             return;
                         }
                         Err(err) => {
+                            last_verified_event = take_last_verified_os_native_event();
                             last_error = Some(format!("{err:?}"));
                         }
                     }
@@ -1067,6 +1287,7 @@ impl MenuConfigApp {
                     result: Err(
                         last_error.unwrap_or_else(|| "No allowed unlock method succeeded.".into())
                     ),
+                    verified_event: last_verified_event,
                 });
             })
             .expect("spawn menuconfig unlock worker");
@@ -1098,6 +1319,30 @@ impl MenuConfigApp {
                 self.vault_router = Some(outcome.router);
                 self.refresh_security_summary();
                 self.last_status = self.t("menu.status.vault_unlock_cancelled");
+                let flow_id = self
+                    .unlock_flow_id
+                    .as_deref()
+                    .unwrap_or("flow-unlock-cancelled");
+                self.record_authorization_event(
+                    flow_id,
+                    "Unlock Vault",
+                    OP_VAULT_UNLOCK,
+                    "cancelled",
+                    "cancelled",
+                    "leader",
+                    None,
+                    None,
+                    None,
+                );
+                self.record_session_event_with_flow(
+                    flow_id,
+                    "unlock.worker",
+                    "cancelled",
+                    "cancelled",
+                    RuntimeLogLevel::Debug,
+                    None,
+                );
+                self.unlock_flow_id = None;
                 return;
             }
             self.vault_router = Some(outcome.router);
@@ -1106,6 +1351,34 @@ impl MenuConfigApp {
                     self.refresh_security_summary();
                     self.unlock_flow_state = UnlockFlowState::Success;
                     self.last_status = self.t("menu.status.vault_unlocked_os_native");
+                    let flow_id = self
+                        .unlock_flow_id
+                        .as_deref()
+                        .unwrap_or("flow-unlock-succeeded");
+                    let verified = outcome.verified_event.as_ref();
+                    let dedupe_state = verified
+                        .as_ref()
+                        .map(|event| event.dedupe_state.as_str())
+                        .unwrap_or("leader");
+                    self.record_authorization_event(
+                        flow_id,
+                        "Unlock Vault",
+                        OP_VAULT_UNLOCK,
+                        "succeeded",
+                        "ok",
+                        dedupe_state,
+                        None,
+                        None,
+                        None,
+                    );
+                    self.record_session_event_with_flow(
+                        flow_id,
+                        "unlock.worker",
+                        "completed",
+                        "ok",
+                        RuntimeLogLevel::Debug,
+                        None,
+                    );
                 }
                 Err(reason) => {
                     let reason = if reason == MENU_UNLOCK_REASON_REQUIRES_OS_NATIVE {
@@ -1121,8 +1394,37 @@ impl MenuConfigApp {
                         "menu.status.vault_unlock_failed",
                         &[("reason", &reason), ("methods", &methods.join(","))],
                     );
+                    let flow_id = self
+                        .unlock_flow_id
+                        .as_deref()
+                        .unwrap_or("flow-unlock-failed");
+                    let verified = outcome.verified_event.as_ref();
+                    let dedupe_state = verified
+                        .as_ref()
+                        .map(|event| event.dedupe_state.as_str())
+                        .unwrap_or("leader");
+                    self.record_authorization_event(
+                        flow_id,
+                        "Unlock Vault",
+                        OP_VAULT_UNLOCK,
+                        "failed",
+                        "error",
+                        dedupe_state,
+                        Some("unlock-failed"),
+                        None,
+                        None,
+                    );
+                    self.record_session_event_with_flow(
+                        flow_id,
+                        "unlock.worker",
+                        "failed",
+                        "error",
+                        RuntimeLogLevel::Debug,
+                        Some("unlock-failed"),
+                    );
                 }
             }
+            self.unlock_flow_id = None;
             return;
         }
 
@@ -1139,6 +1441,30 @@ impl MenuConfigApp {
                     ("methods", &methods.join(",")),
                 ],
             );
+            let flow_id = self
+                .unlock_flow_id
+                .as_deref()
+                .unwrap_or("flow-unlock-disconnected");
+            self.record_authorization_event(
+                flow_id,
+                "Unlock Vault",
+                OP_VAULT_UNLOCK,
+                "failed",
+                "error",
+                "leader",
+                Some("unlock-worker-disconnected"),
+                None,
+                None,
+            );
+            self.record_session_event_with_flow(
+                flow_id,
+                "unlock.worker",
+                "failed",
+                "error",
+                RuntimeLogLevel::Debug,
+                Some("unlock-worker-disconnected"),
+            );
+            self.unlock_flow_id = None;
         }
     }
 
@@ -1258,18 +1584,52 @@ impl MenuConfigApp {
     }
 
     fn execute_ssh_key_import(&mut self) -> Result<(), String> {
+        let flow_id = next_local_authorization_flow_id(OP_SSH_KEY_IMPORT);
         if self.vault_router.is_none() {
             let _ = self.ensure_vault_router_loaded()?;
         }
         self.refresh_security_summary();
         if self.security_summary.lock_state != "unlocked" {
             self.last_status = self.t("menu.status.vault_locked_for_ssh_key_action");
+            self.record_authorization_event(
+                &flow_id,
+                "Import SSH Key",
+                OP_SSH_KEY_IMPORT,
+                "failed",
+                "locked",
+                "not-applicable",
+                Some("vault-locked"),
+                None,
+                None,
+            );
             return Ok(());
         }
+        self.record_authorization_event(
+            &flow_id,
+            "Import SSH Key",
+            OP_SSH_KEY_IMPORT,
+            "started",
+            "pending",
+            "leader",
+            None,
+            None,
+            None,
+        );
 
         let key_name = self.ssh_import_draft.key_name.trim().to_string();
         if key_name.is_empty() {
             self.last_status = self.t("menu.error.ssh_import_key_name_required");
+            self.record_authorization_event(
+                &flow_id,
+                "Import SSH Key",
+                OP_SSH_KEY_IMPORT,
+                "failed",
+                "invalid-input",
+                "leader",
+                Some("missing-key-name"),
+                None,
+                None,
+            );
             return Ok(());
         }
         let canonical_ref = canonical_ssh_private_key_ref_from_key_name(&key_name)
@@ -1278,12 +1638,34 @@ impl MenuConfigApp {
             Ok(value) => value,
             Err(message) => {
                 self.last_status = message;
+                self.record_authorization_event(
+                    &flow_id,
+                    "Import SSH Key",
+                    OP_SSH_KEY_IMPORT,
+                    "failed",
+                    "invalid-input",
+                    "leader",
+                    Some("invalid-key-name"),
+                    None,
+                    None,
+                );
                 return Ok(());
             }
         };
         let source_path = self.ssh_import_draft.source_path.trim().to_string();
         if source_path.is_empty() {
             self.last_status = self.t("menu.error.ssh_import_source_path_required");
+            self.record_authorization_event(
+                &flow_id,
+                "Import SSH Key",
+                OP_SSH_KEY_IMPORT,
+                "failed",
+                "invalid-input",
+                "leader",
+                Some("missing-source-path"),
+                None,
+                None,
+            );
             return Ok(());
         }
         let key_material = fs::read_to_string(&source_path).map_err(|err| {
@@ -1296,6 +1678,17 @@ impl MenuConfigApp {
             Ok(value) => value,
             Err(message) => {
                 self.last_status = message;
+                self.record_authorization_event(
+                    &flow_id,
+                    "Import SSH Key",
+                    OP_SSH_KEY_IMPORT,
+                    "failed",
+                    "error",
+                    "leader",
+                    Some("source-read-failed"),
+                    None,
+                    None,
+                );
                 return Ok(());
             }
         };
@@ -1307,6 +1700,17 @@ impl MenuConfigApp {
             self.last_status = self.tf(
                 "menu.error.ssh_import_key_already_exists",
                 &[("ref", canonical_ref.as_str())],
+            );
+            self.record_authorization_event(
+                &flow_id,
+                "Import SSH Key",
+                OP_SSH_KEY_IMPORT,
+                "failed",
+                "duplicate",
+                "leader",
+                Some("duplicate-credential-ref"),
+                None,
+                Some(canonical_ref.as_str()),
             );
             return Ok(());
         }
@@ -1363,15 +1767,48 @@ impl MenuConfigApp {
                     );
                 }
                 self.refresh_security_summary();
+                self.record_authorization_event(
+                    &flow_id,
+                    "Import SSH Key",
+                    OP_SSH_KEY_IMPORT,
+                    "succeeded",
+                    "ok",
+                    "leader",
+                    None,
+                    None,
+                    Some(imported.credential_ref.as_str()),
+                );
                 Ok(())
             }
             Err(VaultError::SshKeyPassphraseRequired(_)) => {
                 self.last_status = self.t("menu.status.ssh_import_passphrase_required");
                 self.begin_edit(SSH_IMPORT_PASSPHRASE_FIELD.to_string())?;
+                self.record_authorization_event(
+                    &flow_id,
+                    "Import SSH Key",
+                    OP_SSH_KEY_IMPORT,
+                    "failed",
+                    "passphrase-required",
+                    "leader",
+                    Some("passphrase-required"),
+                    None,
+                    Some(canonical_ref.as_str()),
+                );
                 Ok(())
             }
             Err(err) => {
                 self.last_status = format!("import ssh key failed: {err:?}");
+                self.record_authorization_event(
+                    &flow_id,
+                    "Import SSH Key",
+                    OP_SSH_KEY_IMPORT,
+                    "failed",
+                    "error",
+                    "leader",
+                    Some("import-failed"),
+                    None,
+                    Some(canonical_ref.as_str()),
+                );
                 Ok(())
             }
         }
@@ -1470,9 +1907,22 @@ impl MenuConfigApp {
                     self.last_status = self.t("menu.status.vault_locked_for_ssh_key_action");
                     return Ok(());
                 }
+                let flow_id = next_local_authorization_flow_id(OP_SSH_KEY_DELETE);
                 self.confirm_action = Some(ConfirmAction::DeleteSshKey(reference));
+                self.confirm_flow_id = Some(flow_id.clone());
                 self.confirm_selected = 0;
                 self.last_status = self.t("menu.status.ssh_key_delete_confirm_pending");
+                self.record_authorization_event(
+                    &flow_id,
+                    "Delete SSH Key",
+                    OP_SSH_KEY_DELETE,
+                    "requested",
+                    "pending",
+                    "not-applicable",
+                    None,
+                    None,
+                    None,
+                );
             }
             ActionKind::OpenTargetCredentialSource(index) => {
                 let Some(target) = self.settings.targets.get(index) else {
@@ -1638,9 +2088,22 @@ impl MenuConfigApp {
                 self.last_status = self.t("menu.status.vault_initialized");
             }
             ActionKind::DeleteVault => {
+                let flow_id = next_local_authorization_flow_id(OP_VAULT_DELETE);
                 self.confirm_action = Some(ConfirmAction::DeleteVault);
+                self.confirm_flow_id = Some(flow_id.clone());
                 self.confirm_selected = 0;
                 self.last_status = self.t("menu.status.vault_delete_confirm_pending");
+                self.record_authorization_event(
+                    &flow_id,
+                    "Delete Vault",
+                    OP_VAULT_DELETE,
+                    "requested",
+                    "pending",
+                    "not-applicable",
+                    None,
+                    None,
+                    None,
+                );
             }
             ActionKind::CreateToken => {
                 if self.vault_router.is_none() {
@@ -1649,8 +2112,32 @@ impl MenuConfigApp {
                 self.refresh_security_summary();
                 if self.security_summary.lock_state != "unlocked" {
                     self.last_status = self.t("menu.status.vault_locked_for_token_action");
+                    let flow_id = next_local_authorization_flow_id(OP_AUTH_TOKEN_CREATE);
+                    self.record_authorization_event(
+                        &flow_id,
+                        "Create Token",
+                        OP_AUTH_TOKEN_CREATE,
+                        "failed",
+                        "locked",
+                        "not-applicable",
+                        Some("vault-locked"),
+                        None,
+                        None,
+                    );
                     return Ok(());
                 }
+                let flow_id = next_local_authorization_flow_id(OP_AUTH_TOKEN_CREATE);
+                self.record_authorization_event(
+                    &flow_id,
+                    "Create Token",
+                    OP_AUTH_TOKEN_CREATE,
+                    "requested",
+                    "pending",
+                    "leader",
+                    None,
+                    None,
+                    None,
+                );
                 self.pending_token_label = None;
                 self.begin_edit(TOKEN_CREATE_LABEL_FIELD.to_string())?;
             }
@@ -1704,9 +2191,22 @@ impl MenuConfigApp {
                 self.last_status = self.t("menu.status.token_revoke_confirm_pending");
             }
             ActionKind::DeleteToken(token_id) => {
+                let flow_id = next_local_authorization_flow_id(OP_AUTH_TOKEN_DELETE);
                 self.confirm_action = Some(ConfirmAction::DeleteToken(token_id));
+                self.confirm_flow_id = Some(flow_id.clone());
                 self.confirm_selected = 0;
                 self.last_status = self.t("menu.status.token_delete_confirm_pending");
+                self.record_authorization_event(
+                    &flow_id,
+                    "Delete Token",
+                    OP_AUTH_TOKEN_DELETE,
+                    "requested",
+                    "pending",
+                    "not-applicable",
+                    None,
+                    None,
+                    None,
+                );
             }
             ActionKind::DeleteTarget(index) => {
                 let sensitive = self
@@ -1748,18 +2248,106 @@ impl MenuConfigApp {
                 self.confirm_selected = next.clamp(0, 1) as usize;
             }
             KeyCode::Esc => {
+                if let (Some(flow_id), Some(action)) =
+                    (self.confirm_flow_id.as_deref(), self.confirm_action.as_ref())
+                {
+                    match action {
+                        ConfirmAction::DeleteVault => self.record_authorization_event(
+                            flow_id,
+                            "Delete Vault",
+                            OP_VAULT_DELETE,
+                            "cancelled",
+                            "cancelled",
+                            "not-applicable",
+                            None,
+                            None,
+                            None,
+                        ),
+                        ConfirmAction::DeleteToken(token_id) => self.record_authorization_event(
+                            flow_id,
+                            "Delete Token",
+                            OP_AUTH_TOKEN_DELETE,
+                            "cancelled",
+                            "cancelled",
+                            "not-applicable",
+                            None,
+                            Some(token_id.as_str()),
+                            None,
+                        ),
+                        ConfirmAction::DeleteSshKey(reference) => self.record_authorization_event(
+                            flow_id,
+                            "Delete SSH Key",
+                            OP_SSH_KEY_DELETE,
+                            "cancelled",
+                            "cancelled",
+                            "not-applicable",
+                            None,
+                            None,
+                            Some(reference.as_str()),
+                        ),
+                        _ => {}
+                    }
+                }
                 self.confirm_action = None;
+                self.confirm_flow_id = None;
                 self.confirm_selected = 0;
                 self.last_status = self.t("menu.status.confirm_cancelled");
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if self.confirm_selected == 1 {
+                    if let (Some(flow_id), Some(action)) =
+                        (self.confirm_flow_id.as_deref(), self.confirm_action.as_ref())
+                    {
+                        match action {
+                            ConfirmAction::DeleteVault => self.record_authorization_event(
+                                flow_id,
+                                "Delete Vault",
+                                OP_VAULT_DELETE,
+                                "cancelled",
+                                "cancelled",
+                                "not-applicable",
+                                None,
+                                None,
+                                None,
+                            ),
+                            ConfirmAction::DeleteToken(token_id) => self.record_authorization_event(
+                                flow_id,
+                                "Delete Token",
+                                OP_AUTH_TOKEN_DELETE,
+                                "cancelled",
+                                "cancelled",
+                                "not-applicable",
+                                None,
+                                Some(token_id.as_str()),
+                                None,
+                            ),
+                            ConfirmAction::DeleteSshKey(reference) => self.record_authorization_event(
+                                flow_id,
+                                "Delete SSH Key",
+                                OP_SSH_KEY_DELETE,
+                                "cancelled",
+                                "cancelled",
+                                "not-applicable",
+                                None,
+                                None,
+                                Some(reference.as_str()),
+                            ),
+                            _ => {}
+                        }
+                    }
                     self.confirm_action = None;
+                    self.confirm_flow_id = None;
                     self.confirm_selected = 0;
                     self.last_status = self.t("menu.status.confirm_cancelled");
                     return Ok(());
                 }
                 let action = self.confirm_action.clone();
+                let managed_auth_flow = matches!(
+                    action.as_ref(),
+                    Some(ConfirmAction::DeleteVault)
+                        | Some(ConfirmAction::DeleteToken(_))
+                        | Some(ConfirmAction::DeleteSshKey(_))
+                );
                 self.confirm_action = None;
                 self.confirm_selected = 0;
                 match action {
@@ -1820,6 +2408,9 @@ impl MenuConfigApp {
                     }
                     None => {}
                 }
+                if !managed_auth_flow {
+                    self.confirm_flow_id = None;
+                }
             }
             _ => {}
         }
@@ -1831,6 +2422,18 @@ impl MenuConfigApp {
         label: String,
         expires_in_seconds: Option<u64>,
     ) -> Result<(), String> {
+        let flow_id = next_local_authorization_flow_id(OP_AUTH_TOKEN_CREATE);
+        self.record_authorization_event(
+            &flow_id,
+            "Create Token",
+            OP_AUTH_TOKEN_CREATE,
+            "started",
+            "pending",
+            "leader",
+            None,
+            None,
+            None,
+        );
         let operator_principal = "menuconfig:local-operator".to_string();
         let mut request = CreateAgentTokenRequest {
             label,
@@ -1851,7 +2454,23 @@ impl MenuConfigApp {
             attestation_id: None,
         };
         let digest = local_admin_payload_digest_for_create_agent_token(&request);
-        let router = self.ensure_vault_router_loaded()?;
+        let router = match self.ensure_vault_router_loaded() {
+            Ok(router) => router,
+            Err(err) => {
+                self.record_authorization_event(
+                    &flow_id,
+                    "Create Token",
+                    OP_AUTH_TOKEN_CREATE,
+                    "failed",
+                    "error",
+                    "leader",
+                    Some("router-load-failed"),
+                    None,
+                    None,
+                );
+                return Err(err);
+            }
+        };
         let attestation_id = mint_local_admin_attestation(
             router,
             LocalAdminActionKind::CreateAgentToken,
@@ -1867,6 +2486,17 @@ impl MenuConfigApp {
         self.token_reveal = Some(created.plaintext_token);
         self.refresh_security_summary();
         self.last_status = self.t("menu.status.token_created");
+        self.record_authorization_event(
+            &flow_id,
+            "Create Token",
+            OP_AUTH_TOKEN_CREATE,
+            "succeeded",
+            "ok",
+            "leader",
+            None,
+            Some(created.summary.token_id.as_str()),
+            None,
+        );
         Ok(())
     }
 
@@ -1915,9 +2545,40 @@ impl MenuConfigApp {
     }
 
     fn delete_token_confirmed(&mut self, token_id: &str) -> Result<(), String> {
+        let flow_id = self
+            .confirm_flow_id
+            .take()
+            .unwrap_or_else(|| next_local_authorization_flow_id(OP_AUTH_TOKEN_DELETE));
         let operator_principal = "menuconfig:local-operator".to_string();
         let digest = local_admin_payload_digest_for_delete_agent_token(token_id);
-        let router = self.ensure_vault_router_loaded()?;
+        self.record_authorization_event(
+            &flow_id,
+            "Delete Token",
+            OP_AUTH_TOKEN_DELETE,
+            "started",
+            "pending",
+            "leader",
+            None,
+            Some(token_id),
+            None,
+        );
+        let router = match self.ensure_vault_router_loaded() {
+            Ok(router) => router,
+            Err(err) => {
+                self.record_authorization_event(
+                    &flow_id,
+                    "Delete Token",
+                    OP_AUTH_TOKEN_DELETE,
+                    "failed",
+                    "error",
+                    "leader",
+                    Some("router-load-failed"),
+                    Some(token_id),
+                    None,
+                );
+                return Err(err);
+            }
+        };
         let attestation_id = mint_local_admin_attestation(
             router,
             LocalAdminActionKind::DeleteAgentToken,
@@ -1934,11 +2595,53 @@ impl MenuConfigApp {
             .map_err(|err| format!("delete token failed: {err:?}"))?;
         self.refresh_security_summary();
         self.last_status = self.t("menu.status.token_deleted");
+        self.record_authorization_event(
+            &flow_id,
+            "Delete Token",
+            OP_AUTH_TOKEN_DELETE,
+            "succeeded",
+            "ok",
+            "leader",
+            None,
+            Some(token_id),
+            None,
+        );
         Ok(())
     }
 
     fn delete_ssh_key_confirmed(&mut self, credential_ref: &str) -> Result<(), String> {
-        let router = self.ensure_vault_router_loaded()?;
+        let flow_id = self
+            .confirm_flow_id
+            .take()
+            .unwrap_or_else(|| next_local_authorization_flow_id(OP_SSH_KEY_DELETE));
+        self.record_authorization_event(
+            &flow_id,
+            "Delete SSH Key",
+            OP_SSH_KEY_DELETE,
+            "started",
+            "pending",
+            "leader",
+            None,
+            None,
+            Some(credential_ref),
+        );
+        let router = match self.ensure_vault_router_loaded() {
+            Ok(router) => router,
+            Err(err) => {
+                self.record_authorization_event(
+                    &flow_id,
+                    "Delete SSH Key",
+                    OP_SSH_KEY_DELETE,
+                    "failed",
+                    "error",
+                    "leader",
+                    Some("router-load-failed"),
+                    None,
+                    Some(credential_ref),
+                );
+                return Err(err);
+            }
+        };
         router
             .delete_secret_trusted_local(credential_ref)
             .map_err(|err| format!("delete ssh key failed: {err:?}"))?;
@@ -1958,13 +2661,55 @@ impl MenuConfigApp {
         self.sync_selection_to_focusable();
         self.refresh_security_summary();
         self.last_status = self.tf("menu.status.ssh_key_deleted", &[("ref", credential_ref)]);
+        self.record_authorization_event(
+            &flow_id,
+            "Delete SSH Key",
+            OP_SSH_KEY_DELETE,
+            "succeeded",
+            "ok",
+            "leader",
+            None,
+            None,
+            Some(credential_ref),
+        );
         Ok(())
     }
 
     fn delete_vault_confirmed(&mut self) -> Result<(), String> {
+        let flow_id = self
+            .confirm_flow_id
+            .take()
+            .unwrap_or_else(|| next_local_authorization_flow_id(OP_VAULT_DELETE));
         let operator_principal = "menuconfig:local-operator".to_string();
         let digest = local_admin_payload_digest_for_delete_vault();
-        let router = self.ensure_vault_router_loaded()?;
+        self.record_authorization_event(
+            &flow_id,
+            "Delete Vault",
+            OP_VAULT_DELETE,
+            "started",
+            "pending",
+            "leader",
+            None,
+            None,
+            None,
+        );
+        let router = match self.ensure_vault_router_loaded() {
+            Ok(router) => router,
+            Err(err) => {
+                self.record_authorization_event(
+                    &flow_id,
+                    "Delete Vault",
+                    OP_VAULT_DELETE,
+                    "failed",
+                    "error",
+                    "leader",
+                    Some("router-load-failed"),
+                    None,
+                    None,
+                );
+                return Err(err);
+            }
+        };
         let attestation_id = mint_local_admin_attestation(
             router,
             LocalAdminActionKind::DeleteVault,
@@ -1983,16 +2728,35 @@ impl MenuConfigApp {
         self.refresh_security_summary();
         self.sync_selection_to_focusable();
         self.last_status = self.t("menu.status.vault_deleted");
+        self.record_authorization_event(
+            &flow_id,
+            "Delete Vault",
+            OP_VAULT_DELETE,
+            "succeeded",
+            "ok",
+            "leader",
+            None,
+            None,
+            None,
+        );
         Ok(())
     }
 
     fn go_back(&mut self) {
         if let Some((screen, selected)) = self.navigation_stack.pop() {
+            let previous_screen = self.current_screen_id();
             self.screen = screen;
             self.selected = selected;
             self.sync_selection_to_focusable();
             let screen_title = self.screen.title(&self.catalog);
             self.last_status = self.tf("menu.status.returned", &[("screen", &screen_title)]);
+            self.record_session_event(
+                &format!("screen.back:{previous_screen}"),
+                "navigated",
+                "ok",
+                RuntimeLogLevel::Debug,
+                None,
+            );
         } else {
             self.last_status = self.t("menu.status.already_top");
         }
@@ -2001,6 +2765,7 @@ impl MenuConfigApp {
     fn push_navigation_state(&mut self) {
         self.navigation_stack
             .push((self.screen.clone(), self.selected));
+        self.record_session_event("screen.push", "navigated", "ok", RuntimeLogLevel::Debug, None);
     }
 
     fn start_target_edit_session(&mut self, index: usize, is_new: bool) {
@@ -5154,14 +5919,17 @@ mod tests {
     use super::{ActionKind, EditModeKind, MenuConfigApp, MenuEntryKind, Screen};
     use bridgingio_domain::TargetKind;
     use bridgingio_engine::CoreSettings;
+    use bridgingio_platform::RuntimeLogLevel;
     use bridgingio_secrets::{
         SecretBytes, SecretVaultRouter, TrustedLocalSshKeyImportRequest, VaultUnlockTriggerPolicy,
+        VerifiedOsNativeEvent,
     };
     use crossterm::event::KeyCode;
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_path(label: &str) -> PathBuf {
@@ -5185,6 +5953,12 @@ mod tests {
             &format!("data_dir = \"{toml_data_dir}\""),
         );
         fs::write(config_path, updated).expect("write config with custom data dir");
+    }
+
+    fn set_config_log_level(config_path: &Path, level: &str) {
+        let config = fs::read_to_string(config_path).expect("read config");
+        let updated = config.replace("log_level = \"info\"", &format!("log_level = \"{level}\""));
+        fs::write(config_path, updated).expect("write config with custom log level");
     }
 
     const TEST_PRIVATE_KEY_PEM: &str =
@@ -5442,6 +6216,99 @@ mod tests {
         let saved = fs::read_to_string(&config_path).expect("read saved config");
         assert!(saved.contains("display_name = \"My ADB\""));
         assert_eq!(app.last_apply_strategy.as_deref(), Some("restart_required"));
+    }
+
+    #[test]
+    fn authorization_log_is_persisted_and_stays_display_safe() {
+        let config_path = temp_config_path("authorization-log");
+        let runtime_root = config_path
+            .parent()
+            .expect("config parent")
+            .join("runtime-log-root");
+        set_config_data_dir(&config_path, &runtime_root);
+        let app = MenuConfigApp::load(&config_path).expect("load app");
+
+        app.record_authorization_event(
+            "flow-menu-test",
+            "Create Token",
+            super::OP_AUTH_TOKEN_CREATE,
+            "succeeded",
+            "ok",
+            "leader",
+            None,
+            Some("token-000001"),
+            None,
+        );
+
+        let auth_log = runtime_root.join("logs/local-authorization.jsonl");
+        let text = fs::read_to_string(&auth_log).expect("read auth log");
+        assert!(text.contains("\"flow_id\":\"flow-menu-test\""));
+        assert!(text.contains("\"operation\":\"auth.token.create\""));
+        assert!(!text.contains("SUPER-SECRET"));
+    }
+
+    #[test]
+    fn debug_session_breadcrumb_is_gated_by_log_level() {
+        let config_path = temp_config_path("session-debug-gate");
+        let runtime_root = config_path
+            .parent()
+            .expect("config parent")
+            .join("runtime-log-root");
+        set_config_data_dir(&config_path, &runtime_root);
+        let app = MenuConfigApp::load(&config_path).expect("load app");
+
+        app.record_session_event(
+            "screen.push",
+            "navigated",
+            "ok",
+            RuntimeLogLevel::Debug,
+            None,
+        );
+
+        assert!(!runtime_root.join("logs/menuconfig-session.jsonl").exists());
+    }
+
+    #[test]
+    fn unlock_worker_uses_authorization_flow_for_session_and_dedupe() {
+        let config_path = temp_config_path("unlock-flow-correlation");
+        let runtime_root = config_path
+            .parent()
+            .expect("config parent")
+            .join("runtime-flow-root");
+        set_config_data_dir(&config_path, &runtime_root);
+        set_config_log_level(&config_path, "debug");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+
+        let (tx, rx) = mpsc::channel();
+        app.unlock_worker = Some(super::UnlockWorkerHandle {
+            receiver: rx,
+            cancel_requested: false,
+        });
+        app.unlock_flow_id = Some("flow-vault.unlock-test".to_string());
+        tx.send(super::UnlockWorkerOutcome {
+            router: SecretVaultRouter::default(),
+            result: Ok(()),
+            verified_event: Some(VerifiedOsNativeEvent {
+                flow_id: "verified-os-native-flow".to_string(),
+                dedupe_state: "joined".to_string(),
+                phase: "succeeded".to_string(),
+                result: "ok".to_string(),
+                cache_state: "stored".to_string(),
+            }),
+        })
+        .expect("send worker outcome");
+
+        app.poll_unlock_worker();
+
+        let auth = fs::read_to_string(runtime_root.join("logs/local-authorization.jsonl"))
+            .expect("read authorization log");
+        assert!(auth.contains("\"flow_id\":\"flow-vault.unlock-test\""));
+        assert!(auth.contains("\"dedupe_state\":\"joined\""));
+
+        let session = fs::read_to_string(runtime_root.join("logs/menuconfig-session.jsonl"))
+            .expect("read session log");
+        assert!(session.contains("\"flow_id\":\"flow-vault.unlock-test\""));
+        assert!(session.contains("\"action\":\"unlock.worker\""));
     }
 
     #[test]

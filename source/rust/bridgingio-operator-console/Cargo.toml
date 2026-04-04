@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 bridgingio-domain = { path = "../bridgingio-domain" }
 bridgingio-engine = { path = "../bridgingio-engine" }
+bridgingio-platform = { path = "../bridgingio-platform" }
 bridgingio-secrets = { path = "../bridgingio-secrets" }
 crossterm = "0.28"
 ratatui = "0.29"

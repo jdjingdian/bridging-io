@@ -365,6 +365,7 @@ version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
  "bridgingio-engine",
+ "bridgingio-platform",
  "bridgingio-secrets",
  "crossterm",
  "ratatui",
@@ -376,6 +377,8 @@ name = "bridgingio-platform"
 version = "2604.2.1"
 dependencies = [
  "bridgingio-domain",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
