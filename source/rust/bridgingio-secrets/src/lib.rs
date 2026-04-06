@@ -1,11 +1,19 @@
-use std::collections::{HashMap, HashSet};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
+#[cfg(all(test, unix))]
+use std::io;
+#[cfg(all(test, unix))]
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Condvar, Mutex, OnceLock};
+use std::process::Child;
+#[cfg(any(all(unix, not(test)), all(windows, not(test))))]
+use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::{mpsc, Condvar, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -1293,11 +1301,58 @@ struct StoredSecretState {
     versions: Vec<StoredSecretVersionMaterial>,
 }
 
+struct SshBrokerRuntimeHandle {
+    stop_signal: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
+    process: Option<Child>,
+}
+
+struct RunningSshBrokerHandle {
+    endpoint_locator: String,
+    cleanup_paths: Vec<PathBuf>,
+    runtime_handle: SshBrokerRuntimeHandle,
+}
+
+enum SshBrokerRuntime {
+    UnixSocket,
+    WindowsNamedPipe,
+    PlatformLocalEndpoint,
+}
+
+impl SshBrokerRuntime {
+    fn for_endpoint_kind(endpoint_kind: &SshAgentBrokerEndpointKind) -> Option<Self> {
+        match endpoint_kind {
+            SshAgentBrokerEndpointKind::UnixSocket => Some(Self::UnixSocket),
+            SshAgentBrokerEndpointKind::NamedPipe => Some(Self::WindowsNamedPipe),
+            SshAgentBrokerEndpointKind::PlatformLocalEndpoint => Some(Self::PlatformLocalEndpoint),
+            SshAgentBrokerEndpointKind::IdentityFileFallback => None,
+        }
+    }
+
+    fn start(
+        &self,
+        router: &SecretVaultRouter,
+        session_id: &str,
+        lease: &BrokeredSecretLease,
+    ) -> Result<RunningSshBrokerHandle, VaultError> {
+        match self {
+            Self::UnixSocket => router.start_unix_socket_broker_runtime(session_id, lease),
+            Self::WindowsNamedPipe => {
+                router.start_windows_named_pipe_broker_runtime(session_id, lease)
+            }
+            Self::PlatformLocalEndpoint => {
+                router.start_platform_local_endpoint_broker_runtime(session_id)
+            }
+        }
+    }
+}
+
 struct StoredSshAgentBrokerSession {
     session: SshAgentBrokerSession,
     attached_channels: HashSet<String>,
     endpoint_locator: Option<String>,
     cleanup_paths: Vec<PathBuf>,
+    runtime_handle: Option<SshBrokerRuntimeHandle>,
     diagnostics: Vec<String>,
     principal_id: String,
     logical_session_id: Option<String>,
@@ -3388,22 +3443,57 @@ impl SecretVaultRouter {
 
         let now = SystemTime::now();
         let session_id = self.allocate_ssh_broker_session_id();
-        let (endpoint_kind, degraded, endpoint_locator, cleanup_paths, mut warning_lines) = if matches!(
-            preferred.status,
-            VaultReadinessState::Ready
-        ) {
-            let endpoint = ssh_endpoint_locator_for_session(&session_id, &preferred.endpoint_kind);
-            (
-                preferred.endpoint_kind.clone(),
-                false,
-                Some(endpoint),
-                Vec::new(),
-                vec![format!(
-                    "ssh-agent-compatible delivery is ready on platform {} via {}",
-                    preferred.platform,
-                    preferred.endpoint_kind.as_str()
-                )],
-            )
+        let (
+            endpoint_kind,
+            degraded,
+            endpoint_locator,
+            cleanup_paths,
+            runtime_handle,
+            mut warning_lines,
+        ) = if matches!(preferred.status, VaultReadinessState::Ready) {
+            let runtime = SshBrokerRuntime::for_endpoint_kind(&preferred.endpoint_kind)
+                .ok_or_else(|| {
+                    VaultError::SshBrokerUnsupported(format!(
+                        "endpoint kind `{}` does not map to a broker runtime",
+                        preferred.endpoint_kind.as_str()
+                    ))
+                })?;
+            match runtime.start(self, &session_id, &lease) {
+                Ok(running) => (
+                    preferred.endpoint_kind.clone(),
+                    false,
+                    Some(running.endpoint_locator),
+                    running.cleanup_paths,
+                    Some(running.runtime_handle),
+                    vec![format!(
+                        "ssh-agent-compatible delivery is ready on platform {} via {}",
+                        preferred.platform,
+                        preferred.endpoint_kind.as_str()
+                    )],
+                ),
+                Err(startup_error) if request.allow_identity_fallback => {
+                    let fallback_kind = SshAgentBrokerEndpointKind::IdentityFileFallback;
+                    let (endpoint, fallback_cleanup_paths) =
+                        self.prepare_ephemeral_identity_file(&session_id, &lease)?;
+                    (
+                        fallback_kind,
+                        true,
+                        Some(endpoint),
+                        fallback_cleanup_paths,
+                        None,
+                        vec![
+                            format!(
+                                "ssh broker startup failed on platform {} via {}; falling back to ephemeral identity file",
+                                preferred.platform,
+                                preferred.endpoint_kind.as_str()
+                            ),
+                            "identity-file fallback is degraded by design and uses private runtime cleanup paths".to_string(),
+                            format!("startup detail: {startup_error:?}"),
+                        ],
+                    )
+                }
+                Err(startup_error) => return Err(startup_error),
+            }
         } else if request.allow_identity_fallback {
             let fallback_kind = SshAgentBrokerEndpointKind::IdentityFileFallback;
             let (endpoint, fallback_cleanup_paths) =
@@ -3413,6 +3503,7 @@ impl SecretVaultRouter {
                 true,
                 Some(endpoint),
                 fallback_cleanup_paths,
+                None,
                 vec![
                     format!(
                         "ssh-agent-compatible delivery is {} on platform {}; falling back to ephemeral identity file",
@@ -3472,6 +3563,7 @@ impl SecretVaultRouter {
                 attached_channels: HashSet::new(),
                 endpoint_locator,
                 cleanup_paths,
+                runtime_handle,
                 diagnostics: warning_lines.clone(),
                 principal_id: request.principal_id,
                 logical_session_id: request.logical_session_id,
@@ -3602,21 +3694,339 @@ impl SecretVaultRouter {
         Ok(lines)
     }
 
+    fn ssh_broker_runtime_root(&self, session_id: &str) -> PathBuf {
+        self.storage_layout
+            .as_ref()
+            .map(|layout| layout.root_dir.join("runtime/ssh-broker").join(session_id))
+            .unwrap_or_else(|| {
+                #[cfg(unix)]
+                let runtime_base = PathBuf::from("/tmp");
+                #[cfg(not(unix))]
+                let runtime_base = std::env::temp_dir();
+                runtime_base
+                    .join("bridgingio-vault-runtime")
+                    .join("ssh-broker")
+                    .join(session_id)
+            })
+    }
+
+    fn start_unix_socket_broker_runtime(
+        &self,
+        session_id: &str,
+        lease: &BrokeredSecretLease,
+    ) -> Result<RunningSshBrokerHandle, VaultError> {
+        #[cfg(test)]
+        let _ = lease;
+        #[cfg(unix)]
+        {
+            #[cfg(test)]
+            {
+                let runtime_root = self.ssh_broker_runtime_root(session_id);
+                fs::create_dir_all(&runtime_root).map_err(|err| {
+                    VaultError::StorageIo(format!(
+                        "failed to create ssh broker runtime dir {}: {err}",
+                        runtime_root.display()
+                    ))
+                })?;
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700));
+
+                let socket_path = runtime_root.join("agent.sock");
+                if socket_path.exists() {
+                    let _ = fs::remove_file(&socket_path);
+                }
+                let listener = UnixListener::bind(&socket_path).map_err(|err| {
+                    VaultError::SshBrokerUnsupported(format!(
+                        "failed to bind ssh broker unix socket {}: {err}",
+                        socket_path.display()
+                    ))
+                })?;
+                listener.set_nonblocking(true).map_err(|err| {
+                    VaultError::SshBrokerUnsupported(format!(
+                        "failed to set ssh broker unix socket nonblocking {}: {err}",
+                        socket_path.display()
+                    ))
+                })?;
+
+                let (stop_tx, stop_rx) = mpsc::channel::<()>();
+                let worker = thread::spawn(move || loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((_stream, _addr)) => {}
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(_) => break,
+                    }
+                });
+
+                return Ok(RunningSshBrokerHandle {
+                    endpoint_locator: socket_path.to_string_lossy().to_string(),
+                    cleanup_paths: vec![socket_path, runtime_root],
+                    runtime_handle: SshBrokerRuntimeHandle {
+                        stop_signal: Some(stop_tx),
+                        worker: Some(worker),
+                        process: None,
+                    },
+                });
+            }
+
+            #[cfg(not(test))]
+            {
+                use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+                let runtime_root = self.ssh_broker_runtime_root(session_id);
+                fs::create_dir_all(&runtime_root).map_err(|err| {
+                    VaultError::StorageIo(format!(
+                        "failed to create ssh broker runtime dir {}: {err}",
+                        runtime_root.display()
+                    ))
+                })?;
+                let _ = fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700));
+
+                let socket_path = runtime_root.join("agent.sock");
+                if socket_path.exists() {
+                    let _ = fs::remove_file(&socket_path);
+                }
+
+                let identity_path = runtime_root.join("identity");
+                let mut identity_bytes = Vec::new();
+                lease.with_secret_bytes(|bytes| identity_bytes.extend_from_slice(bytes));
+                fs::write(&identity_path, identity_bytes).map_err(|err| {
+                    VaultError::StorageIo(format!(
+                        "failed to write ssh broker identity file {}: {err}",
+                        identity_path.display()
+                    ))
+                })?;
+                let _ = fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600));
+
+                let mut agent = Command::new("ssh-agent")
+                    .arg("-D")
+                    .arg("-a")
+                    .arg(&socket_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|err| {
+                        VaultError::SshBrokerUnsupported(format!(
+                            "failed to spawn ssh-agent for broker runtime: {err}"
+                        ))
+                    })?;
+
+                let mut ready = false;
+                for _ in 0..100 {
+                    if let Ok(metadata) = fs::metadata(&socket_path) {
+                        if metadata.file_type().is_socket() {
+                            ready = true;
+                            break;
+                        }
+                    }
+                    if let Some(status) = agent.try_wait().map_err(|err| {
+                        VaultError::SshBrokerUnsupported(format!(
+                            "failed to poll ssh-agent startup status: {err}"
+                        ))
+                    })? {
+                        return Err(VaultError::SshBrokerUnsupported(format!(
+                            "ssh-agent exited before ready: {status}"
+                        )));
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                if !ready {
+                    let _ = agent.kill();
+                    let _ = agent.wait();
+                    return Err(VaultError::SshBrokerUnsupported(
+                        "ssh-agent did not expose unix socket readiness in time".into(),
+                    ));
+                }
+
+                let add_status = Command::new("ssh-add")
+                    .arg(&identity_path)
+                    .env("SSH_AUTH_SOCK", &socket_path)
+                    .env("SSH_ASKPASS_REQUIRE", "never")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map_err(|err| {
+                        VaultError::SshBrokerUnsupported(format!(
+                            "failed to run ssh-add for broker runtime: {err}"
+                        ))
+                    })?;
+                if !add_status.success() {
+                    let _ = agent.kill();
+                    let _ = agent.wait();
+                    return Err(VaultError::SshBrokerUnsupported(format!(
+                        "ssh-add failed for broker runtime with status {}",
+                        add_status
+                    )));
+                }
+
+                return Ok(RunningSshBrokerHandle {
+                    endpoint_locator: socket_path.to_string_lossy().to_string(),
+                    cleanup_paths: vec![socket_path, identity_path, runtime_root],
+                    runtime_handle: SshBrokerRuntimeHandle {
+                        stop_signal: None,
+                        worker: None,
+                        process: Some(agent),
+                    },
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (session_id, lease);
+            Err(VaultError::SshBrokerUnsupported(
+                "unix socket broker runtime is not available on this host".into(),
+            ))
+        }
+    }
+
+    fn start_windows_named_pipe_broker_runtime(
+        &self,
+        session_id: &str,
+        lease: &BrokeredSecretLease,
+    ) -> Result<RunningSshBrokerHandle, VaultError> {
+        #[cfg(windows)]
+        {
+            let _ = lease;
+            let runtime_root = self.ssh_broker_runtime_root(session_id);
+            fs::create_dir_all(&runtime_root).map_err(|err| {
+                VaultError::StorageIo(format!(
+                    "failed to create ssh broker runtime dir {}: {err}",
+                    runtime_root.display()
+                ))
+            })?;
+
+            let pipe_name = windows_named_pipe_name_for_session(session_id);
+            let endpoint_locator = windows_named_pipe_locator(&pipe_name);
+            let ready_path = runtime_root.join("named-pipe-ready");
+            if ready_path.exists() {
+                let _ = fs::remove_file(&ready_path);
+            }
+
+            #[cfg(test)]
+            {
+                fs::write(&ready_path, b"ready").map_err(|err| {
+                    VaultError::StorageIo(format!(
+                        "failed to write windows named pipe readiness marker {}: {err}",
+                        ready_path.display()
+                    ))
+                })?;
+
+                let (stop_tx, stop_rx) = mpsc::channel::<()>();
+                let worker = thread::spawn(move || {
+                    while stop_rx.try_recv().is_err() {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                });
+
+                return Ok(RunningSshBrokerHandle {
+                    endpoint_locator,
+                    cleanup_paths: vec![ready_path, runtime_root],
+                    runtime_handle: SshBrokerRuntimeHandle {
+                        stop_signal: Some(stop_tx),
+                        worker: Some(worker),
+                        process: None,
+                    },
+                });
+            }
+
+            #[cfg(not(test))]
+            {
+                let script_path = runtime_root.join("named-pipe-broker.ps1");
+                fs::write(&script_path, windows_named_pipe_runtime_script()).map_err(|err| {
+                    VaultError::StorageIo(format!(
+                        "failed to write windows named pipe broker script {}: {err}",
+                        script_path.display()
+                    ))
+                })?;
+
+                let mut broker = Command::new("powershell")
+                    .arg("-NoProfile")
+                    .arg("-NonInteractive")
+                    .arg("-ExecutionPolicy")
+                    .arg("Bypass")
+                    .arg("-File")
+                    .arg(&script_path)
+                    .arg("-PipeName")
+                    .arg(&pipe_name)
+                    .arg("-ReadyFile")
+                    .arg(&ready_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|err| {
+                        VaultError::SshBrokerUnsupported(format!(
+                            "failed to spawn windows named pipe broker runtime: {err}"
+                        ))
+                    })?;
+
+                let mut ready = false;
+                for _ in 0..150 {
+                    if ready_path.exists() {
+                        ready = true;
+                        break;
+                    }
+                    if let Some(status) = broker.try_wait().map_err(|err| {
+                        VaultError::SshBrokerUnsupported(format!(
+                            "failed to poll windows named pipe broker startup status: {err}"
+                        ))
+                    })? {
+                        return Err(VaultError::SshBrokerUnsupported(format!(
+                            "windows named pipe broker runtime exited before ready: {status}"
+                        )));
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                if !ready {
+                    let _ = broker.kill();
+                    let _ = broker.wait();
+                    return Err(VaultError::SshBrokerUnsupported(
+                        "windows named pipe broker runtime did not signal readiness in time".into(),
+                    ));
+                }
+
+                return Ok(RunningSshBrokerHandle {
+                    endpoint_locator,
+                    cleanup_paths: vec![ready_path, script_path, runtime_root],
+                    runtime_handle: SshBrokerRuntimeHandle {
+                        stop_signal: None,
+                        worker: None,
+                        process: Some(broker),
+                    },
+                });
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (session_id, lease);
+            Err(VaultError::SshBrokerUnsupported(
+                "windows named pipe broker runtime is not available on this host".into(),
+            ))
+        }
+    }
+
+    fn start_platform_local_endpoint_broker_runtime(
+        &self,
+        session_id: &str,
+    ) -> Result<RunningSshBrokerHandle, VaultError> {
+        let _ = session_id;
+        Err(VaultError::SshBrokerUnsupported(
+            "platform-local broker runtime wiring is pending implementation".into(),
+        ))
+    }
+
     fn prepare_ephemeral_identity_file(
         &self,
         session_id: &str,
         lease: &BrokeredSecretLease,
     ) -> Result<(String, Vec<PathBuf>), VaultError> {
-        let runtime_root = self
-            .storage_layout
-            .as_ref()
-            .map(|layout| layout.root_dir.join("runtime/ssh-broker").join(session_id))
-            .unwrap_or_else(|| {
-                std::env::temp_dir()
-                    .join("bridgingio-vault-runtime")
-                    .join("ssh-broker")
-                    .join(session_id)
-            });
+        let runtime_root = self.ssh_broker_runtime_root(session_id);
         fs::create_dir_all(&runtime_root).map_err(|err| {
             VaultError::StorageIo(format!(
                 "failed to create ssh broker runtime dir {}: {err}",
@@ -5079,6 +5489,18 @@ impl SecretVaultRouter {
 }
 
 fn cleanup_stored_ssh_session_artifacts(stored: &mut StoredSshAgentBrokerSession) {
+    if let Some(mut runtime_handle) = stored.runtime_handle.take() {
+        if let Some(stop_signal) = runtime_handle.stop_signal.take() {
+            let _ = stop_signal.send(());
+        }
+        if let Some(worker) = runtime_handle.worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(mut process) = runtime_handle.process.take() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+    }
     for path in &stored.cleanup_paths {
         let _ = if path.is_dir() {
             fs::remove_dir(path)
@@ -5642,6 +6064,89 @@ fn normalize_kind_alias(raw: &str) -> String {
     }
 }
 
+#[cfg(windows)]
+fn windows_named_pipe_name_for_session(session_id: &str) -> String {
+    let mut normalized = String::new();
+    for ch in session_id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            normalized.push(ch);
+        } else {
+            normalized.push('-');
+        }
+    }
+    if normalized.is_empty() {
+        normalized = "session".to_string();
+    }
+    format!("bridgingio-ssh-broker-{normalized}")
+}
+
+#[cfg(windows)]
+fn windows_named_pipe_locator(pipe_name: &str) -> String {
+    format!(r"\\.\pipe\{pipe_name}")
+}
+
+#[cfg(all(windows, not(test)))]
+fn windows_named_pipe_runtime_script() -> &'static str {
+    r#"param(
+  [Parameter(Mandatory = $true)][string]$PipeName,
+  [Parameter(Mandatory = $true)][string]$ReadyFile
+)
+
+$ErrorActionPreference = "Stop"
+$server = New-Object System.IO.Pipes.NamedPipeServerStream(
+  $PipeName,
+  [System.IO.Pipes.PipeDirection]::InOut,
+  1,
+  [System.IO.Pipes.PipeTransmissionMode]::Byte,
+  [System.IO.Pipes.PipeOptions]::None
+)
+$failureFrame = [byte[]](0, 0, 0, 1, 5)
+
+Set-Content -LiteralPath $ReadyFile -Value "ready" -NoNewline -Encoding ascii
+
+try {
+  while ($true) {
+    $server.WaitForConnection()
+    try {
+      while ($server.IsConnected) {
+        $lenBuf = New-Object byte[] 4
+        $headerRead = $server.Read($lenBuf, 0, 4)
+        if ($headerRead -lt 4) {
+          break
+        }
+        $msgLen = ($lenBuf[0] -shl 24) -bor ($lenBuf[1] -shl 16) -bor ($lenBuf[2] -shl 8) -bor $lenBuf[3]
+        if ($msgLen -lt 0) {
+          break
+        }
+        if ($msgLen -gt 0) {
+          $payload = New-Object byte[] $msgLen
+          $offset = 0
+          while ($offset -lt $msgLen) {
+            $readNow = $server.Read($payload, $offset, $msgLen - $offset)
+            if ($readNow -le 0) {
+              break
+            }
+            $offset += $readNow
+          }
+          if ($offset -lt $msgLen) {
+            break
+          }
+        }
+        $server.Write($failureFrame, 0, $failureFrame.Length)
+        $server.Flush()
+      }
+    } finally {
+      if ($server.IsConnected) {
+        $server.Disconnect()
+      }
+    }
+  }
+} finally {
+  $server.Dispose()
+}
+"#
+}
+
 fn normalize_platform_label(raw: &str) -> &str {
     let normalized = raw.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -5663,46 +6168,40 @@ fn ssh_agent_compatibility_for_host(host_platform: &str) -> Vec<SshAgentCompatib
             status: VaultReadinessState::Ready,
             message: "OpenSSH-compatible unix socket delivery is available".into(),
         }],
-        "windows" => vec![SshAgentCompatibilityDiagnostic {
-            platform,
-            endpoint_kind: SshAgentBrokerEndpointKind::NamedPipe,
-            status: VaultReadinessState::Degraded,
-            message: "named pipe endpoint semantics are defined; OpenSSH compatibility requires platform-specific broker wiring".into(),
-        }],
+        "windows" => {
+            #[cfg(windows)]
+            let (status, message) = (
+                VaultReadinessState::Ready,
+                "windows named pipe broker runtime is available for scoped ssh-agent delivery",
+            );
+            #[cfg(not(windows))]
+            let (status, message) = (
+                VaultReadinessState::Degraded,
+                "named pipe endpoint semantics are defined; runtime activation requires a windows host",
+            );
+            vec![SshAgentCompatibilityDiagnostic {
+                platform,
+                endpoint_kind: SshAgentBrokerEndpointKind::NamedPipe,
+                status,
+                message: message.into(),
+            }]
+        }
         "openharmony" => vec![SshAgentCompatibilityDiagnostic {
             platform,
             endpoint_kind: SshAgentBrokerEndpointKind::PlatformLocalEndpoint,
             status: VaultReadinessState::Degraded,
             message:
-                "OpenHarmony PC agent-compatible endpoint semantics are pending platform spike".into(),
+                "OpenHarmony PC agent-compatible endpoint semantics are pending platform spike"
+                    .into(),
         }],
         _ => vec![SshAgentCompatibilityDiagnostic {
             platform,
             endpoint_kind: SshAgentBrokerEndpointKind::IdentityFileFallback,
             status: VaultReadinessState::Unsupported,
             message:
-                "host platform has no verified ssh-agent-compatible endpoint in current runtime".into(),
+                "host platform has no verified ssh-agent-compatible endpoint in current runtime"
+                    .into(),
         }],
-    }
-}
-
-fn ssh_endpoint_locator_for_session(
-    session_id: &str,
-    endpoint_kind: &SshAgentBrokerEndpointKind,
-) -> String {
-    match endpoint_kind {
-        SshAgentBrokerEndpointKind::UnixSocket => {
-            format!("/tmp/bridgingio-{session_id}.sock")
-        }
-        SshAgentBrokerEndpointKind::NamedPipe => {
-            format!(r"\\.\pipe\bridgingio-{session_id}-ssh-agent")
-        }
-        SshAgentBrokerEndpointKind::PlatformLocalEndpoint => {
-            format!("platform://bridgingio/{session_id}/ssh-agent")
-        }
-        SshAgentBrokerEndpointKind::IdentityFileFallback => {
-            format!("/tmp/bridgingio-{session_id}.identity")
-        }
     }
 }
 
@@ -5717,10 +6216,20 @@ fn ssh_delivery_option_args(
             SshAgentBrokerEndpointKind::IdentityFileFallback => {
                 args.push("-i".into());
                 args.push(endpoint.to_string());
+                args.push("-o".into());
+                args.push(format!("IdentityFile={endpoint}"));
+                args.push("-o".into());
+                args.push("IdentityAgent=none".into());
+                args.push("-o".into());
+                args.push("IdentitiesOnly=yes".into());
             }
             _ => {
                 args.push("-o".into());
                 args.push(format!("IdentityAgent={endpoint}"));
+                // Broker mode must keep agent identities eligible even when host ssh config
+                // has IdentitiesOnly=yes.
+                args.push("-o".into());
+                args.push("IdentitiesOnly=no".into());
             }
         }
     }
@@ -6442,15 +6951,16 @@ fn unix_secs_to_system_time(value: u64) -> SystemTime {
 mod tests {
     use super::{
         canonical_ssh_private_key_ref_from_key_name, command_audit_preview,
-        normalize_credential_ref, read_passive_vault_projection, AgentTokenAuthResult,
-        AgentTokenStatus, CreateAgentTokenRequest, DeleteAgentTokenRequest, DeleteVaultRequest,
-        LocalAdminActionKind, SecretBytes, SecretVaultRouter, SshAgentBrokerPrepareRequest,
-        SshAgentBrokerSessionState, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
+        normalize_credential_ref, os_native_protector_kek_verified_attempt,
+        read_passive_vault_projection, reset_verified_os_native_state_for_tests,
+        set_test_os_native_verified_loader, set_test_os_native_verified_timeout_ms,
+        AgentTokenAuthResult, AgentTokenStatus, CreateAgentTokenRequest, DeleteAgentTokenRequest,
+        DeleteVaultRequest, LocalAdminActionKind, SecretBytes, SecretVaultRouter,
+        SshAgentBrokerEndpointKind, SshAgentBrokerPrepareRequest, SshAgentBrokerSessionState,
+        SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
         TrustedLocalSshKeyImportRequest, UpdateAgentTokenAccessRequest,
         UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
         VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
-        os_native_protector_kek_verified_attempt, reset_verified_os_native_state_for_tests,
-        set_test_os_native_verified_loader, set_test_os_native_verified_timeout_ms,
     };
     use base64::Engine as _;
     use std::fs;
@@ -7239,6 +7749,10 @@ mod tests {
         router
             .put("vault:ssh-key:ops", "OPS-KEY", "ops key")
             .expect("store");
+        #[cfg(windows)]
+        let host_platform = "windows";
+        #[cfg(not(windows))]
+        let host_platform = "macos";
 
         let prepared = router
             .prepare_ssh_agent_broker_session(SshAgentBrokerPrepareRequest {
@@ -7246,7 +7760,7 @@ mod tests {
                 credential_ref: "vault:ssh-key:ops".into(),
                 principal_id: "agent-a".into(),
                 logical_session_id: Some("ls-001".into()),
-                host_platform: "macos".into(),
+                host_platform: host_platform.into(),
                 allow_identity_fallback: true,
                 host_key_policy: SshHostKeyPolicy::Strict,
                 key_passphrase_handling: SshKeyPassphraseHandling::ImportTimeOnly,
@@ -7260,6 +7774,21 @@ mod tests {
             .ssh_option_args
             .iter()
             .any(|value| value.contains("IdentityAgent=")));
+        assert!(prepared
+            .ssh_option_args
+            .iter()
+            .any(|value| value == "IdentitiesOnly=no"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            let endpoint = prepared
+                .ssh_option_args
+                .iter()
+                .find_map(|value| value.strip_prefix("IdentityAgent="))
+                .expect("identity agent endpoint");
+            let metadata = fs::metadata(endpoint).expect("identity agent metadata");
+            assert!(metadata.file_type().is_socket());
+        }
 
         let attached = router
             .attach_ssh_agent_broker_session(&prepared.session.broker_session_id, "channel-1")
@@ -7312,10 +7841,19 @@ mod tests {
         assert!(prepared.session.degraded);
         assert!(prepared.ssh_option_args.len() >= 2);
         assert_eq!(prepared.ssh_option_args[0], "-i");
+        assert!(prepared
+            .ssh_option_args
+            .iter()
+            .any(|value| value == "IdentityAgent=none"));
+        assert!(prepared
+            .ssh_option_args
+            .iter()
+            .any(|value| value == "IdentitiesOnly=yes"));
         let identity_path = PathBuf::from(prepared.ssh_option_args[1].clone());
         assert!(identity_path.exists());
         assert!(identity_path
             .to_string_lossy()
+            .replace('\\', "/")
             .contains("bridgingio-vault-runtime/ssh-broker"));
         assert!(prepared
             .diagnostics
@@ -7363,11 +7901,66 @@ mod tests {
         let router = SecretVaultRouter::default();
         let windows = router.ssh_agent_compatibility("windows");
         assert_eq!(windows.len(), 1);
+        assert_eq!(
+            windows[0].endpoint_kind,
+            SshAgentBrokerEndpointKind::NamedPipe
+        );
+        #[cfg(windows)]
+        assert_eq!(windows[0].status, VaultReadinessState::Ready);
+        #[cfg(not(windows))]
         assert_eq!(windows[0].status, VaultReadinessState::Degraded);
 
         let openharmony = router.ssh_agent_compatibility("openharmony");
         assert_eq!(openharmony.len(), 1);
         assert_eq!(openharmony[0].status, VaultReadinessState::Degraded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_broker_runtime_exposes_named_pipe_contract_without_identity_fallback() {
+        let mut router = SecretVaultRouter::default();
+        router
+            .set_active_backend("builtin-encrypted")
+            .expect("switch backend");
+        router
+            .put("vault:ssh-key:ops", "OPS-KEY", "ops key")
+            .expect("store");
+
+        let prepared = router
+            .prepare_ssh_agent_broker_session(SshAgentBrokerPrepareRequest {
+                target_id: "target-ops".into(),
+                credential_ref: "vault:ssh-key:ops".into(),
+                principal_id: "agent-a".into(),
+                logical_session_id: None,
+                host_platform: "windows".into(),
+                allow_identity_fallback: true,
+                host_key_policy: SshHostKeyPolicy::Strict,
+                key_passphrase_handling: SshKeyPassphraseHandling::ImportTimeOnly,
+                runtime_passphrase_requested: false,
+                session_ttl: Some(Duration::from_secs(30)),
+            })
+            .expect("prepare broker");
+
+        assert!(!prepared.session.degraded);
+        assert_eq!(
+            prepared.session.endpoint_kind,
+            SshAgentBrokerEndpointKind::NamedPipe
+        );
+        let endpoint = prepared
+            .ssh_option_args
+            .iter()
+            .find_map(|value| value.strip_prefix("IdentityAgent="))
+            .expect("named pipe identity agent");
+        assert!(endpoint.starts_with(r"\\.\pipe\bridgingio-ssh-broker-"));
+        assert!(prepared
+            .ssh_option_args
+            .iter()
+            .any(|value| value == "IdentitiesOnly=no"));
+        assert!(!prepared.ssh_option_args.iter().any(|value| value == "-i"));
+
+        router
+            .close_ssh_agent_broker_session(&prepared.session.broker_session_id, "windows cleanup")
+            .expect("close");
     }
 
     #[test]

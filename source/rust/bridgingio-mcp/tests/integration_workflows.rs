@@ -13,10 +13,12 @@ use bridgingio_connectors::{
 };
 use bridgingio_domain::{SessionReusePolicy, TargetKind};
 #[cfg(unix)]
+use bridgingio_mcp::CoreRuntimeError;
+#[cfg(unix)]
 use bridgingio_mcp::{ControlPlaneIpcClient, ControlPlaneIpcServer};
 use bridgingio_mcp::{
-    CoreHostMode, CoreRuntimeError, McpToolHandler, ModelPlaneHttpServer, StandaloneCoreRuntime,
-    ToolRequest, ToolRequestContext, ToolResult,
+    CoreHostMode, McpToolHandler, ModelPlaneHttpServer, StandaloneCoreRuntime, ToolRequest,
+    ToolRequestContext, ToolResult,
 };
 use bridgingio_platform::{detect_host_platform_adapter, HostPlatform};
 use bridgingio_policy::OperationKind;
@@ -61,7 +63,13 @@ fn short_unix_socket_path(prefix: &str) -> PathBuf {
 }
 
 fn toolchain_resolver(root: &PathBuf) -> ToolchainResolver {
+    #[cfg(windows)]
+    let ssh = root.join("ssh.bat");
+    #[cfg(not(windows))]
     let ssh = root.join("ssh");
+    #[cfg(windows)]
+    let adb = root.join("adb.bat");
+    #[cfg(not(windows))]
     let adb = root.join("adb");
     #[cfg(windows)]
     {
@@ -254,6 +262,14 @@ fn command_alias_ok() -> &'static str {
     "echo alias-ok"
 }
 
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn command_read_cwd() -> &'static str {
     #[cfg(windows)]
     {
@@ -355,6 +371,11 @@ fn validates_ssh_adb_git_flow_with_artifacts_and_approval() {
         invocation: None,
     });
     assert!(matches!(adb_exec, ToolResult::Execution { .. }));
+
+    if !git_available() {
+        eprintln!("skip git status verification because git is unavailable in PATH");
+        return;
+    }
 
     let repo = temp_dir("git-status");
     let init = Command::new("git")
@@ -1807,7 +1828,11 @@ fn canonical_vault_persistence_and_passphrase_unlock_integration_contract() {
         })
         .expect("set unlock policy");
 
-    let locked_put = router.put("vault:ssh-key:integration", "INTEGRATION-KEY", "integration");
+    let locked_put = router.put(
+        "vault:ssh-key:integration",
+        "INTEGRATION-KEY",
+        "integration",
+    );
     assert!(
         matches!(locked_put, Err(VaultError::VaultLocked(_))),
         "locked fail-closed contract should reject put before unlock"
@@ -1833,7 +1858,11 @@ fn canonical_vault_persistence_and_passphrase_unlock_integration_contract() {
         .unlock_with_passphrase("correct horse battery staple")
         .expect("unlock with passphrase");
     router
-        .put("vault:ssh-key:integration", "INTEGRATION-KEY", "integration")
+        .put(
+            "vault:ssh-key:integration",
+            "INTEGRATION-KEY",
+            "integration",
+        )
         .expect("put secret after unlock");
     drop(router);
 

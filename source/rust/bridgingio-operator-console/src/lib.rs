@@ -337,9 +337,7 @@ struct SshTestPendingStart {
 
 enum SshTestWorkerResult {
     Succeeded,
-    Failed {
-        error_code: String,
-    },
+    Failed { error_code: String },
     TimedOut,
     Cancelled,
     VaultLockedPreflight,
@@ -633,7 +631,13 @@ impl MenuConfigApp {
     }
 
     fn finish_session(&self, outcome: MenuConfigOutcome) -> MenuConfigOutcome {
-        self.record_session_event("menuconfig.exit", "completed", "ok", RuntimeLogLevel::Info, None);
+        self.record_session_event(
+            "menuconfig.exit",
+            "completed",
+            "ok",
+            RuntimeLogLevel::Info,
+            None,
+        );
         outcome
     }
 
@@ -1267,7 +1271,13 @@ impl MenuConfigApp {
             "menu.status.saved",
             &[("path", &self.config_path.display().to_string())],
         );
-        self.record_session_event("menuconfig.save", "succeeded", "ok", RuntimeLogLevel::Info, None);
+        self.record_session_event(
+            "menuconfig.save",
+            "succeeded",
+            "ok",
+            RuntimeLogLevel::Info,
+            None,
+        );
         Ok(())
     }
 
@@ -1665,7 +1675,8 @@ impl MenuConfigApp {
     }
 
     fn begin_ssh_test_flow(&mut self, target_index: usize) {
-        if !matches!(self.ssh_test_flow_state, SshTestFlowState::Idle) || self.ssh_test_worker.is_some()
+        if !matches!(self.ssh_test_flow_state, SshTestFlowState::Idle)
+            || self.ssh_test_worker.is_some()
         {
             self.last_status = self.t("menu.status.ssh_test_inflight");
             return;
@@ -1683,7 +1694,9 @@ impl MenuConfigApp {
             return;
         }
         let timeout_input = SSH_TEST_DEFAULT_TIMEOUT_MS.to_string();
-        self.ssh_test_flow_id = Some(next_local_authorization_flow_id(OP_TARGET_SSH_TEST_CONNECTION));
+        self.ssh_test_flow_id = Some(next_local_authorization_flow_id(
+            OP_TARGET_SSH_TEST_CONNECTION,
+        ));
         self.ssh_test_flow_pending = None;
         self.ssh_test_flow_state = SshTestFlowState::TimeoutInput {
             target_index,
@@ -1797,9 +1810,10 @@ impl MenuConfigApp {
                         };
                         (category, Some(error_code))
                     }
-                    SshTestWorkerResult::TimedOut => {
-                        (SshTestResultCategory::TimedOut, Some("timed-out".to_string()))
-                    }
+                    SshTestWorkerResult::TimedOut => (
+                        SshTestResultCategory::TimedOut,
+                        Some("timed-out".to_string()),
+                    ),
                     SshTestWorkerResult::Cancelled => (SshTestResultCategory::Cancelled, None),
                     SshTestWorkerResult::VaultLockedPreflight => (
                         SshTestResultCategory::VaultLockedPreflight,
@@ -2035,9 +2049,13 @@ impl MenuConfigApp {
                             self.t("menu.status.ssh_test_failed_broker_endpoint")
                         }
                         SshTestResultCategory::VaultLockedPreflight
-                        | SshTestResultCategory::ToolchainUnavailable => self.t("menu.status.ssh_test_failed"),
+                        | SshTestResultCategory::ToolchainUnavailable => {
+                            self.t("menu.status.ssh_test_failed")
+                        }
                         SshTestResultCategory::TimedOut => self.t("menu.status.ssh_test_timed_out"),
-                        SshTestResultCategory::Cancelled => self.t("menu.status.ssh_test_cancelled"),
+                        SshTestResultCategory::Cancelled => {
+                            self.t("menu.status.ssh_test_cancelled")
+                        }
                     };
                 }
                 _ => {}
@@ -2763,9 +2781,10 @@ impl MenuConfigApp {
                 self.confirm_selected = next.clamp(0, 1) as usize;
             }
             KeyCode::Esc => {
-                if let (Some(flow_id), Some(action)) =
-                    (self.confirm_flow_id.as_deref(), self.confirm_action.as_ref())
-                {
+                if let (Some(flow_id), Some(action)) = (
+                    self.confirm_flow_id.as_deref(),
+                    self.confirm_action.as_ref(),
+                ) {
                     match action {
                         ConfirmAction::DeleteVault => self.record_authorization_event(
                             flow_id,
@@ -2810,9 +2829,10 @@ impl MenuConfigApp {
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if self.confirm_selected == 1 {
-                    if let (Some(flow_id), Some(action)) =
-                        (self.confirm_flow_id.as_deref(), self.confirm_action.as_ref())
-                    {
+                    if let (Some(flow_id), Some(action)) = (
+                        self.confirm_flow_id.as_deref(),
+                        self.confirm_action.as_ref(),
+                    ) {
                         match action {
                             ConfirmAction::DeleteVault => self.record_authorization_event(
                                 flow_id,
@@ -2825,28 +2845,30 @@ impl MenuConfigApp {
                                 None,
                                 None,
                             ),
-                            ConfirmAction::DeleteToken(token_id) => self.record_authorization_event(
-                                flow_id,
-                                "Delete Token",
-                                OP_AUTH_TOKEN_DELETE,
-                                "cancelled",
-                                "cancelled",
-                                "not-applicable",
-                                None,
-                                Some(token_id.as_str()),
-                                None,
-                            ),
-                            ConfirmAction::DeleteSshKey(reference) => self.record_authorization_event(
-                                flow_id,
-                                "Delete SSH Key",
-                                OP_SSH_KEY_DELETE,
-                                "cancelled",
-                                "cancelled",
-                                "not-applicable",
-                                None,
-                                None,
-                                Some(reference.as_str()),
-                            ),
+                            ConfirmAction::DeleteToken(token_id) => self
+                                .record_authorization_event(
+                                    flow_id,
+                                    "Delete Token",
+                                    OP_AUTH_TOKEN_DELETE,
+                                    "cancelled",
+                                    "cancelled",
+                                    "not-applicable",
+                                    None,
+                                    Some(token_id.as_str()),
+                                    None,
+                                ),
+                            ConfirmAction::DeleteSshKey(reference) => self
+                                .record_authorization_event(
+                                    flow_id,
+                                    "Delete SSH Key",
+                                    OP_SSH_KEY_DELETE,
+                                    "cancelled",
+                                    "cancelled",
+                                    "not-applicable",
+                                    None,
+                                    None,
+                                    Some(reference.as_str()),
+                                ),
                             _ => {}
                         }
                     }
@@ -3280,7 +3302,13 @@ impl MenuConfigApp {
     fn push_navigation_state(&mut self) {
         self.navigation_stack
             .push((self.screen.clone(), self.selected));
-        self.record_session_event("screen.push", "navigated", "ok", RuntimeLogLevel::Debug, None);
+        self.record_session_event(
+            "screen.push",
+            "navigated",
+            "ok",
+            RuntimeLogLevel::Debug,
+            None,
+        );
     }
 
     fn start_target_edit_session(&mut self, index: usize, is_new: bool) {
@@ -3843,12 +3871,12 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
             app.t("menu.render.confirm_hint")
         } else if app.token_reveal.is_some() {
             app.t("menu.render.token_reveal_hint")
-        } else if matches!(app.ssh_test_flow_state, SshTestFlowState::TimeoutInput { .. }) {
-            app.t("menu.render.ssh_test_timeout_hint")
         } else if matches!(
             app.ssh_test_flow_state,
-            SshTestFlowState::Waiting { .. }
+            SshTestFlowState::TimeoutInput { .. }
         ) {
+            app.t("menu.render.ssh_test_timeout_hint")
+        } else if matches!(app.ssh_test_flow_state, SshTestFlowState::Waiting { .. }) {
             app.t("menu.render.ssh_test_waiting_hint")
         } else if let SshTestFlowState::Result { category } = &app.ssh_test_flow_state {
             match category {
@@ -3859,7 +3887,9 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
                 | SshTestResultCategory::ToolchainUnavailable => {
                     app.t("menu.render.ssh_test_failed_hint")
                 }
-                SshTestResultCategory::TimedOut => app.t("menu.render.ssh_test_timeout_result_hint"),
+                SshTestResultCategory::TimedOut => {
+                    app.t("menu.render.ssh_test_timeout_result_hint")
+                }
                 SshTestResultCategory::Cancelled => app.t("menu.render.ssh_test_cancelled_hint"),
             }
         } else if matches!(app.unlock_flow_state, UnlockFlowState::Waiting) {
@@ -4157,7 +4187,10 @@ fn render_ssh_test_flow_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
                 .unwrap_or_else(|| "unknown-target".to_string());
             let prefix = app.t("menu.ssh_test.timeout.input_prefix");
             let popup = Paragraph::new(vec![
-                Line::from(app.tf("menu.ssh_test.timeout.message", &[("target_id", &target_id)])),
+                Line::from(app.tf(
+                    "menu.ssh_test.timeout.message",
+                    &[("target_id", &target_id)],
+                )),
                 Line::from(app.t("menu.ssh_test.timeout.hint")),
                 Line::from(""),
                 Line::from(format!("{prefix}{timeout_input}")),
@@ -4237,7 +4270,11 @@ fn render_ssh_test_flow_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
                 Line::from(""),
                 Line::from(app.t("menu.ssh_test.result.hint")),
             ])
-            .block(Block::default().title(app.t(title_key)).borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(app.t(title_key))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false });
             frame.render_widget(popup, area);
         }
@@ -5516,11 +5553,7 @@ fn target_editor_entries(app: &MenuConfigApp, index: usize, catalog: &Catalog) -
     } else {
         catalog.t("menu.target.apply_target.desc")
     };
-    let apply_entry = action_entry(
-        &apply_label,
-        &apply_desc,
-        ActionKind::ApplyTarget(index),
-    );
+    let apply_entry = action_entry(&apply_label, &apply_desc, ActionKind::ApplyTarget(index));
     let mut entries = vec![nav_entry(
         &catalog.t("menu.target.public_descriptor"),
         &catalog.t("menu.target.public_descriptor.desc"),
@@ -6501,15 +6534,21 @@ fn ssh_identity_agent_endpoint_preflight_issue(endpoint: &str) -> Option<&'stati
     }
 }
 
-fn classify_ssh_probe_failure_hint(stderr: &str) -> Option<&'static str> {
+fn classify_ssh_probe_failure_hint(stderr: &str, allow_broker_hint: bool) -> Option<&'static str> {
     let normalized = stderr.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         return None;
     }
-    if normalized.contains("ssh_get_authentication_socket")
-        && normalized.contains("no such file")
-    {
-        return Some("broker-endpoint-unready");
+    if allow_broker_hint {
+        let broker_unready = normalized.lines().any(|line| {
+            let trimmed = line.trim();
+            (trimmed.contains("ssh_get_authentication_socket:") && trimmed.contains("no such file"))
+                || trimmed.contains("ssh_fetch_identitylist: communication with agent failed")
+                || trimmed.contains("ssh_agent_bind_hostkey: communication with agent failed")
+        });
+        if broker_unready {
+            return Some("broker-endpoint-unready");
+        }
     }
     if normalized.contains("permission denied") && normalized.contains("publickey") {
         return Some("auth-publickey-rejected");
@@ -6547,9 +6586,13 @@ fn classify_ssh_probe_failure_hint(stderr: &str) -> Option<&'static str> {
     None
 }
 
-fn build_ssh_exit_nonzero_error_code(exit_status_code: Option<i32>, stderr: &str) -> String {
+fn build_ssh_exit_nonzero_error_code(
+    exit_status_code: Option<i32>,
+    stderr: &str,
+    allow_broker_hint: bool,
+) -> String {
     let mut code = format!("ssh-exit-nonzero:exit-{}", exit_status_code.unwrap_or(-1));
-    if let Some(hint) = classify_ssh_probe_failure_hint(stderr) {
+    if let Some(hint) = classify_ssh_probe_failure_hint(stderr, allow_broker_hint) {
         code.push(':');
         code.push_str(hint);
     }
@@ -6752,6 +6795,9 @@ fn execute_ssh_test_worker(
                     }
                 }
             }
+        } else {
+            let direct_identity_args = direct_identity_option_args_for_probe(ref_id);
+            apply_ssh_delivery_args_for_probe(&mut ssh_args, &direct_identity_args);
         }
     }
 
@@ -6786,11 +6832,7 @@ fn execute_ssh_test_worker(
                 }
                 _ => "identity-agent endpoint preflight failed before ssh spawn",
             };
-            cleanup_ssh_probe_broker_session(
-                &mut router,
-                broker_session_id,
-                cleanup_reason,
-            );
+            cleanup_ssh_probe_broker_session(&mut router, broker_session_id, cleanup_reason);
             return SshTestWorkerOutcome {
                 router,
                 result: SshTestWorkerResult::Failed {
@@ -6830,6 +6872,7 @@ fn execute_ssh_test_worker(
         }
     };
 
+    let broker_path_active = broker_session_id.is_some();
     let (result, captured_stderr) = loop {
         if cancel_receiver.try_recv().is_ok() {
             let _ = child.kill();
@@ -6862,7 +6905,11 @@ fn execute_ssh_test_worker(
                     capture_child_stderr_snapshot(&mut child, SSH_TEST_VERBOSE_CAPTURE_LIMIT_BYTES);
                 break (
                     SshTestWorkerResult::Failed {
-                        error_code: build_ssh_exit_nonzero_error_code(status.code(), &stderr),
+                        error_code: build_ssh_exit_nonzero_error_code(
+                            status.code(),
+                            &stderr,
+                            broker_path_active,
+                        ),
                     },
                     stderr,
                 );
@@ -6929,6 +6976,19 @@ fn apply_ssh_delivery_args_for_probe(args: &mut Vec<String>, delivery_args: &[St
     for (offset, value) in delivery_args.iter().enumerate() {
         args.insert(insertion_index + offset, value.clone());
     }
+}
+
+fn direct_identity_option_args_for_probe(identity_path: &str) -> Vec<String> {
+    vec![
+        "-i".to_string(),
+        identity_path.to_string(),
+        "-o".to_string(),
+        format!("IdentityFile={identity_path}"),
+        "-o".to_string(),
+        "IdentitiesOnly=yes".to_string(),
+        "-o".to_string(),
+        "IdentityAgent=none".to_string(),
+    ]
 }
 
 fn menuconfig_host_platform_label() -> String {
@@ -7462,6 +7522,37 @@ mod tests {
     }
 
     #[test]
+    fn direct_identity_ssh_test_bypasses_broker_and_injects_identity_args() {
+        let config_path = temp_config_path("ssh-test-direct-identity");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let root = config_path.parent().expect("config parent");
+        let args_path = root.join("ssh-test-direct-identity-args.txt");
+        #[cfg(windows)]
+        let script_body = format!("echo %* > \"{}\"\r\nexit /b 0", args_path.display());
+        #[cfg(not(windows))]
+        let script_body = format!(
+            "printf '%s\\n' \"$@\" > \"{}\"\nexit 0",
+            args_path.display()
+        );
+        let ssh_script = write_mock_ssh_script(root, "mock-ssh-direct-identity", &script_body);
+        let identity_path = root.join("id_direct_identity_test");
+        app.settings.targets[0].credential_ref = Some(identity_path.to_string_lossy().to_string());
+        set_target_ssh_override(&mut app, 0, &ssh_script);
+
+        begin_and_start_ssh_test(&mut app, 0, 2000);
+        let category = wait_for_ssh_test_result(&mut app, Duration::from_secs(2));
+        assert_eq!(category, super::SshTestResultCategory::Success);
+
+        let args = fs::read_to_string(&args_path).expect("read ssh args");
+        let expected = identity_path.to_string_lossy().to_string();
+        assert!(args.contains("-i"));
+        assert!(args.contains(&expected));
+        assert!(args.contains(&format!("IdentityFile={expected}")));
+        assert!(args.contains("IdentitiesOnly=yes"));
+        assert!(args.contains("IdentityAgent=none"));
+    }
+
+    #[test]
     fn ssh_test_connection_covers_failed_timeout_and_cancelled_paths() {
         let config_path = temp_config_path("ssh-test-fail-timeout-cancel");
         let root = config_path.parent().expect("config parent");
@@ -7529,14 +7620,13 @@ mod tests {
 
         let session = fs::read_to_string(runtime_root.join("logs/menuconfig-session.jsonl"))
             .expect("read menuconfig session log");
-        assert!(session.contains(
-            "\"error_code\":\"ssh-exit-nonzero:exit-255:auth-publickey-rejected\""
-        ));
+        assert!(session
+            .contains("\"error_code\":\"ssh-exit-nonzero:exit-255:auth-publickey-rejected\""));
     }
 
     #[test]
-    fn ssh_test_broker_endpoint_failure_is_classified_with_dedicated_category() {
-        let config_path = temp_config_path("ssh-test-broker-endpoint-failure");
+    fn non_broker_ssh_test_failure_does_not_use_broker_error_category() {
+        let config_path = temp_config_path("ssh-test-non-broker-endpoint-failure");
         let runtime_root = config_path
             .parent()
             .expect("config parent")
@@ -7549,19 +7639,19 @@ mod tests {
         let fail_body = "echo debug1: get_agent_identities: ssh_get_authentication_socket: No such file or directory 1>&2\r\necho Permission denied (publickey). 1>&2\r\nexit /b 255".to_string();
         #[cfg(not(windows))]
         let fail_body = "echo 'debug1: get_agent_identities: ssh_get_authentication_socket: No such file or directory' 1>&2\necho 'Permission denied (publickey).' 1>&2\nexit 255".to_string();
-        let fail_script = write_mock_ssh_script(root, "mock-ssh-broker-endpoint-fail", &fail_body);
+        let fail_script =
+            write_mock_ssh_script(root, "mock-ssh-non-broker-endpoint-fail", &fail_body);
         app.settings.targets[0].credential_ref = None;
         set_target_ssh_override(&mut app, 0, &fail_script);
 
         begin_and_start_ssh_test(&mut app, 0, 2000);
         let category = wait_for_ssh_test_result(&mut app, Duration::from_secs(2));
-        assert_eq!(category, super::SshTestResultCategory::BrokerEndpointUnavailable);
+        assert_eq!(category, super::SshTestResultCategory::Failed);
 
         let session = fs::read_to_string(runtime_root.join("logs/menuconfig-session.jsonl"))
             .expect("read menuconfig session log");
-        assert!(session.contains(
-            "\"error_code\":\"ssh-exit-nonzero:exit-255:broker-endpoint-unready\""
-        ));
+        assert!(session
+            .contains("\"error_code\":\"ssh-exit-nonzero:exit-255:auth-publickey-rejected\""));
     }
 
     #[test]
@@ -7617,8 +7707,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ssh_test_broker_preflight_missing_identity_agent_socket_skips_spawn_and_logs_diagnostics() {
-        let config_path = temp_config_path("ssh-test-broker-preflight-missing");
+    fn ssh_test_broker_ready_preflight_allows_spawn_and_logs_display_safe_result() {
+        let config_path = temp_config_path("ssh-test-broker-preflight-ready");
         let runtime_root = config_path
             .parent()
             .expect("config parent")
@@ -7627,9 +7717,9 @@ mod tests {
         set_config_log_level(&config_path, "debug");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         let root = config_path.parent().expect("config parent");
-        let marker = root.join("ssh-broker-preflight-marker.txt");
+        let marker = root.join("ssh-broker-preflight-ready-marker.txt");
         let body = format!("echo ran > \"{}\"\nexit 0", marker.display());
-        let ssh_script = write_mock_ssh_script(root, "mock-ssh-broker-preflight", &body);
+        let ssh_script = write_mock_ssh_script(root, "mock-ssh-broker-preflight-ready", &body);
         set_target_ssh_override(&mut app, 0, &ssh_script);
 
         let mut router = SecretVaultRouter::default();
@@ -7653,15 +7743,13 @@ mod tests {
 
         begin_and_start_ssh_test(&mut app, 0, 2000);
         let category = wait_for_ssh_test_result(&mut app, Duration::from_secs(2));
-        assert_eq!(category, super::SshTestResultCategory::BrokerEndpointUnavailable);
-        assert!(!marker.exists());
+        assert_eq!(category, super::SshTestResultCategory::Success);
+        assert!(marker.exists());
 
         let session = fs::read_to_string(runtime_root.join("logs/menuconfig-session.jsonl"))
             .expect("read menuconfig session log");
         assert!(session.contains("\"action\":\"ssh.test_connection\""));
-        assert!(session.contains("\"phase\":\"failed\""));
-        assert!(session
-            .contains("\"error_code\":\"ssh-broker-endpoint-unready:identity-agent-missing\""));
+        assert!(session.contains("\"phase\":\"finished\""));
         assert!(!session.contains(TEST_PRIVATE_KEY_PEM));
     }
 
@@ -7794,23 +7882,42 @@ mod tests {
     fn ssh_probe_failure_hint_classifier_maps_known_patterns() {
         assert_eq!(
             super::classify_ssh_probe_failure_hint(
-                "debug1: get_agent_identities: ssh_get_authentication_socket: No such file or directory"
+                "debug1: get_agent_identities: ssh_get_authentication_socket: No such file or directory",
+                true,
             ),
             Some("broker-endpoint-unready")
         );
         assert_eq!(
-            super::classify_ssh_probe_failure_hint("Permission denied (publickey)."),
+            super::classify_ssh_probe_failure_hint("Permission denied (publickey).", true),
             Some("auth-publickey-rejected")
         );
         assert_eq!(
-            super::classify_ssh_probe_failure_hint("Host key verification failed."),
+            super::classify_ssh_probe_failure_hint("Host key verification failed.", true),
             Some("host-key-verification-failed")
         );
         assert_eq!(
-            super::classify_ssh_probe_failure_hint("Connection refused"),
+            super::classify_ssh_probe_failure_hint("Connection refused", true),
             Some("connection-refused")
         );
-        assert_eq!(super::classify_ssh_probe_failure_hint(""), None);
+        assert_eq!(
+            super::classify_ssh_probe_failure_hint(
+                "debug3: ssh_get_authentication_socket_path: path '/tmp/example.sock'\n\
+                 debug1: get_agent_identities: agent returned 1 keys\n\
+                 debug1: Trying private key: /Users/demo/.ssh/id_rsa\n\
+                 debug3: no such identity: /Users/demo/.ssh/id_rsa: No such file or directory\n\
+                 root@example: Permission denied (publickey).",
+                true,
+            ),
+            Some("auth-publickey-rejected")
+        );
+        assert_eq!(super::classify_ssh_probe_failure_hint("", true), None);
+        assert_eq!(
+            super::classify_ssh_probe_failure_hint(
+                "debug1: get_agent_identities: ssh_get_authentication_socket: No such file or directory",
+                false,
+            ),
+            None
+        );
     }
 
     #[test]

@@ -1050,11 +1050,13 @@ mod tests {
         let (selected, diagnostics) = toolchain.resolve_with_diagnostics("adb", None);
         let selected = selected.expect("must resolve");
         assert_eq!(selected.source, ExecutableSource::BuiltInFallback);
-        assert_eq!(selected.path.to_string_lossy(), bundled.to_string_lossy(),);
+        let selected_norm = selected.path.to_string_lossy().replace('\\', "/");
+        let bundled_norm = bundled.to_string_lossy().replace('\\', "/");
+        assert_eq!(selected_norm, bundled_norm);
         assert!(diagnostics
             .builtin_candidates
             .iter()
-            .any(|candidate| candidate == &bundled));
+            .any(|candidate| candidate.to_string_lossy().replace('\\', "/") == bundled_norm));
     }
 
     #[test]

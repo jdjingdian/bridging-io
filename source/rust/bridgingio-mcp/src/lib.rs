@@ -1,18 +1,22 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+#[cfg(unix)]
+use bridgingio_app_api::AppApiLineCodec;
 use bridgingio_app_api::{
     AgentTokenScopeView, AgentTokenSummaryView, ApiError, ApiErrorCode, ApiRequest, ApiResponse,
-    AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ArtifactReadView, ControlPlaneView,
-    CoreSettingsView, CreateAgentTokenResult as ApiCreateAgentTokenResult, ModelPlaneHttpView,
-    LocalAdminActionIntentView, LocalAdminAttestationView,
-    RuntimeLogSettingsView, TimelineEntry, TimelineSourceGroupSummaryView, ToolchainDiagnosticView,
-    VaultProtectorSummaryView, VaultSecretSummaryView, VaultStateProjectionView, VaultStatusView,
+    AppCommand, ArtifactCacheSettingsView, ArtifactReadView, ControlPlaneView, CoreSettingsView,
+    CreateAgentTokenResult as ApiCreateAgentTokenResult, LocalAdminActionIntentView,
+    LocalAdminAttestationView, ModelPlaneHttpView, RuntimeLogSettingsView, TimelineEntry,
+    TimelineSourceGroupSummaryView, ToolchainDiagnosticView, VaultProtectorSummaryView,
+    VaultSecretSummaryView, VaultStateProjectionView, VaultStatusView,
     VaultUnlockPolicySummaryView,
 };
 use bridgingio_artifacts::{
@@ -41,15 +45,15 @@ use bridgingio_platform::{
 use bridgingio_policy::{evaluate, OperationKind, PolicyDecision};
 use bridgingio_providers::{GitProvider, TerminalProvider};
 use bridgingio_secrets::{
-    normalize_credential_ref, AgentTokenAuthRejectReason, AgentTokenAuthResult,
-    AgentTokenSummary, CreateAgentTokenRequest, DeleteAgentTokenRequest, DeleteVaultRequest,
-    LocalAdminActionIntent, LocalAdminActionKind, LocalAdminAttestationRecord, SecretVaultRouter,
+    normalize_credential_ref, AgentTokenAuthRejectReason, AgentTokenAuthResult, AgentTokenSummary,
+    CreateAgentTokenRequest, DeleteAgentTokenRequest, DeleteVaultRequest, LocalAdminActionIntent,
+    LocalAdminActionKind, LocalAdminAttestationRecord, SecretVaultRouter,
     SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
     UnlockVaultRequest, UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError,
     VaultLockState, VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
 };
-use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -1265,7 +1269,10 @@ impl StandaloneCoreRuntime {
         ) {
             return Ok(());
         }
-        if matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+        if matches!(
+            self.vault_router.vault_lock_state(),
+            VaultLockState::Unlocked
+        ) {
             self.reconcile_sensitive_targets_after_unlock()?;
             return Ok(());
         }
@@ -1450,23 +1457,27 @@ impl StandaloneCoreRuntime {
         &mut self,
         target_id: &str,
     ) -> Result<TargetProfile, CoreRuntimeError> {
-        let profile = self
-            .profiles
-            .get(target_id)
-            .cloned()
-            .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_id}")))?;
+        let profile =
+            self.profiles.get(target_id).cloned().ok_or_else(|| {
+                CoreRuntimeError::Config(format!("target not found: {target_id}"))
+            })?;
         let descriptor = self
             .target_descriptors
             .get(target_id)
             .cloned()
-            .ok_or_else(|| CoreRuntimeError::Config(format!("target descriptor not found: {target_id}")))?;
+            .ok_or_else(|| {
+                CoreRuntimeError::Config(format!("target descriptor not found: {target_id}"))
+            })?;
         if descriptor.storage_class.is_plain() {
             let mut projected = profile;
             apply_target_catalog_projection_metadata(&mut projected, "plain", None);
             return Ok(projected);
         }
 
-        if !matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+        if !matches!(
+            self.vault_router.vault_lock_state(),
+            VaultLockState::Unlocked
+        ) {
             return Ok(redacted_sealed_catalog_profile(
                 &profile,
                 TARGET_PROJECTION_STATE_LOCKED,
@@ -1509,11 +1520,10 @@ impl StandaloneCoreRuntime {
         let target_id = self
             .resolve_target_id_by_ref(target_ref)
             .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
-        let mut target = self
-            .profiles
-            .get(&target_id)
-            .cloned()
-            .ok_or_else(|| CoreRuntimeError::Config(format!("target not found: {target_ref}")))?;
+        let mut target =
+            self.profiles.get(&target_id).cloned().ok_or_else(|| {
+                CoreRuntimeError::Config(format!("target not found: {target_ref}"))
+            })?;
         let descriptor = self
             .target_descriptors
             .get(&target_id)
@@ -1524,7 +1534,10 @@ impl StandaloneCoreRuntime {
         if descriptor.storage_class.is_plain() {
             return Ok(target);
         }
-        if !matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+        if !matches!(
+            self.vault_router.vault_lock_state(),
+            VaultLockState::Unlocked
+        ) {
             return Err(CoreRuntimeError::Config(format!(
                 "sealed target `{}` requires unlocked vault before execution",
                 descriptor.target_id
@@ -1542,15 +1555,12 @@ impl StandaloneCoreRuntime {
         &mut self,
         descriptor: &McpTargetDescriptor,
     ) -> Result<TargetProfileSecretPayload, SensitiveTargetLoadError> {
-        let sealed_profile_ref = descriptor
-            .sealed_profile_ref
-            .as_deref()
-            .ok_or_else(|| {
-                SensitiveTargetLoadError::RepairNeeded(format!(
-                    "sealed target `{}` is missing sealed_profile_ref",
-                    descriptor.target_id
-                ))
-            })?;
+        let sealed_profile_ref = descriptor.sealed_profile_ref.as_deref().ok_or_else(|| {
+            SensitiveTargetLoadError::RepairNeeded(format!(
+                "sealed target `{}` is missing sealed_profile_ref",
+                descriptor.target_id
+            ))
+        })?;
         let lease = self
             .vault_router
             .use_for_signing(
@@ -1573,24 +1583,18 @@ impl StandaloneCoreRuntime {
         };
 
         if map.contains_key("public_descriptor") || map.contains_key("sensitive_overlay") {
-            let public_descriptor = map
-                .get("public_descriptor")
-                .cloned()
-                .ok_or_else(|| {
-                    SensitiveTargetLoadError::RepairNeeded(format!(
-                        "sealed target `{}` payload missing public_descriptor",
-                        descriptor.target_id
-                    ))
-                })?;
-            let sensitive_overlay = map
-                .get("sensitive_overlay")
-                .cloned()
-                .ok_or_else(|| {
-                    SensitiveTargetLoadError::RepairNeeded(format!(
-                        "sealed target `{}` payload missing sensitive_overlay",
-                        descriptor.target_id
-                    ))
-                })?;
+            let public_descriptor = map.get("public_descriptor").cloned().ok_or_else(|| {
+                SensitiveTargetLoadError::RepairNeeded(format!(
+                    "sealed target `{}` payload missing public_descriptor",
+                    descriptor.target_id
+                ))
+            })?;
+            let sensitive_overlay = map.get("sensitive_overlay").cloned().ok_or_else(|| {
+                SensitiveTargetLoadError::RepairNeeded(format!(
+                    "sealed target `{}` payload missing sensitive_overlay",
+                    descriptor.target_id
+                ))
+            })?;
             let actual_digest = map
                 .get("public_descriptor_digest")
                 .and_then(Value::as_str)
@@ -1601,7 +1605,8 @@ impl StandaloneCoreRuntime {
                         descriptor.target_id
                     ))
                 })?;
-            let expected_digest = public_descriptor_digest_for_public_descriptor(&public_descriptor)?;
+            let expected_digest =
+                public_descriptor_digest_for_public_descriptor(&public_descriptor)?;
             if actual_digest != expected_digest {
                 return Err(SensitiveTargetLoadError::Tamper(format!(
                     "sealed target `{}` descriptor tamper detected (expected digest {}, got {})",
@@ -1888,7 +1893,9 @@ impl StandaloneCoreRuntime {
     fn target_candidate_summary_json(&mut self, candidate: &TargetResolutionCandidate) -> Value {
         let descriptor = self.target_descriptors.get(&candidate.target_id).cloned();
         let fallback_profile = self.profiles.get(&candidate.target_id).cloned();
-        let projected_profile = self.project_catalog_profile_by_id(&candidate.target_id).ok();
+        let projected_profile = self
+            .project_catalog_profile_by_id(&candidate.target_id)
+            .ok();
         let profile = projected_profile.as_ref().or(fallback_profile.as_ref());
         let toolchain_summary = profile
             .and_then(|target| self.toolchain_diagnostic_for_target(target))
@@ -2491,6 +2498,18 @@ impl StandaloneCoreRuntime {
         if !matches!(target.kind, TargetKind::Ssh) {
             return Ok(None);
         }
+        let Some(credential_ref) = target.credential_ref.as_ref() else {
+            return Ok(None);
+        };
+        if !is_vault_managed_credential_ref(&credential_ref.id) {
+            let direct_identity_args = direct_identity_option_args(&credential_ref.id);
+            apply_ssh_delivery_args(invocation, &direct_identity_args);
+            invocation.resolution.warnings.push(format!(
+                "ssh credential source=direct-identity; broker bypass is active for `{}`",
+                credential_ref.id
+            ));
+            return Ok(None);
+        }
         if target
             .metadata
             .get(TARGET_SSH_DELIVERY_MODE_METADATA_KEY)
@@ -2499,9 +2518,6 @@ impl StandaloneCoreRuntime {
         {
             return Ok(None);
         }
-        let Some(credential_ref) = target.credential_ref.as_ref() else {
-            return Ok(None);
-        };
 
         let host_key_policy = ssh_host_key_policy_for_target(target);
         let allow_identity_fallback = target
@@ -2939,7 +2955,10 @@ impl StandaloneCoreRuntime {
     }
 
     fn reconcile_sensitive_targets_after_unlock(&mut self) -> Result<(), CoreRuntimeError> {
-        if !matches!(self.vault_router.vault_lock_state(), VaultLockState::Unlocked) {
+        if !matches!(
+            self.vault_router.vault_lock_state(),
+            VaultLockState::Unlocked
+        ) {
             return Ok(());
         }
 
@@ -2949,7 +2968,11 @@ impl StandaloneCoreRuntime {
             .vault_router
             .list_secret_summaries()
             .into_iter()
-            .filter(|summary| summary.kind.eq_ignore_ascii_case(TARGET_PROFILE_SECRET_KIND))
+            .filter(|summary| {
+                summary
+                    .kind
+                    .eq_ignore_ascii_case(TARGET_PROFILE_SECRET_KIND)
+            })
             .map(|summary| summary.reference)
             .collect::<Vec<_>>();
 
@@ -2978,7 +3001,8 @@ impl StandaloneCoreRuntime {
             let Some(reference) = descriptor.sealed_profile_ref.as_ref() else {
                 continue;
             };
-            if secret_kind_from_reference(reference).as_deref() == Some(TARGET_PROFILE_SECRET_KIND) {
+            if secret_kind_from_reference(reference).as_deref() == Some(TARGET_PROFILE_SECRET_KIND)
+            {
                 continue;
             }
             let payload = match self.load_target_profile_secret_payload(&descriptor) {
@@ -3031,11 +3055,11 @@ impl StandaloneCoreRuntime {
             else {
                 continue;
             };
-            let expected_digest = match public_descriptor_digest_for_public_descriptor(public_descriptor)
-            {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
+            let expected_digest =
+                match public_descriptor_digest_for_public_descriptor(public_descriptor) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
             if actual_digest != expected_digest {
                 continue;
             }
@@ -3059,7 +3083,11 @@ impl StandaloneCoreRuntime {
         }
 
         for (target_id, target) in reconciled {
-            if let Some(index) = settings.targets.iter().position(|existing| existing.id == target_id) {
+            if let Some(index) = settings
+                .targets
+                .iter()
+                .position(|existing| existing.id == target_id)
+            {
                 if settings.targets[index] != target {
                     settings.targets[index] = target;
                     changed = true;
@@ -3075,7 +3103,9 @@ impl StandaloneCoreRuntime {
         }
 
         settings.validate().map_err(|err| {
-            CoreRuntimeError::Config(format!("sensitive target reconcile failed validation: {err:?}"))
+            CoreRuntimeError::Config(format!(
+                "sensitive target reconcile failed validation: {err:?}"
+            ))
         })?;
         self.settings_store.settings = settings;
         self.rebuild_profile_cache_from_settings()?;
@@ -3107,10 +3137,9 @@ impl StandaloneCoreRuntime {
             if access_class.allows_anonymous_local() {
                 access_class = TargetAccessClass::TokenScoped;
             }
-            let existing_ref = descriptor
-                .sealed_profile_ref
-                .clone()
-                .filter(|value| secret_kind_from_reference(value).as_deref() == Some(TARGET_PROFILE_SECRET_KIND));
+            let existing_ref = descriptor.sealed_profile_ref.clone().filter(|value| {
+                secret_kind_from_reference(value).as_deref() == Some(TARGET_PROFILE_SECRET_KIND)
+            });
             let sealed_profile_ref = match existing_ref {
                 Some(value) => value,
                 None => canonical_target_profile_ref_for_target(&profile.id)
@@ -3971,13 +4000,13 @@ impl StandaloneCoreRuntime {
                 attestation_id,
             } => {
                 let actor = control_plane_request_actor(&request.context);
-                match self
-                    .vault_router
-                    .delete_agent_token_with_attestation(DeleteAgentTokenRequest {
+                match self.vault_router.delete_agent_token_with_attestation(
+                    DeleteAgentTokenRequest {
                         token_id,
                         requested_by: actor,
                         attestation_id,
-                    }) {
+                    },
+                ) {
                     Ok(summary) => ApiResponse::AgentTokenDeleted {
                         request_id: request.request_id,
                         summary: app_agent_token_summary(summary),
@@ -4106,12 +4135,14 @@ impl StandaloneCoreRuntime {
                 attestation_id,
             } => {
                 let actor = control_plane_request_actor(&request.context);
-                match self.vault_router.unlock_vault_with_attestation(UnlockVaultRequest {
-                    method,
-                    passphrase,
-                    requested_by: actor,
-                    attestation_id,
-                }) {
+                match self
+                    .vault_router
+                    .unlock_vault_with_attestation(UnlockVaultRequest {
+                        method,
+                        passphrase,
+                        requested_by: actor,
+                        attestation_id,
+                    }) {
                     Ok(()) => match self.reconcile_sensitive_targets_after_unlock() {
                         Ok(()) => ApiResponse::VaultUnlocked {
                             request_id: request.request_id,
@@ -4784,10 +4815,10 @@ fn apply_sealed_overlay_to_target_profile(
         profile.credential_ref = match credential_value {
             Value::Null => None,
             Value::String(raw_ref) => {
-                let normalized = normalize_credential_ref(raw_ref).map_err(vault_error_to_runtime)?;
+                let normalized = canonicalize_profile_credential_ref(raw_ref)?;
                 Some(CredentialRef {
+                    provider: credential_ref_provider_for(&normalized),
                     id: normalized,
-                    provider: "vault".to_string(),
                 })
             }
             Value::Object(obj) => {
@@ -4801,17 +4832,17 @@ fn apply_sealed_overlay_to_target_profile(
                             "sealed overlay credential_ref object requires non-empty `id`".into(),
                         )
                     })?;
-                let provider = obj
+                let provider_hint = obj
                     .get("provider")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
-                    .unwrap_or("vault")
-                    .to_string();
-                let normalized = normalize_credential_ref(id).map_err(vault_error_to_runtime)?;
+                    .map(str::to_string);
+                let normalized = canonicalize_profile_credential_ref(id)?;
                 Some(CredentialRef {
+                    provider: provider_hint
+                        .unwrap_or_else(|| credential_ref_provider_for(&normalized)),
                     id: normalized,
-                    provider,
                 })
             }
             _ => {
@@ -4824,7 +4855,9 @@ fn apply_sealed_overlay_to_target_profile(
 
     if let Some(connection_value) = map.get("connection") {
         let connection = connection_value.as_object().ok_or_else(|| {
-            CoreRuntimeError::Config("sealed overlay field `connection` must be a JSON object".into())
+            CoreRuntimeError::Config(
+                "sealed overlay field `connection` must be a JSON object".into(),
+            )
         })?;
         match &mut profile.connection {
             ConnectionConfig::Ssh {
@@ -4952,18 +4985,20 @@ fn apply_sealed_overlay_to_target_profile(
             CoreRuntimeError::Config("sealed overlay field `policy` must be a JSON object".into())
         })?;
         if let Some(value) = policy.get("require_approval_for_write") {
-            profile.default_policy.require_approval_for_write = value.as_bool().ok_or_else(|| {
-                CoreRuntimeError::Config(
-                    "sealed overlay policy.require_approval_for_write must be bool".into(),
-                )
-            })?;
+            profile.default_policy.require_approval_for_write =
+                value.as_bool().ok_or_else(|| {
+                    CoreRuntimeError::Config(
+                        "sealed overlay policy.require_approval_for_write must be bool".into(),
+                    )
+                })?;
         }
         if let Some(value) = policy.get("require_approval_for_delete") {
-            profile.default_policy.require_approval_for_delete = value.as_bool().ok_or_else(|| {
-                CoreRuntimeError::Config(
-                    "sealed overlay policy.require_approval_for_delete must be bool".into(),
-                )
-            })?;
+            profile.default_policy.require_approval_for_delete =
+                value.as_bool().ok_or_else(|| {
+                    CoreRuntimeError::Config(
+                        "sealed overlay policy.require_approval_for_delete must be bool".into(),
+                    )
+                })?;
         }
         if let Some(value) = policy.get("require_approval_for_privileged") {
             profile.default_policy.require_approval_for_privileged =
@@ -4977,7 +5012,8 @@ fn apply_sealed_overlay_to_target_profile(
             profile.default_policy.require_approval_for_sensitive_read =
                 value.as_bool().ok_or_else(|| {
                     CoreRuntimeError::Config(
-                        "sealed overlay policy.require_approval_for_sensitive_read must be bool".into(),
+                        "sealed overlay policy.require_approval_for_sensitive_read must be bool"
+                            .into(),
                     )
                 })?;
         }
@@ -4985,7 +5021,9 @@ fn apply_sealed_overlay_to_target_profile(
 
     if let Some(toolchains_value) = map.get("toolchains") {
         let toolchains = toolchains_value.as_object().ok_or_else(|| {
-            CoreRuntimeError::Config("sealed overlay field `toolchains` must be a JSON object".into())
+            CoreRuntimeError::Config(
+                "sealed overlay field `toolchains` must be a JSON object".into(),
+            )
         })?;
         for (command, value) in toolchains {
             match value {
@@ -5277,7 +5315,8 @@ fn authoritative_target_profile_payload_json(
     descriptor: &McpTargetDescriptor,
 ) -> Result<String, SensitiveTargetLoadError> {
     let public_descriptor = public_descriptor_json_for_descriptor(descriptor);
-    let public_descriptor_digest = public_descriptor_digest_for_public_descriptor(&public_descriptor)?;
+    let public_descriptor_digest =
+        public_descriptor_digest_for_public_descriptor(&public_descriptor)?;
     let sensitive_overlay = sensitive_overlay_json_from_profile(profile);
     Ok(json!({
         "public_descriptor": public_descriptor,
@@ -5494,7 +5533,9 @@ fn vault_readiness_to_capability_status(status: &VaultReadinessState) -> Capabil
     }
 }
 
-fn vault_unlock_policy_from_settings(settings: &CoreSettings) -> Result<VaultUnlockPolicy, CoreRuntimeError> {
+fn vault_unlock_policy_from_settings(
+    settings: &CoreSettings,
+) -> Result<VaultUnlockPolicy, CoreRuntimeError> {
     let trigger_policy = match settings
         .vault
         .unlock
@@ -5627,6 +5668,19 @@ fn apply_ssh_delivery_args(invocation: &mut CommandInvocation, option_args: &[St
         invocation.args.insert(index, value.clone());
         index += 1;
     }
+}
+
+fn direct_identity_option_args(identity_path: &str) -> Vec<String> {
+    vec![
+        "-i".to_string(),
+        identity_path.to_string(),
+        "-o".to_string(),
+        format!("IdentityFile={identity_path}"),
+        "-o".to_string(),
+        "IdentitiesOnly=yes".to_string(),
+        "-o".to_string(),
+        "IdentityAgent=none".to_string(),
+    ]
 }
 
 fn parse_bool_metadata(raw: &str, default: bool) -> bool {
@@ -5790,13 +5844,38 @@ fn looks_like_named_pipe_endpoint(endpoint: &str) -> bool {
     endpoint.trim().starts_with(r"\\.\pipe\")
 }
 
+fn is_vault_managed_credential_ref(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.starts_with("vault://") || trimmed.starts_with("vault:")
+}
+
+fn canonicalize_profile_credential_ref(raw: &str) -> Result<String, CoreRuntimeError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CoreRuntimeError::Config(
+            "credential_ref must be non-empty".into(),
+        ));
+    }
+    if is_vault_managed_credential_ref(trimmed) {
+        return normalize_credential_ref(trimmed).map_err(vault_error_to_runtime);
+    }
+    Ok(trimmed.to_string())
+}
+
+fn credential_ref_provider_for(raw: &str) -> String {
+    if is_vault_managed_credential_ref(raw) {
+        "vault".to_string()
+    } else {
+        "direct-identity".to_string()
+    }
+}
+
 fn normalize_profile_credential_ref(
     mut profile: TargetProfile,
 ) -> Result<TargetProfile, CoreRuntimeError> {
     if let Some(credential_ref) = profile.credential_ref.as_mut() {
-        credential_ref.id =
-            normalize_credential_ref(&credential_ref.id).map_err(vault_error_to_runtime)?;
-        credential_ref.provider = "vault".into();
+        credential_ref.id = canonicalize_profile_credential_ref(&credential_ref.id)?;
+        credential_ref.provider = credential_ref_provider_for(&credential_ref.id);
     }
     Ok(profile)
 }
@@ -5890,13 +5969,13 @@ fn to_target_profile(
         .credential_ref
         .as_ref()
         .map(|reference| {
-            normalize_credential_ref(reference).map(|normalized| bridgingio_domain::CredentialRef {
-                id: normalized,
-                provider: "vault".into(),
+            let canonicalized = canonicalize_profile_credential_ref(reference)?;
+            Ok(bridgingio_domain::CredentialRef {
+                provider: credential_ref_provider_for(&canonicalized),
+                id: canonicalized,
             })
         })
-        .transpose()
-        .map_err(vault_error_to_runtime)?;
+        .transpose()?;
     Ok(TargetProfile {
         id: configured.id.clone(),
         name: configured.display_name.clone(),
@@ -6048,9 +6127,8 @@ fn to_standalone_target_profile(
         credential_ref: profile
             .credential_ref
             .as_ref()
-            .map(|value| normalize_credential_ref(&value.id))
-            .transpose()
-            .map_err(vault_error_to_runtime)?,
+            .map(|value| canonicalize_profile_credential_ref(&value.id))
+            .transpose()?,
         notes: profile.notes.clone(),
         connection,
         terminal: StandaloneTerminalSection {
@@ -6461,20 +6539,31 @@ fn handle_http_connection(
                                 .map(|target_id| authenticated.target_ids.contains(target_id))
                                 .unwrap_or(false);
                             if !allowed {
-                                auth_error = Some("result=error|message=token_scope_denied_for_target".to_string());
+                                auth_error = Some(
+                                    "result=error|message=token_scope_denied_for_target"
+                                        .to_string(),
+                                );
                             } else if authenticated.tool_ids.is_empty()
                                 || !authenticated
                                     .tool_ids
                                     .iter()
                                     .any(|tool_id| tool_id == "terminal.exec")
                             {
-                                auth_error = Some("result=error|message=token_scope_denied_for_tool".to_string());
+                                auth_error = Some(
+                                    "result=error|message=token_scope_denied_for_tool".to_string(),
+                                );
                             } else if !authenticated.allow_open_shell
                                 || !authenticated.allow_write_shell_input
                             {
-                                auth_error = Some("result=error|message=token_scope_denied_for_shell_capability".to_string());
+                                auth_error = Some(
+                                    "result=error|message=token_scope_denied_for_shell_capability"
+                                        .to_string(),
+                                );
                             } else if authenticated.max_risk_envelope == "deny-all" {
-                                auth_error = Some("result=error|message=token_scope_denied_by_risk_envelope".to_string());
+                                auth_error = Some(
+                                    "result=error|message=token_scope_denied_by_risk_envelope"
+                                        .to_string(),
+                                );
                             } else {
                                 context.principal_id = Some(authenticated.principal_id);
                                 context.timeline_source = Some(timeline_source_from_token_label(
@@ -6495,15 +6584,20 @@ fn handle_http_connection(
                     .cloned()
                 {
                     if !runtime.anonymous_loopback_compat_enabled() {
-                        auth_error = Some("result=error|message=anonymous_compat_disabled".to_string());
+                        auth_error =
+                            Some("result=error|message=anonymous_compat_disabled".to_string());
                     } else if !remote_addr
                         .map(|value| value.ip().is_loopback())
                         .unwrap_or(false)
                     {
-                        auth_error =
-                            Some("result=error|message=anonymous_compat_non_loopback_rejected".to_string());
+                        auth_error = Some(
+                            "result=error|message=anonymous_compat_non_loopback_rejected"
+                                .to_string(),
+                        );
                     } else if !descriptor.allows_anonymous_execution() {
-                        auth_error = Some("result=error|message=anonymous_compat_denied_for_target".to_string());
+                        auth_error = Some(
+                            "result=error|message=anonymous_compat_denied_for_target".to_string(),
+                        );
                     } else {
                         context.principal_id = Some("anonymous-local".to_string());
                         context.timeline_source = Some(timeline_source_for_anonymous_loopback(
@@ -8215,15 +8309,15 @@ mod tests {
         local_admin_payload_digest_for_unlock_vault,
         local_admin_payload_digest_for_update_agent_token_scope, local_admin_unlock_vault_target,
         CreateAgentTokenRequest, TokenScopeInput, UpdateAgentTokenAccessRequest,
-        UpdateAgentTokenScopeRequest, VaultLockState, VaultUnlockPolicy,
-        VaultUnlockTriggerPolicy,
+        UpdateAgentTokenScopeRequest, VaultLockState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
     };
 
     use super::{
-        CapabilityDiscovery, ControlPlaneIpcClient, ControlPlaneIpcServer, CoreRuntimeError,
-        DefaultCapabilityDiscovery, McpToolHandler, ModelPlaneHttpServer, StandaloneCoreRuntime,
-        ToolRequest, ToolRequestContext, ToolResult,
+        CapabilityDiscovery, CoreRuntimeError, DefaultCapabilityDiscovery, McpToolHandler,
+        ModelPlaneHttpServer, StandaloneCoreRuntime, ToolRequest, ToolRequestContext, ToolResult,
     };
+    #[cfg(unix)]
+    use super::{ControlPlaneIpcClient, ControlPlaneIpcServer};
 
     fn context(
         agent: &str,
@@ -8456,12 +8550,10 @@ enabled = true
             .resolve_target_descriptor_by_ref(target_ref)
             .cloned()
             .expect("sealed target descriptor");
-        let digest = digest_override
-            .map(ToString::to_string)
-            .unwrap_or_else(|| {
-                super::public_descriptor_digest_for_target_descriptor(&descriptor)
-                    .expect("descriptor digest")
-            });
+        let digest = digest_override.map(ToString::to_string).unwrap_or_else(|| {
+            super::public_descriptor_digest_for_target_descriptor(&descriptor)
+                .expect("descriptor digest")
+        });
         let overlay_ref = descriptor
             .sealed_profile_ref
             .clone()
@@ -8991,7 +9083,7 @@ enabled = true
         let runtime = StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
 
         let view = runtime.settings_view();
-        assert!(view.runtime_logs.root.ends_with("/logs"));
+        assert!(std::path::Path::new(&view.runtime_logs.root).ends_with("logs"));
         assert_eq!(
             view.runtime_logs.level,
             runtime.settings_store.settings.core.log_level
@@ -9828,12 +9920,8 @@ enabled = true
             allow_delegation: Some(false),
             allow_admin_actions: Some(false),
         };
-        let attestation_id = create_token_attestation_id(
-            &mut runtime,
-            "expired-token",
-            Some(1),
-            scope.clone(),
-        );
+        let attestation_id =
+            create_token_attestation_id(&mut runtime, "expired-token", Some(1), scope.clone());
         let created = runtime.handle_app_request(ApiRequest {
             request_id: "token-create-expired".into(),
             context: request_context(),
@@ -9891,7 +9979,10 @@ enabled = true
                 require_fresh_user_verification: true,
             })
             .expect("manual unlock policy");
-        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+        runtime
+            .vault_router
+            .lock_vault("test lock")
+            .expect("lock vault");
 
         let response = runtime.handle_app_request(ApiRequest {
             request_id: "list-profiles-locked".into(),
@@ -10021,7 +10112,11 @@ enabled = true
             .expect("sealed profile ref");
         runtime
             .vault_router
-            .put(reference, r#"{"notes":"broken-without-digest"}"#, "broken overlay")
+            .put(
+                reference,
+                r#"{"notes":"broken-without-digest"}"#,
+                "broken overlay",
+            )
             .expect("store broken payload");
 
         let response = runtime.handle_app_request(ApiRequest {
@@ -10071,7 +10166,10 @@ enabled = true
                 require_fresh_user_verification: true,
             })
             .expect("manual unlock policy");
-        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+        runtime
+            .vault_router
+            .lock_vault("test lock")
+            .expect("lock vault");
 
         let attestation_id = unlock_attestation_id(&mut runtime, "os-native");
         let response = runtime.handle_app_request(ApiRequest {
@@ -10095,9 +10193,7 @@ enabled = true
             .any(|target| {
                 target.id == "sealed-shell"
                     && target.storage_class == "sealed-overlay"
-                    && target
-                        .sealed_profile_ref
-                        .as_deref()
+                    && target.sealed_profile_ref.as_deref()
                         == Some("vault://bridgingio/target-profile/sealed-shell")
             }));
     }
@@ -10144,7 +10240,10 @@ enabled = true
                 require_fresh_user_verification: true,
             })
             .expect("manual unlock policy");
-        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+        runtime
+            .vault_router
+            .lock_vault("test lock")
+            .expect("lock vault");
 
         let err = runtime
             .resolve_target_profile_for_execution_by_ref("sealed-shell")
@@ -10415,6 +10514,75 @@ enabled = true
     }
 
     #[test]
+    fn direct_identity_ssh_delivery_bypasses_broker_and_injects_identity_args() {
+        let root = temp_dir("direct-identity-ssh-delivery");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+
+        let mut target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        target.metadata.insert(
+            "ssh.delivery_mode".to_string(),
+            "ssh-agent-broker".to_string(),
+        );
+        let identity_path = root.join("id_direct_identity");
+        target.credential_ref = Some(bridgingio_domain::CredentialRef {
+            id: identity_path.to_string_lossy().to_string(),
+            provider: "direct-identity".into(),
+        });
+
+        let mut invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        let broker_session_id = runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-ssh-direct",
+                    "run-ssh-direct",
+                    "client-ssh-direct",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut invocation,
+                Some("channel-ssh-direct"),
+            )
+            .expect("prepare direct identity");
+
+        assert!(broker_session_id.is_none());
+        let expected = identity_path.to_string_lossy().to_string();
+        assert!(invocation.args.iter().any(|arg| arg == "-i"));
+        assert!(invocation.args.iter().any(|arg| arg == &expected));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|arg| arg == &format!("IdentityFile={expected}")));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|arg| arg == "IdentitiesOnly=yes"));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|arg| arg == "IdentityAgent=none"));
+        assert!(invocation
+            .resolution
+            .warnings
+            .iter()
+            .any(|line| line.contains("direct-identity")));
+    }
+
+    #[test]
     fn secret_backed_ssh_delivery_rejects_when_vault_not_unlocked() {
         let root = temp_dir("secret-backed-ssh-locked-gate");
         let settings = bridgingio_engine::CoreSettings::from_toml_str(
@@ -10459,7 +10627,10 @@ enabled = true
                 require_fresh_user_verification: true,
             })
             .expect("manual policy");
-        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+        runtime
+            .vault_router
+            .lock_vault("test lock")
+            .expect("lock vault");
 
         let mut locked_invocation = runtime
             .resolve_structured_exec_invocation(&target, "whoami")
@@ -10515,9 +10686,7 @@ enabled = true
             .expect_err("unavailable vault must block secret-backed ssh delivery");
         match unavailable_err {
             CoreRuntimeError::Config(message) => {
-                assert!(
-                    message.contains("VaultUnavailable") || message.contains("VaultLocked")
-                );
+                assert!(message.contains("VaultUnavailable") || message.contains("VaultLocked"));
             }
             other => panic!("expected config error, got {other:?}"),
         }
@@ -10549,7 +10718,10 @@ enabled = true
             .vault_router
             .configure_passphrase_protector("correct horse battery staple")
             .expect("configure passphrase protector");
-        runtime.vault_router.lock_vault("test lock").expect("lock vault");
+        runtime
+            .vault_router
+            .lock_vault("test lock")
+            .expect("lock vault");
         runtime
             .vault_router
             .set_unlock_policy(VaultUnlockPolicy {
@@ -10566,7 +10738,10 @@ enabled = true
         runtime
             .complete_startup_unlock_with_secret(Some("correct horse battery staple"))
             .expect("startup unlock with passphrase");
-        assert_eq!(runtime.vault_router.vault_lock_state(), VaultLockState::Unlocked);
+        assert_eq!(
+            runtime.vault_router.vault_lock_state(),
+            VaultLockState::Unlocked
+        );
     }
 
     #[test]
@@ -10909,6 +11084,80 @@ exit 1
         assert_eq!(
             payload["credential_ref"].as_str(),
             Some("vault://bridgingio/ssh-private-key/ops-prod")
+        );
+    }
+
+    #[test]
+    fn upsert_profile_preserves_direct_identity_credential_ref() {
+        let root = temp_dir("direct-identity-ref");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let config_path = root.join("managed-core.toml");
+        fs::write(
+            &config_path,
+            bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("write config");
+        runtime.settings_store.runtime_metadata.config_path =
+            Some(config_path.to_string_lossy().to_string());
+
+        let identity_path = root.join("id_direct_identity");
+        let response = runtime.handle_app_request(ApiRequest {
+            request_id: "upsert-direct-ref".into(),
+            context: request_context(),
+            command: AppCommand::UpsertProfile {
+                profile: TargetProfile {
+                    id: "direct-ref-target".into(),
+                    name: "Direct Ref Target".into(),
+                    kind: TargetKind::Ssh,
+                    connection: ConnectionConfig::Ssh {
+                        host: "127.0.0.1".into(),
+                        port: 22,
+                        username: "dev".into(),
+                    },
+                    credential_ref: Some(bridgingio_domain::CredentialRef {
+                        id: identity_path.to_string_lossy().to_string(),
+                        provider: "manual".into(),
+                    }),
+                    default_policy: PolicyProfile::default(),
+                    notes: None,
+                    metadata: BTreeMap::new(),
+                    toolchains: BTreeMap::new(),
+                },
+            },
+        });
+        match response {
+            ApiResponse::Accepted { apply_strategy, .. } => {
+                assert_eq!(apply_strategy.as_deref(), Some("live_applied"));
+            }
+            other => panic!("unexpected upsert response: {other:?}"),
+        }
+
+        let profile_response = runtime.handle_app_request(ApiRequest {
+            request_id: "get-direct-ref".into(),
+            context: request_context(),
+            command: AppCommand::GetProfile {
+                target_id: "direct-ref-target".into(),
+            },
+        });
+        let payload_json = match profile_response {
+            ApiResponse::Profile { payload_json, .. } => payload_json,
+            other => panic!("unexpected profile response: {other:?}"),
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_json).expect("profile payload json");
+        assert_eq!(
+            payload["credential_ref"].as_str(),
+            Some(identity_path.to_string_lossy().as_ref())
         );
     }
 

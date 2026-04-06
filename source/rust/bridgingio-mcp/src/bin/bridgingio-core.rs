@@ -18,13 +18,12 @@ use bridgingio_domain::{
 };
 use bridgingio_engine::{
     i18n::{Catalog, OPERATOR_LOCALE_EN_US},
-    ConfigError, CoreSettings, StandaloneConnectionSection, StandaloneTargetProfile,
-    StandaloneTerminalSection, TerminalProviderSection,
+    prepare_standalone_ssh_probe, ConfigError, CoreSettings, StandaloneConnectionSection,
+    StandaloneTargetProfile, StandaloneTerminalSection, TerminalProviderSection,
 };
-use bridgingio_mcp::{
-    control_plane_socket_path, CoreHostMode, CoreRuntimeError, ModelPlaneHttpServer,
-    StandaloneCoreRuntime,
-};
+#[cfg(unix)]
+use bridgingio_mcp::{control_plane_socket_path, CoreRuntimeError};
+use bridgingio_mcp::{CoreHostMode, ModelPlaneHttpServer, StandaloneCoreRuntime};
 use bridgingio_operator_console::run_menuconfig;
 use bridgingio_platform::{
     detect_host_platform_adapter, next_local_authorization_flow_id, CapabilityStatus, HostPlatform,
@@ -33,14 +32,14 @@ use bridgingio_platform::{
 };
 use bridgingio_providers::TerminalProvider;
 use bridgingio_secrets::{
-    local_admin_create_token_target, local_admin_payload_digest_for_create_agent_token,
-    local_admin_delete_vault_target, local_admin_payload_digest_for_delete_agent_token,
-    local_admin_payload_digest_for_delete_vault, local_admin_payload_digest_for_unlock_vault,
-    local_admin_unlock_vault_target, normalize_credential_ref, CreateAgentTokenRequest,
-    DeleteAgentTokenRequest, DeleteVaultRequest, LocalAdminActionKind, SecretBytes,
-    SecretVaultRouter, SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling,
-    TokenScopeInput, UnlockVaultRequest, VaultError, VaultReadinessState, VaultUnlockPolicy,
-    VaultUnlockTriggerPolicy,
+    local_admin_create_token_target, local_admin_delete_vault_target,
+    local_admin_payload_digest_for_create_agent_token,
+    local_admin_payload_digest_for_delete_agent_token, local_admin_payload_digest_for_delete_vault,
+    local_admin_payload_digest_for_unlock_vault, local_admin_unlock_vault_target,
+    normalize_credential_ref, CreateAgentTokenRequest, DeleteAgentTokenRequest, DeleteVaultRequest,
+    LocalAdminActionKind, SecretBytes, SecretVaultRouter, SshAgentBrokerPrepareRequest,
+    SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput, UnlockVaultRequest, VaultError,
+    VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
 };
 use serde_json::json;
 
@@ -553,7 +552,10 @@ fn run_management_command(config_path: &Path, command: ManagementCommand) -> Res
             let created = router
                 .create_agent_token(create_request)
                 .map_err(|err| format!("create token failed: {err:?}"))?;
-            println!("token created (one-time reveal): {}", created.plaintext_token);
+            println!(
+                "token created (one-time reveal): {}",
+                created.plaintext_token
+            );
             println!(
                 "token summary: id={} status={} scope={} targets={}",
                 created.summary.token_id,
@@ -1409,6 +1411,79 @@ fn validate_vault_and_auth_contract_smoke() -> Result<(), String> {
             prepared.ssh_option_args
         ));
     }
+    let broker_endpoint = prepared
+        .ssh_option_args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("IdentityAgent="))
+        .filter(|value| !value.eq_ignore_ascii_case("none"))
+        .map(PathBuf::from);
+    let identity_fallback_path = prepared.ssh_option_args.windows(2).find_map(|pair| {
+        if pair[0] == "-i" {
+            Some(PathBuf::from(pair[1].clone()))
+        } else {
+            None
+        }
+    });
+    if broker_endpoint.is_some()
+        && !prepared
+            .ssh_option_args
+            .iter()
+            .any(|arg| arg == "IdentitiesOnly=no")
+    {
+        return Err(format!(
+            "ssh broker smoke must force IdentitiesOnly=no for broker mode: {:?}",
+            prepared.ssh_option_args
+        ));
+    }
+    if identity_fallback_path.is_some()
+        && !prepared
+            .ssh_option_args
+            .iter()
+            .any(|arg| arg == "IdentitiesOnly=yes")
+    {
+        return Err(format!(
+            "ssh broker smoke must enforce IdentitiesOnly=yes for identity fallback: {:?}",
+            prepared.ssh_option_args
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let Some(endpoint) = broker_endpoint.as_ref() else {
+            return Err(format!(
+                "windows ssh broker smoke requires named-pipe IdentityAgent endpoint: {:?}",
+                prepared.ssh_option_args
+            ));
+        };
+        let endpoint_text = endpoint.to_string_lossy();
+        if !endpoint_text.starts_with(r"\\.\pipe\bridgingio-ssh-broker-") {
+            return Err(format!(
+                "windows ssh broker endpoint must use named-pipe contract, got {endpoint_text}"
+            ));
+        }
+        if identity_fallback_path.is_some() {
+            return Err(format!(
+                "windows ssh broker contract probe must not degrade to identity-file fallback: {:?}",
+                prepared.ssh_option_args
+            ));
+        }
+    }
+    #[cfg(unix)]
+    if let Some(path) = broker_endpoint.as_ref() {
+        use std::os::unix::fs::FileTypeExt;
+        let metadata = fs::metadata(path).map_err(|err| {
+            format!(
+                "unix broker endpoint should exist before attach ({}): {err}",
+                path.display()
+            )
+        })?;
+        if !metadata.file_type().is_socket() {
+            return Err(format!(
+                "unix broker endpoint must be a socket, got: {}",
+                path.display()
+            ));
+        }
+    }
+
     let attached = router
         .attach_ssh_agent_broker_session(&prepared.session.broker_session_id, "channel-self-test")
         .map_err(|err| format!("attach ssh broker session failed: {err:?}"))?;
@@ -1435,6 +1510,22 @@ fn validate_vault_and_auth_contract_smoke() -> Result<(), String> {
             "ssh broker session must close after cleanup, got {}",
             closed.state.as_str()
         ));
+    }
+    if let Some(path) = broker_endpoint.as_ref() {
+        if path.exists() {
+            return Err(format!(
+                "ssh broker endpoint should be cleaned up after close: {}",
+                path.display()
+            ));
+        }
+    }
+    if let Some(path) = identity_fallback_path.as_ref() {
+        if path.exists() {
+            return Err(format!(
+                "identity-file fallback path should be cleaned up after close: {}",
+                path.display()
+            ));
+        }
     }
     let ssh_diag = router
         .ssh_agent_broker_diagnostics(&prepared.session.broker_session_id)
@@ -1474,6 +1565,33 @@ fn validate_vault_and_auth_contract_smoke() -> Result<(), String> {
                 "non-loopback host must require auth mode when protection is enabled: {other:?}"
             ))
         }
+    }
+
+    let mut direct_identity_settings =
+        CoreSettings::from_toml_str(&CoreSettings::minimal_example())
+            .map_err(|err| format!("parse direct identity self-test settings failed: {err:?}"))?;
+    let direct_identity_ref = if cfg!(windows) {
+        r"C:\temp\bridgingio-self-test-id".to_string()
+    } else {
+        "/tmp/bridgingio-self-test-id".to_string()
+    };
+    let ssh_target_index = direct_identity_settings
+        .targets
+        .iter()
+        .position(|target| target.kind == TargetKind::Ssh)
+        .ok_or_else(|| "direct identity self-test requires at least one ssh target".to_string())?;
+    direct_identity_settings.targets[ssh_target_index].credential_ref =
+        Some(direct_identity_ref.clone());
+    let ssh_target = direct_identity_settings.targets[ssh_target_index].clone();
+    let prepared_probe = prepare_standalone_ssh_probe(&direct_identity_settings, &ssh_target)
+        .map_err(|err| {
+            format!("prepare standalone ssh probe for direct identity failed: {err:?}")
+        })?;
+    if prepared_probe.credential_ref.as_deref() != Some(direct_identity_ref.as_str()) {
+        return Err(format!(
+            "direct identity credential ref must bypass vault canonicalization, got {:?}",
+            prepared_probe.credential_ref
+        ));
     }
 
     Ok(())
@@ -2018,7 +2136,10 @@ where
     })
 }
 
-fn parse_management_cli_args(args: &[String], catalog: &Catalog) -> Result<Option<CliArgs>, String> {
+fn parse_management_cli_args(
+    args: &[String],
+    catalog: &Catalog,
+) -> Result<Option<CliArgs>, String> {
     let Some(route) = args.first().map(String::as_str) else {
         return Ok(None);
     };
@@ -2126,9 +2247,8 @@ fn parse_vault_management_cli(args: &[String], catalog: &Catalog) -> Result<CliA
             ManagementCommand::VaultDelete
         }
         "import" => ManagementCommand::VaultImport {
-            reference: reference.ok_or_else(|| {
-                "vault import requires --reference <credential-ref>".to_string()
-            })?,
+            reference: reference
+                .ok_or_else(|| "vault import requires --reference <credential-ref>".to_string())?,
             label,
             input,
         },
@@ -2293,7 +2413,8 @@ fn read_secret_input(input: &SecretInputRoute, prompt: &str) -> Result<SecretInp
     validate_secret_input_route(input)?;
     let (kind, locator, summary, bytes) = if let Some(fd) = input.fd {
         let path = format!("/dev/fd/{fd}");
-        let bytes = fs::read(&path).map_err(|err| format!("read --from-fd failed ({path}): {err}"))?;
+        let bytes =
+            fs::read(&path).map_err(|err| format!("read --from-fd failed ({path}): {err}"))?;
         (SecretSourceKind::Fd, path, "explicit:fd".to_string(), bytes)
     } else if input.from_stdin {
         let bytes = read_all_stdin()?;
@@ -2364,8 +2485,8 @@ fn read_secret_from_tty_prompt(prompt: &str) -> Result<Vec<u8>, String> {
     if !io::stdin().is_terminal() {
         return Err("tty prompt requested but stdin is not a tty".to_string());
     }
-    let line =
-        rpassword::prompt_password(prompt).map_err(|err| format!("read tty prompt input failed: {err}"))?;
+    let line = rpassword::prompt_password(prompt)
+        .map_err(|err| format!("read tty prompt input failed: {err}"))?;
     Ok(trim_single_trailing_newline(line).into_bytes())
 }
 
@@ -2396,10 +2517,9 @@ fn startup_unlock_secret_for_mode(
     }
     match host_mode {
         CoreHostMode::StandaloneRun => {
-            let secret = String::from_utf8(read_secret_from_tty_prompt(
-                "Enter vault passphrase: ",
-            )?)
-            .map_err(|_| "startup unlock secret must be valid UTF-8".to_string())?;
+            let secret =
+                String::from_utf8(read_secret_from_tty_prompt("Enter vault passphrase: ")?)
+                    .map_err(|_| "startup unlock secret must be valid UTF-8".to_string())?;
             let _carrier = StartupUnlockCarrierKind::HiddenPrompt;
             Ok(Some(secret))
         }
@@ -2570,7 +2690,10 @@ fn build_usage_text(catalog: &Catalog, use_style: bool) -> String {
     lines.push(format!("  {}", catalog.t("cli.help.usage.run")));
     lines.push(format!("  {}", catalog.t("cli.help.usage.detached")));
     lines.push(format!("  {}", catalog.t("cli.help.usage.ui_managed")));
-    lines.push(format!("  {}", catalog.t("cli.help.usage.ui_managed_config")));
+    lines.push(format!(
+        "  {}",
+        catalog.t("cli.help.usage.ui_managed_config")
+    ));
     lines.push(format!("  {}", catalog.t("cli.help.usage.vault_init")));
     lines.push(format!("  {}", catalog.t("cli.help.usage.vault_import")));
     lines.push(format!("  {}", catalog.t("cli.help.usage.vault_unlock")));
@@ -2633,7 +2756,9 @@ fn validate_core_version_format(version: &str) -> Result<(), String> {
         return Err("YYMM segment cannot start with 0 in Cargo semver".to_string());
     }
     if dd.is_empty() || dd.len() > 2 || !dd.chars().all(|c| c.is_ascii_digit()) {
-        return Err("DD segment must be 1-2 digits (Cargo semver disallows leading zero)".to_string());
+        return Err(
+            "DD segment must be 1-2 digits (Cargo semver disallows leading zero)".to_string(),
+        );
     }
     if dd.len() > 1 && dd.starts_with('0') {
         return Err("DD segment cannot have a leading zero in Cargo semver".to_string());
@@ -3063,6 +3188,14 @@ mod tests {
         parse_args_from(args).expect("parse")
     }
 
+    fn normalize_path_for_assert(value: &str) -> String {
+        let mut normalized = value.replace('\\', "/");
+        while normalized.contains("//") {
+            normalized = normalized.replace("//", "/");
+        }
+        normalized
+    }
+
     #[test]
     fn parses_default_as_standalone_run() {
         assert_eq!(parse(&[]), LaunchMode::StandaloneRun);
@@ -3245,7 +3378,10 @@ mod tests {
         let settings = CoreSettings::load_from_file(&config_path).expect("parse config");
         assert_eq!(settings.model_plane.http.host, "127.0.0.1");
         assert_eq!(settings.model_plane.http.port, 19718);
-        assert_eq!(settings.core.data_dir, root.to_string_lossy().to_string());
+        assert_eq!(
+            normalize_path_for_assert(&settings.core.data_dir),
+            normalize_path_for_assert(root.to_string_lossy().as_ref())
+        );
     }
 
     #[test]
@@ -3268,7 +3404,10 @@ mod tests {
         assert_eq!(resolved, config_path);
         assert!(resolved.exists());
         let settings = CoreSettings::load_from_file(&resolved).expect("parse config");
-        assert_eq!(settings.core.data_dir, root.to_string_lossy().to_string());
+        assert_eq!(
+            normalize_path_for_assert(&settings.core.data_dir),
+            normalize_path_for_assert(root.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

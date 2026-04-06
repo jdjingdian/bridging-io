@@ -26,7 +26,10 @@ impl RuntimeRootValidationError {
     pub fn recovery_actions(&self) -> Vec<RuntimeRecoveryAction> {
         match self {
             RuntimeRootValidationError::MissingPath | RuntimeRootValidationError::NotDirectory => {
-                vec![RuntimeRecoveryAction::ChooseRuntimeRoot, RuntimeRecoveryAction::Retry]
+                vec![
+                    RuntimeRecoveryAction::ChooseRuntimeRoot,
+                    RuntimeRecoveryAction::Retry,
+                ]
             }
             RuntimeRootValidationError::NotWritable => vec![
                 RuntimeRecoveryAction::FixPermissions,

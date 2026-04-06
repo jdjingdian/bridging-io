@@ -1,0 +1,54 @@
+version = 1
+
+[preflight]
+mode = "compile-only"
+runs_dir = "tmp/local-preflight-runs"
+cleanup_remote_on_success = true
+exclude = [
+  ".git/**",
+  "**/target/**",
+  "tmp/local-preflight-runs/**",
+  "tmp/local-preflight.toml",
+]
+
+[linux]
+enabled = false
+host = "192.168.56.10"
+port = 22
+user = "dev"
+# optional
+# identity_file = "~/.ssh/id_ed25519"
+# password = "local-dev-password"
+# remote_base = "/home/dev/bridgingio-local-preflight"
+
+[linux.commands]
+compile-only = "cargo test --workspace --no-run"
+unit = "cargo test --workspace -- --test-threads=1"
+extended = "cargo test --workspace -- --test-threads=1"
+
+[windows]
+enabled = false
+host = "192.168.56.20"
+port = 22
+user = "dev"
+# optional
+# identity_file = "~/.ssh/id_ed25519"
+# password = "local-dev-password"
+# remote_base = "C:\\Users\\dev\\bridgingio-local-preflight"
+# Note:
+# auth priority: identity_file > password > interactive SSH/SCP prompt.
+# keep real password only in your local gitignored config.
+
+[windows.commands]
+compile-only = "cargo test --workspace --no-run"
+unit = "cargo test --workspace -- --test-threads=1"
+extended = "cargo test --workspace -- --test-threads=1"
+
+[windows.contracts]
+enabled = true
+modes = ["compile-only", "extended"]
+command = "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ..\\..\\scripts\\testing\\run-windows-ssh-broker-contract.ps1"
+
+[windows.git_bash]
+enabled = false
+extra_check = "cargo test --workspace --no-run"

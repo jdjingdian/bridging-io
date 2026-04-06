@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::fs::File;
 use std::io::{Read, Write};
 #[cfg(unix)]

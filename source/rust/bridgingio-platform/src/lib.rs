@@ -500,9 +500,18 @@ impl LocalAuthorizationRecorder {
             .append(true)
             .create(true)
             .open(&path)
-            .map_err(|err| format!("open local authorization log failed: {} ({err})", path.display()))?;
-        writeln!(file, "{line}")
-            .map_err(|err| format!("append local authorization log failed: {} ({err})", path.display()))?;
+            .map_err(|err| {
+                format!(
+                    "open local authorization log failed: {} ({err})",
+                    path.display()
+                )
+            })?;
+        writeln!(file, "{line}").map_err(|err| {
+            format!(
+                "append local authorization log failed: {} ({err})",
+                path.display()
+            )
+        })?;
         Ok(())
     }
 

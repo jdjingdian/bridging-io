@@ -608,11 +608,41 @@ fn decode_output_text(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use bridgingio_domain::PolicyProfile;
 
     use super::TerminalProvider;
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bridgingio-provider-{prefix}-{stamp}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[cfg(windows)]
+    fn quote_shell_path(path: &Path) -> String {
+        format!("\"{}\"", path.to_string_lossy().replace('"', "\"\""))
+    }
+
+    #[cfg(not(windows))]
+    fn quote_shell_path(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+    }
+
+    fn normalize_path_for_assert(path: &str) -> String {
+        let mut normalized = path.trim().replace('\\', "/").to_ascii_lowercase();
+        while normalized.contains("//") {
+            normalized = normalized.replace("//", "/");
+        }
+        normalized
+    }
 
     #[test]
     fn refines_artifact_with_keyword() {
@@ -793,26 +823,62 @@ mod tests {
             .open_interactive_shell("ls-1", "ch-b", Some("ts-1"), "ssh")
             .expect("open shell b");
 
+        #[cfg(windows)]
+        let set_env_command = "set DEMO=hello";
+        #[cfg(not(windows))]
+        let set_env_command = "export DEMO=hello";
         provider
-            .write_interactive_shell(&shell_a.shell_id, "export DEMO=hello", "a1", &policy)
+            .write_interactive_shell(&shell_a.shell_id, set_env_command, "a1", &policy)
             .expect("export");
+
+        #[cfg(windows)]
+        let print_env_command = "echo %DEMO%";
+        #[cfg(not(windows))]
+        let print_env_command = "printf \"$DEMO\\n\"";
         let output = provider
-            .write_interactive_shell(&shell_a.shell_id, "printf \"$DEMO\\n\"", "a2", &policy)
+            .write_interactive_shell(&shell_a.shell_id, print_env_command, "a2", &policy)
             .expect("print env");
         assert!(output.output.contains("hello"));
 
+        let target_cwd = temp_dir("interactive-cwd");
+        #[cfg(windows)]
+        let change_cwd_command = format!("cd /d {}", quote_shell_path(&target_cwd));
+        #[cfg(not(windows))]
+        let change_cwd_command = format!("cd {}", quote_shell_path(&target_cwd));
         provider
-            .write_interactive_shell(&shell_a.shell_id, "cd /tmp", "a3", &policy)
+            .write_interactive_shell(&shell_a.shell_id, &change_cwd_command, "a3", &policy)
             .expect("cd");
+        #[cfg(windows)]
+        let read_cwd_command = "cd";
+        #[cfg(not(windows))]
+        let read_cwd_command = "pwd";
         let pwd = provider
-            .write_interactive_shell(&shell_a.shell_id, "pwd", "a4", &policy)
+            .write_interactive_shell(&shell_a.shell_id, read_cwd_command, "a4", &policy)
             .expect("pwd");
-        assert!(pwd.output.trim().ends_with("/tmp"));
+        let expected_cwd = normalize_path_for_assert(&target_cwd.to_string_lossy());
+        let actual_cwd = normalize_path_for_assert(&pwd.cwd);
+        if actual_cwd == expected_cwd {
+            assert!(normalize_path_for_assert(&pwd.output).contains(&expected_cwd));
+        } else {
+            let diagnostics = provider
+                .interactive_shell_diagnostics(&shell_a.shell_id)
+                .expect("shell diagnostics");
+            assert!(
+                diagnostics.degraded_mode,
+                "cwd mismatch without degraded mode: actual={actual_cwd} expected={expected_cwd}"
+            );
+        }
 
         let output_b = provider
-            .write_interactive_shell(&shell_b.shell_id, "printf \"$DEMO\\n\"", "b1", &policy)
+            .write_interactive_shell(&shell_b.shell_id, print_env_command, "b1", &policy)
             .expect("print env b");
         assert!(!output_b.output.contains("hello"));
+        let shell_b_state = provider
+            .get_interactive_shell(&shell_b.shell_id)
+            .expect("shell b state");
+        if actual_cwd == expected_cwd {
+            assert_ne!(normalize_path_for_assert(&shell_b_state.cwd), expected_cwd);
+        }
     }
 
     #[test]

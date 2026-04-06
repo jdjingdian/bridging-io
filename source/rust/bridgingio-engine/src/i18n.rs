@@ -79,14 +79,8 @@ pub fn validate_catalog_key_parity() -> Result<(), String> {
     let en_keys = en.keys().cloned().collect::<BTreeSet<_>>();
     let zh_keys = zh.keys().cloned().collect::<BTreeSet<_>>();
 
-    let missing_in_zh = en_keys
-        .difference(&zh_keys)
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_in_en = zh_keys
-        .difference(&en_keys)
-        .cloned()
-        .collect::<Vec<_>>();
+    let missing_in_zh = en_keys.difference(&zh_keys).cloned().collect::<Vec<_>>();
+    let missing_in_en = zh_keys.difference(&en_keys).cloned().collect::<Vec<_>>();
 
     if missing_in_zh.is_empty() && missing_in_en.is_empty() {
         return Ok(());

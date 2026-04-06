@@ -491,7 +491,7 @@ BridgingIO 的 `menuconfig` 操作面必须尽量对齐 Linux kernel `menuconfig
 - **并且** 若日志涉及 SSH key 或 token，只允许记录 canonical `credential_ref`、稳定 `token_id`、label、field path 或等价 display-safe 标识
 
 ### 需求:`menuconfig` 的 SSH target 管理页必须提供真实测试连接流程
-对于 `kind = ssh` 的 target，`bridgingio-core menuconfig` 必须提供正式的 `Test Connection --->` 入口，用于对当前草稿连接配置执行一次真实 SSH 连通性探测。系统不得把该动作退化为字段完整性校验，也不得要求操作员先 `Apply Target --->` 或 `Save` 才能测试。
+对于 `kind = ssh` 的 target，`bridgingio-core menuconfig` 必须提供正式的 `Test Connection --->` 入口，用于对当前草稿连接配置执行一次真实 SSH 连通性探测。系统不得把该动作退化为字段完整性校验，也不得要求操作员先 `Apply Target --->` 或 `Save` 才能测试。对于 vault-managed SSH key，该流程必须只在 broker runtime 已真实就绪时才把 endpoint 下发给 SSH；对于 direct identity 文件，该流程必须显式走 identity-file 语义，而不是错误依赖 broker。
 
 #### 场景:plain SSH 在 Connection Profile 中直接测试当前草稿
 - **当** 操作员进入一个 plain SSH target 的 `Connection Profile`
@@ -521,10 +521,20 @@ BridgingIO 的 `menuconfig` 操作面必须尽量对齐 Linux kernel `menuconfig
 - **并且** 系统不得因此隐式触发 `Unlock Vault` 或把该 plain target 改判为 sealed target
 
 #### 场景:broker endpoint 未就绪时必须返回专属失败
-- **当** 当前 SSH 测试连接依赖 broker delivery，且解析出的 `IdentityAgent` endpoint 未配置、缺失或不可访问
+- **当** 当前 SSH 测试连接依赖 broker delivery，且 broker runtime 未能把解析出的本地 endpoint 真正启动到 ready
 - **那么** 系统必须返回 broker 专属的受控失败（例如 `broker-endpoint-unavailable`）
 - **并且** 结果反馈必须明确提示失败点位于 broker endpoint 就绪性，而不是泛化为普通认证失败
 - **并且** 系统不得通过 fallback 私钥路径掩盖该 broker 故障
+
+#### 场景:agent 已返回身份时不得误报 broker 未就绪
+- **当** SSH 测试日志已显示 `agent returned` / `Offering public key ... agent`，但认证最终被远端拒绝（例如 `Permission denied (publickey)`）
+- **那么** 系统必须将结果归类为认证失败（如 `auth-publickey-rejected`）而非 `broker-endpoint-unready`
+- **并且** 错误分类不得因为同一 stderr 中出现无关的 `no such identity` 文本而错误提升为 broker 异常
+
+#### 场景:direct identity 文件测试必须显式旁路 broker
+- **当** 当前 SSH 测试连接的 `credential_ref` 直接指向本地 identity 文件，而不是 canonical vault ref
+- **那么** 系统必须通过显式 `-i <path>`、`IdentityFile=<path>` 或等价 direct identity 语义执行该次探测
+- **并且** 系统不得创建 broker session 或展示 broker unavailable 结果，除非该次探测真实使用了 broker 路径
 
 ### 需求:`menuconfig` 的 SSH 测试连接必须只显示简洁结果并保留 display-safe 日志
 `menuconfig` 的 SSH 测试连接流程在界面上必须只显示简洁结果摘要，而更详细的执行诊断必须以 display-safe 方式写入 menuconfig 日志。系统不得在结果弹窗、状态栏或普通列表行中回显 raw SSH 错误输出或 secret material。
@@ -549,3 +559,4 @@ BridgingIO 的 `menuconfig` 操作面必须尽量对齐 Linux kernel `menuconfig
 - **当** SSH 测试连接因 broker endpoint 未就绪而失败
 - **那么** `menuconfig-session` 日志必须记录可关联 `flow_id` 的 display-safe 诊断节点
 - **并且** 该节点至少包含 broker 失败分类与 endpoint 就绪性检查结果摘要
+

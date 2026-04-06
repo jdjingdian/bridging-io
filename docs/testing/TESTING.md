@@ -67,6 +67,29 @@ Tauri shell host smoke verification:
 scripts/testing/run-tauri-shell-smoke.sh
 ```
 
+Optional local cross-platform preflight (developer helper, not gate):
+
+```bash
+python3 scripts/testing/run-local-cross-platform-preflight.py
+```
+
+Windows named-pipe runtime contract coverage via preflight (default contract
+modes include `compile-only` and `extended`; explicit `extended` example):
+
+```bash
+python3 scripts/testing/run-local-cross-platform-preflight.py --target windows --mode extended
+```
+
+Windows broker contract probe script (run on a Windows host):
+
+```powershell
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/testing/run-windows-ssh-broker-contract.ps1
+```
+
+Details:
+
+- `docs/testing/LOCAL_CROSS_PLATFORM_PREFLIGHT.md`
+
 ## Core Platform Contract
 
 Cross-platform core verification must follow:

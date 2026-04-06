@@ -90,9 +90,7 @@ impl CommonErrorCode {
             "not_found" | "notfound" => Some(Self::NotFound),
             "permission_denied" | "permissiondenied" => Some(Self::PermissionDenied),
             "validation_failed" | "validationfailed" => Some(Self::ValidationFailed),
-            "dependency_unavailable" | "dependencyunavailable" => {
-                Some(Self::DependencyUnavailable)
-            }
+            "dependency_unavailable" | "dependencyunavailable" => Some(Self::DependencyUnavailable),
             "internal" => Some(Self::Internal),
             "method_not_implemented" | "methodnotimplemented" => Some(Self::MethodNotImplemented),
             "not_ready" | "notready" => Some(Self::NotReady),

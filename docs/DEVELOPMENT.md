@@ -46,6 +46,7 @@ Terminal provider runtime notes:
 Cross-platform architecture references:
 
 - core platform contract: `docs/testing/CORE_PLATFORM_CONTRACT.md`
+- optional local cross-platform preflight helper: `docs/testing/LOCAL_CROSS_PLATFORM_PREFLIGHT.md`
 - self-test / contract matrix: `docs/matrix/SELF_TEST_CASE_MATRIX.md`
 - local operator interface matrix: `docs/matrix/LOCAL_OPERATOR_INTERFACE_MATRIX.md`
 - runtime root layout contract: `docs/runtime/RUNTIME_ROOT_LAYOUT.md`
@@ -139,6 +140,12 @@ Tauri shell startup smoke:
 
 ```bash
 scripts/testing/run-tauri-shell-smoke.sh
+```
+
+Optional local cross-platform compile-first preflight:
+
+```bash
+python3 scripts/testing/run-local-cross-platform-preflight.py
 ```
 
 ## Tauri Shell Host Layout

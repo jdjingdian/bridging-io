@@ -3,9 +3,8 @@ use std::time::SystemTime;
 use bridgingio_domain::{
     ApprovalRequestRecord, ArtifactRecord, CommonErrorCode, ConnectionConfig, ContractStatus,
     CredentialRef, ErrorDomain, PolicyProfile, SessionRecord, SessionReusePolicy, SharedError,
-    TargetKind, TargetProfile,
-    TARGET_TERMINAL_CONCURRENCY_METADATA_KEY, TARGET_TERMINAL_FAMILY_METADATA_KEY,
-    TARGET_TERMINAL_SHELL_METADATA_KEY,
+    TargetKind, TargetProfile, TARGET_TERMINAL_CONCURRENCY_METADATA_KEY,
+    TARGET_TERMINAL_FAMILY_METADATA_KEY, TARGET_TERMINAL_SHELL_METADATA_KEY,
 };
 
 const TARGET_STORAGE_CLASS_METADATA_KEY: &str = "target.storage_class";
@@ -819,10 +818,7 @@ impl AppApiLineCodec {
                 }
                 if let Some(storage_class) = profile.metadata.get(TARGET_STORAGE_CLASS_METADATA_KEY)
                 {
-                    base.push_str(&format!(
-                        "|target_storage_class={}",
-                        escape(storage_class)
-                    ));
+                    base.push_str(&format!("|target_storage_class={}", escape(storage_class)));
                 }
                 if let Some(access_class) = profile.metadata.get(TARGET_ACCESS_CLASS_METADATA_KEY) {
                     base.push_str(&format!("|target_access_class={}", escape(access_class)));
@@ -1981,7 +1977,10 @@ fn append_vault_state_fields(line: &mut String, state: &VaultStateProjectionView
         "|configured_backend={}",
         escape(&state.configured_backend)
     ));
-    line.push_str(&format!("|active_backend={}", escape(&state.active_backend)));
+    line.push_str(&format!(
+        "|active_backend={}",
+        escape(&state.active_backend)
+    ));
     line.push_str(&format!(
         "|protector_primary={}",
         escape(&state.protector_summary.primary)
@@ -2004,7 +2003,9 @@ fn append_vault_state_fields(line: &mut String, state: &VaultStateProjectionView
     ));
     line.push_str(&format!(
         "|unlock_allowed_methods={}",
-        escape(&encode_string_list(&state.unlock_policy_summary.allowed_methods))
+        escape(&encode_string_list(
+            &state.unlock_policy_summary.allowed_methods
+        ))
     ));
     line.push_str(&format!(
         "|unlock_preferred_method={}",
@@ -2016,9 +2017,7 @@ fn append_vault_state_fields(line: &mut String, state: &VaultStateProjectionView
     ));
     line.push_str(&format!(
         "|unlock_require_fresh_user_verification={}",
-        state
-            .unlock_policy_summary
-            .require_fresh_user_verification
+        state.unlock_policy_summary.require_fresh_user_verification
     ));
     line.push_str(&format!("|secret_count={}", state.secrets.len()));
     for (index, secret) in state.secrets.iter().enumerate() {
@@ -2028,7 +2027,10 @@ fn append_vault_state_fields(line: &mut String, state: &VaultStateProjectionView
         ));
         line.push_str(&format!("|secret_{index}_kind={}", escape(&secret.kind)));
         line.push_str(&format!("|secret_{index}_label={}", escape(&secret.label)));
-        line.push_str(&format!("|secret_{index}_status={}", escape(&secret.status)));
+        line.push_str(&format!(
+            "|secret_{index}_status={}",
+            escape(&secret.status)
+        ));
         if let Some(value) = secret.active_version_id.as_ref() {
             line.push_str(&format!(
                 "|secret_{index}_active_version_id={}",
@@ -2067,15 +2069,9 @@ fn parse_vault_state_from_fields(
         protector_summary: VaultProtectorSummaryView {
             primary: unescape(required(map, "protector_primary")?),
             recovery: parse_string_list(
-                optional(map, "protector_recovery")
-                    .map(unescape)
-                    .as_deref(),
+                optional(map, "protector_recovery").map(unescape).as_deref(),
             ),
-            retired: parse_string_list(
-                optional(map, "protector_retired")
-                    .map(unescape)
-                    .as_deref(),
-            ),
+            retired: parse_string_list(optional(map, "protector_retired").map(unescape).as_deref()),
             fail_closed: required(map, "protector_fail_closed")?
                 .parse::<bool>()
                 .map_err(|_| invalid_request("protector_fail_closed must be bool"))?,
@@ -2096,9 +2092,7 @@ fn parse_vault_state_from_fields(
                 "unlock_require_fresh_user_verification",
             )?
             .parse::<bool>()
-            .map_err(|_| {
-                invalid_request("unlock_require_fresh_user_verification must be bool")
-            })?,
+            .map_err(|_| invalid_request("unlock_require_fresh_user_verification must be bool"))?,
         },
         secrets,
     })
@@ -2198,7 +2192,10 @@ fn parse_profile_from_fields(
     if let Some(sealed_profile_ref) = optional(map, "target_sealed_profile_ref").map(unescape) {
         let normalized = sealed_profile_ref.trim().to_string();
         if !normalized.is_empty() {
-            metadata.insert(TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(), normalized);
+            metadata.insert(
+                TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(),
+                normalized,
+            );
         }
     }
 
@@ -2300,10 +2297,10 @@ mod tests {
         AgentTokenScopeView, AgentTokenSummaryView, ApiError, ApiRequest, ApiRequestContext,
         ApiResponse, AppApiLineCodec, AppCommand, ArtifactCacheSettingsView, ControlPlaneView,
         CoreSettingsView, CreateAgentTokenResult, LocalAdminActionIntentView,
-        LocalAdminAttestationView, ModelPlaneHttpView, RuntimeLogSettingsView, VaultStatusView,
-        TARGET_ACCESS_CLASS_METADATA_KEY, TARGET_SEALED_PROFILE_REF_METADATA_KEY,
-        TARGET_STORAGE_CLASS_METADATA_KEY, VaultProtectorSummaryView, VaultSecretSummaryView,
-        VaultStateProjectionView, VaultUnlockPolicySummaryView,
+        LocalAdminAttestationView, ModelPlaneHttpView, RuntimeLogSettingsView,
+        VaultProtectorSummaryView, VaultSecretSummaryView, VaultStateProjectionView,
+        VaultStatusView, VaultUnlockPolicySummaryView, TARGET_ACCESS_CLASS_METADATA_KEY,
+        TARGET_SEALED_PROFILE_REF_METADATA_KEY, TARGET_STORAGE_CLASS_METADATA_KEY,
     };
 
     #[test]
@@ -2824,12 +2821,11 @@ mod tests {
             consumed_at: None,
             status: "active".into(),
         };
-        let attestation_line = AppApiLineCodec::encode_response_line(
-            &ApiResponse::LocalAdminAttestationCompleted {
+        let attestation_line =
+            AppApiLineCodec::encode_response_line(&ApiResponse::LocalAdminAttestationCompleted {
                 request_id: "req-intent-complete".into(),
                 attestation: attestation.clone(),
-            },
-        );
+            });
         let attestation_parsed = AppApiLineCodec::decode_response_line(&attestation_line)
             .expect("decode attestation response");
         match attestation_parsed {

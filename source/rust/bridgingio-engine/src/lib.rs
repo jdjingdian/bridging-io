@@ -7,9 +7,9 @@ use std::time::SystemTime;
 use bridgingio_domain::{
     build_logical_session_key, AccessScope, ApprovalRequestRecord, ArtifactRecord, AuditEvent,
     ChannelKind, ChannelRecord, ChannelStatus, CommonErrorCode, ContractStatus,
-    EnvironmentFingerprint, ErrorDomain, LogicalSessionRecord, LogicalSessionStatus,
-    SessionRecord, SessionReusePolicy, SharedError, TargetKind, TargetProfile,
-    TerminalConcurrencyPolicy, TerminalTargetFamily, TransportSessionRecord, TransportSessionStatus,
+    EnvironmentFingerprint, ErrorDomain, LogicalSessionRecord, LogicalSessionStatus, SessionRecord,
+    SessionReusePolicy, SharedError, TargetKind, TargetProfile, TerminalConcurrencyPolicy,
+    TerminalTargetFamily, TransportSessionRecord, TransportSessionStatus,
 };
 
 pub mod i18n;
@@ -626,8 +626,7 @@ impl ConfigError {
                 CommonErrorCode::NotReady,
                 "config.non_loopback_explicit_enable_required".to_string(),
                 format!("non-loopback model-plane host `{host}` requires explicit enable"),
-                "set allow_non_loopback explicitly before exposing the model-plane"
-                    .to_string(),
+                "set allow_non_loopback explicitly before exposing the model-plane".to_string(),
             ),
             Self::NonLoopbackAuthRequired(host) => (
                 CommonErrorCode::NotReady,
@@ -890,7 +889,9 @@ impl CoreSettings {
                 },
                 Section::VaultUnlock => match key {
                     "trigger_policy" => vault.unlock.trigger_policy = parse_string(key, value)?,
-                    "allowed_methods" => vault.unlock.allowed_methods = parse_string_array(key, value)?,
+                    "allowed_methods" => {
+                        vault.unlock.allowed_methods = parse_string_array(key, value)?
+                    }
                     "preferred_method" => vault.unlock.preferred_method = parse_string(key, value)?,
                     "cache_ttl_sec" => vault.unlock.cache_ttl_sec = parse_u64(key, value)?,
                     "require_fresh_user_verification" => {
@@ -1201,7 +1202,10 @@ impl CoreSettings {
             }
         }
         match self.vault.unlock.trigger_policy.as_str() {
-            "on-core-start" | "on-first-secret-access" | "on-every-secret-access" | "manual-only" => {}
+            "on-core-start"
+            | "on-first-secret-access"
+            | "on-every-secret-access"
+            | "manual-only" => {}
             other => {
                 return Err(ConfigError::InvalidValue {
                     field: "vault.unlock.trigger_policy".into(),
@@ -1231,7 +1235,9 @@ impl CoreSettings {
             return Err(ConfigError::MissingField("vault.ssh.delivery_mode"));
         }
         if self.vault.ssh.fallback_delivery_mode.trim().is_empty() {
-            return Err(ConfigError::MissingField("vault.ssh.fallback_delivery_mode"));
+            return Err(ConfigError::MissingField(
+                "vault.ssh.fallback_delivery_mode",
+            ));
         }
 
         let host = self.model_plane.http.host.trim();
@@ -1304,8 +1310,7 @@ impl CoreSettings {
                 if sealed_profile_ref.trim().is_empty() {
                     return Err(ConfigError::InvalidValue {
                         field: "targets[].sealed_profile_ref".into(),
-                        reason: "sealed_profile_ref must be non-empty for sealed target"
-                            .into(),
+                        reason: "sealed_profile_ref must be non-empty for sealed target".into(),
                     });
                 }
                 if target.access_class == "anonymous-local" {
@@ -1542,13 +1547,13 @@ impl CoreSettings {
             ),
             String::new(),
             "[vault.protectors.primary]".to_string(),
-            format!(
-                "kind = {}",
-                toml_quote(&self.vault.protectors.primary.kind)
-            ),
+            format!("kind = {}", toml_quote(&self.vault.protectors.primary.kind)),
             String::new(),
             "[vault.ssh]".to_string(),
-            format!("delivery_mode = {}", toml_quote(&self.vault.ssh.delivery_mode)),
+            format!(
+                "delivery_mode = {}",
+                toml_quote(&self.vault.ssh.delivery_mode)
+            ),
             format!(
                 "fallback_delivery_mode = {}",
                 toml_quote(&self.vault.ssh.fallback_delivery_mode)
@@ -1795,10 +1800,14 @@ impl SshProbeToolchainSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrepareSshProbeError {
-    UnsupportedTargetKind { kind: TargetKind },
+    UnsupportedTargetKind {
+        kind: TargetKind,
+    },
     MissingHost,
     MissingUsername,
-    InvalidCredentialRef { reason: String },
+    InvalidCredentialRef {
+        reason: String,
+    },
     ToolchainUnavailable {
         target_override: Option<String>,
         global_override: Option<String>,
@@ -2833,10 +2842,13 @@ mod config_tests {
 
     #[test]
     fn rejects_unsupported_core_operator_locale() {
-        let invalid =
-            CoreSettings::minimal_example().replace("operator_locale = \"en-US\"", "operator_locale = \"ja-JP\"");
-        let err = CoreSettings::from_toml_str(&invalid).expect_err("must reject unsupported locale");
-        assert!(matches!(err, ConfigError::InvalidValue { field, .. } if field == "core.operator_locale"));
+        let invalid = CoreSettings::minimal_example()
+            .replace("operator_locale = \"en-US\"", "operator_locale = \"ja-JP\"");
+        let err =
+            CoreSettings::from_toml_str(&invalid).expect_err("must reject unsupported locale");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "core.operator_locale")
+        );
     }
 
     #[test]

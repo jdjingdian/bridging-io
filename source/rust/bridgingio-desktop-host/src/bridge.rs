@@ -260,9 +260,7 @@ fn response_kind(response: &ApiResponse) -> String {
         ApiResponse::AgentTokenDeleted { .. } => "agent_token_deleted",
         ApiResponse::AgentTokenLabelUpdated { .. } => "agent_token_label_updated",
         ApiResponse::LocalAdminIntentCreated { .. } => "local_admin_intent_created",
-        ApiResponse::LocalAdminAttestationCompleted { .. } => {
-            "local_admin_attestation_completed"
-        }
+        ApiResponse::LocalAdminAttestationCompleted { .. } => "local_admin_attestation_completed",
         ApiResponse::VaultState { .. } => "vault_state",
         ApiResponse::VaultInitialized { .. } => "vault_initialized",
         ApiResponse::VaultDeleted { .. } => "vault_deleted",
