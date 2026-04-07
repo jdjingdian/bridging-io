@@ -118,11 +118,42 @@ impl Screen {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MenuEntry {
+    template: RowTemplate,
     label: String,
     value: Option<String>,
     description: String,
     dirty_key: Option<String>,
     kind: MenuEntryKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowTemplate {
+    InfoRow,
+    FixedEnabledRow,
+    RequiredReadonlyRow,
+    FieldEntryRow,
+    ActionRow,
+    BooleanToggleRow,
+    MultiSelectRow,
+    ExclusiveChoiceRow,
+    ExclusiveChoiceEntryRow,
+    BlockedActionRow,
+    StatusEntryCompat,
+}
+
+impl RowTemplate {
+    fn is_focusable(self) -> bool {
+        matches!(
+            self,
+            RowTemplate::FieldEntryRow
+                | RowTemplate::ActionRow
+                | RowTemplate::BooleanToggleRow
+                | RowTemplate::MultiSelectRow
+                | RowTemplate::ExclusiveChoiceRow
+                | RowTemplate::ExclusiveChoiceEntryRow
+                | RowTemplate::StatusEntryCompat
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,6 +213,37 @@ enum ActionKind {
 enum EditModeKind {
     Text,
     Choice,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PopupTemplate {
+    TextInputModal,
+    ChoiceListModal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TextInputPopupModel {
+    template: PopupTemplate,
+    area_percent_x: u16,
+    area_percent_y: u16,
+    title: String,
+    header: String,
+    hint: String,
+    input_prefix: String,
+    input_value: String,
+    cursor: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChoiceListPopupModel {
+    template: PopupTemplate,
+    area_percent_x: u16,
+    area_percent_y: u16,
+    title: String,
+    header: String,
+    hint: String,
+    options: Vec<String>,
+    selected: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -782,8 +844,8 @@ impl MenuConfigApp {
     }
 
     fn handle_edit_key(&mut self, code: KeyCode) -> Result<(), String> {
-        match self.edit_mode_kind {
-            EditModeKind::Text => match code {
+        match self.active_edit_popup_template() {
+            PopupTemplate::TextInputModal => match code {
                 KeyCode::Esc => self.cancel_edit("menu.status.edit_cancelled"),
                 KeyCode::Enter => {
                     if let Err(err) = self.commit_edit() {
@@ -797,7 +859,7 @@ impl MenuConfigApp {
                 KeyCode::Char(ch) => self.insert_text_char(ch),
                 _ => {}
             },
-            EditModeKind::Choice => match code {
+            PopupTemplate::ChoiceListModal => match code {
                 KeyCode::Esc => self.cancel_edit("menu.status.select_cancelled"),
                 KeyCode::Down | KeyCode::Char('j') => self.move_edit_option(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_edit_option(-1),
@@ -811,6 +873,13 @@ impl MenuConfigApp {
             },
         }
         Ok(())
+    }
+
+    fn active_edit_popup_template(&self) -> PopupTemplate {
+        match self.edit_mode_kind {
+            EditModeKind::Text => PopupTemplate::TextInputModal,
+            EditModeKind::Choice => PopupTemplate::ChoiceListModal,
+        }
     }
 
     fn handle_search_key(&mut self, code: KeyCode) {
@@ -847,6 +916,10 @@ impl MenuConfigApp {
         let Some(entry) = self.entries().into_iter().nth(self.selected) else {
             return Ok(());
         };
+        if !entry.template.is_focusable() {
+            self.last_status = entry.description;
+            return Ok(());
+        }
         match entry.kind {
             MenuEntryKind::Navigate(screen) => {
                 self.push_navigation_state();
@@ -861,11 +934,15 @@ impl MenuConfigApp {
                     self.tf("menu.status.opened_screen", &[("screen", &screen_title)]);
             }
             MenuEntryKind::EditField(field) => {
-                if is_boolean_toggle_field(&field) {
-                    self.last_status = self.t("menu.status.bool_toggle_space_only");
-                    return Ok(());
+                match entry.template {
+                    RowTemplate::FieldEntryRow => self.begin_edit(field)?,
+                    RowTemplate::BooleanToggleRow | RowTemplate::MultiSelectRow => {
+                        self.last_status = self.t("menu.status.bool_toggle_space_only");
+                    }
+                    _ => {
+                        self.last_status = entry.description;
+                    }
                 }
-                self.begin_edit(field)?;
             }
             MenuEntryKind::FocusField { screen, field } => {
                 self.push_navigation_state();
@@ -876,25 +953,33 @@ impl MenuConfigApp {
                 self.select_field(&field);
                 self.last_status = self.tf("menu.status.focused_field", &[("field", &field)]);
             }
-            MenuEntryKind::Action(ActionKind::ToggleTokenAccess(_)) => {
-                self.last_status = self.t("menu.status.token_access_space_only");
-            }
-            MenuEntryKind::Action(ActionKind::BindTargetCredentialRef { .. }) => {
-                self.last_status = self.t("menu.status.target_credential_picker_space_only");
-            }
-            MenuEntryKind::Action(ActionKind::ToggleTargetSshSecureAccess(_)) => {
-                self.last_status = self.t("menu.status.bool_toggle_space_only");
-            }
-            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(index)) => {
-                self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::None)?;
-            }
-            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(index)) => {
-                self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::Password)?;
-            }
-            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPrivateKey(index)) => {
-                self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::PrivateKey)?;
-            }
-            MenuEntryKind::Action(action) => self.run_action(action)?,
+            MenuEntryKind::Action(action) => match entry.template {
+                RowTemplate::BooleanToggleRow => {
+                    if matches!(action, ActionKind::ToggleTokenAccess(_)) {
+                        self.last_status = self.t("menu.status.token_access_space_only");
+                    } else {
+                        self.last_status = self.t("menu.status.bool_toggle_space_only");
+                    }
+                }
+                RowTemplate::ExclusiveChoiceRow | RowTemplate::ExclusiveChoiceEntryRow => {
+                    match action {
+                        ActionKind::BindTargetCredentialRef { .. } => {
+                            self.last_status = self.t("menu.status.target_credential_picker_space_only");
+                        }
+                        ActionKind::SelectTargetSshAuthNone(index) => {
+                            self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::None)?;
+                        }
+                        ActionKind::SelectTargetSshAuthPassword(index) => {
+                            self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::Password)?;
+                        }
+                        ActionKind::SelectTargetSshAuthPrivateKey(index) => {
+                            self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::PrivateKey)?;
+                        }
+                        _ => self.run_action(action)?,
+                    }
+                }
+                _ => self.run_action(action)?,
+            },
             MenuEntryKind::Info => {
                 self.last_status = entry.description;
             }
@@ -1353,7 +1438,10 @@ impl MenuConfigApp {
         };
         match entry.kind {
             MenuEntryKind::EditField(field) => {
-                if is_boolean_toggle_field(&field) {
+                if matches!(
+                    entry.template,
+                    RowTemplate::BooleanToggleRow | RowTemplate::MultiSelectRow
+                ) {
                     let current =
                         field_value(&self.settings, &field).unwrap_or_else(|| "false".into());
                     let parsed = current
@@ -1366,33 +1454,21 @@ impl MenuConfigApp {
                         "menu.status.toggle",
                         &[("field", &field), ("value", &toggled)],
                     );
-                } else if field_options(&field).is_some() {
+                } else if matches!(entry.template, RowTemplate::FieldEntryRow)
+                    && field_options(&field).is_some()
+                {
                     self.begin_edit(field)?;
                 }
             }
-            MenuEntryKind::Action(ActionKind::ToggleTokenAccess(token_id)) => {
-                self.run_action(ActionKind::ToggleTokenAccess(token_id))?;
-            }
-            MenuEntryKind::Action(ActionKind::BindTargetCredentialRef {
-                target_index,
-                credential_ref,
-            }) => {
-                self.run_action(ActionKind::BindTargetCredentialRef {
-                    target_index,
-                    credential_ref,
-                })?;
-            }
-            MenuEntryKind::Action(ActionKind::ToggleTargetSshSecureAccess(index)) => {
-                self.run_action(ActionKind::ToggleTargetSshSecureAccess(index))?;
-            }
-            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(index)) => {
-                self.run_action(ActionKind::SelectTargetSshAuthNone(index))?;
-            }
-            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(index)) => {
-                self.run_action(ActionKind::SelectTargetSshAuthPassword(index))?;
-            }
-            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPrivateKey(index)) => {
-                self.run_action(ActionKind::SelectTargetSshAuthPrivateKey(index))?;
+            MenuEntryKind::Action(action) => {
+                if matches!(
+                    entry.template,
+                    RowTemplate::BooleanToggleRow
+                        | RowTemplate::ExclusiveChoiceRow
+                        | RowTemplate::ExclusiveChoiceEntryRow
+                ) {
+                    self.run_action(action)?;
+                }
             }
             _ => {}
         }
@@ -4002,7 +4078,7 @@ fn menu_entry_style(state: MenuEntryVisualState, mode: SelectionHighlightMode) -
 }
 
 fn menu_entry_is_disabled(entry: &MenuEntry) -> bool {
-    matches!(entry.kind, MenuEntryKind::Info)
+    !entry.template.is_focusable()
 }
 
 fn menu_entry_visual_state(
@@ -4480,38 +4556,23 @@ fn render_ssh_test_flow_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
             timeout_input,
             cursor,
         } => {
-            let area = centered_rect(68, 34, frame.area());
-            frame.render_widget(Clear, area);
             let target_id = app
                 .settings
                 .targets
                 .get(*target_index)
                 .map(|target| target.id.clone())
                 .unwrap_or_else(|| "unknown-target".to_string());
-            let prefix = app.t("menu.ssh_test.timeout.input_prefix");
-            let popup = Paragraph::new(vec![
-                Line::from(app.tf(
-                    "menu.ssh_test.timeout.message",
-                    &[("target_id", &target_id)],
-                )),
-                Line::from(app.t("menu.ssh_test.timeout.hint")),
-                Line::from(""),
-                Line::from(format!("{prefix}{timeout_input}")),
-            ])
-            .block(
-                Block::default()
-                    .title(app.t("menu.ssh_test.timeout.title"))
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false });
-            frame.render_widget(popup, area);
-
-            let content_x = area.x.saturating_add(1);
-            let content_y = area.y.saturating_add(4);
-            let desired_offset = prefix.chars().count().saturating_add(*cursor);
-            let max_offset = area.width.saturating_sub(3) as usize;
-            let cursor_x = content_x.saturating_add(desired_offset.min(max_offset) as u16);
-            frame.set_cursor_position((cursor_x, content_y));
+            let popup = popup_text_input(
+                app.t("menu.ssh_test.timeout.title"),
+                app.tf("menu.ssh_test.timeout.message", &[("target_id", &target_id)]),
+                app.t("menu.ssh_test.timeout.hint"),
+                app.t("menu.ssh_test.timeout.input_prefix"),
+                timeout_input.clone(),
+                *cursor,
+                68,
+                34,
+            );
+            render_text_input_modal(frame, &popup);
         }
         SshTestFlowState::Waiting {
             cancel_requested, ..
@@ -4730,12 +4791,62 @@ fn render_popup_button_span(
 
 fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) -> String {
     let selector = menu_entry_selector(app, index, entry);
-    if is_security_unlocked_notice_entry(app, entry) {
-        return format!("{selector} -*- {}", entry.label);
-    }
-    match &entry.kind {
-        MenuEntryKind::Navigate(screen) => {
-            if let Screen::TargetEditor(target_index) = screen {
+    match entry.template {
+        RowTemplate::InfoRow => match entry.value.as_deref() {
+            Some(value) => format!("{selector} --- {} = {}", entry.label, value),
+            None => format!("{selector} --- {}", entry.label),
+        },
+        RowTemplate::FixedEnabledRow => format!("{selector} -*- {}", entry.label),
+        RowTemplate::RequiredReadonlyRow => match entry.value.as_deref() {
+            Some(value) => format!("{selector} --- {} = {}", entry.label, value),
+            None => format!("{selector} --- {}", entry.label),
+        },
+        RowTemplate::BlockedActionRow => match entry.value.as_deref() {
+            Some(reason) => format!("{selector} --- {} (blocked: {reason})", entry.label),
+            None => format!("{selector} --- {} (blocked)", entry.label),
+        },
+        RowTemplate::FieldEntryRow => {
+            if let Some(value) = entry.value.as_deref() {
+                format!("{selector}     {} ({value}) --->", entry.label)
+            } else {
+                format!("{selector}     {} --->", entry.label)
+            }
+        }
+        RowTemplate::ActionRow => format!("{selector}     {} --->", entry.label),
+        RowTemplate::BooleanToggleRow => {
+            let marker = if row_value_is_enabled(entry.value.as_deref()) {
+                "<*>"
+            } else {
+                "< >"
+            };
+            format!("{selector} {marker} {}", entry.label)
+        }
+        RowTemplate::MultiSelectRow => {
+            let marker = if row_value_is_enabled(entry.value.as_deref()) {
+                "[*]"
+            } else {
+                "[ ]"
+            };
+            format!("{selector} {marker} {}", entry.label)
+        }
+        RowTemplate::ExclusiveChoiceRow => {
+            let marker = if row_value_is_selected(entry.value.as_deref()) {
+                "<*>"
+            } else {
+                "< >"
+            };
+            format!("{selector} {marker} {}", entry.label)
+        }
+        RowTemplate::ExclusiveChoiceEntryRow => {
+            let marker = if row_value_is_selected(entry.value.as_deref()) {
+                "<*>"
+            } else {
+                "< >"
+            };
+            format!("{selector} {marker} {} --->", entry.label)
+        }
+        RowTemplate::StatusEntryCompat => {
+            if let MenuEntryKind::Navigate(Screen::TargetEditor(target_index)) = &entry.kind {
                 let enabled = app
                     .settings
                     .targets
@@ -4753,89 +4864,26 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
                 format!("{selector}     {} --->", entry.label)
             }
         }
-        MenuEntryKind::EditField(field) => {
-            if is_boolean_toggle_field(field) {
-                let enabled = field_value(&app.settings, field)
-                    .and_then(|value| value.parse::<bool>().ok())
-                    .unwrap_or(false);
-                let marker = if is_single_choice_toggle_field(field) {
-                    if enabled {
-                        "<*>"
-                    } else {
-                        "< >"
-                    }
-                } else if enabled {
-                    "[*]"
-                } else {
-                    "[ ]"
-                };
-                format!("{selector} {marker} {}", entry.label)
-            } else if let Some(value) = entry.value.as_deref() {
-                format!("{selector}     {} ({value}) --->", entry.label)
-            } else {
-                format!("{selector}     {} --->", entry.label)
-            }
-        }
-        MenuEntryKind::FocusField { field, .. } => {
-            if is_boolean_toggle_field(field) {
-                let enabled = field_value(&app.settings, field)
-                    .and_then(|value| value.parse::<bool>().ok())
-                    .unwrap_or(false);
-                let marker = if is_single_choice_toggle_field(field) {
-                    if enabled {
-                        "<*>"
-                    } else {
-                        "< >"
-                    }
-                } else if enabled {
-                    "[*]"
-                } else {
-                    "[ ]"
-                };
-                format!("{selector} {marker} {} --->", entry.label)
-            } else if let Some(value) = entry.value.as_deref() {
-                format!("{selector}     {} ({value}) --->", entry.label)
-            } else {
-                format!("{selector}     {} --->", entry.label)
-            }
-        }
-        MenuEntryKind::Info => match entry.value.as_deref() {
-            Some(value) => format!("{selector} --- {} = {}", entry.label, value),
-            None => format!("{selector} --- {}", entry.label),
-        },
-        MenuEntryKind::Action(action) => {
-            if matches!(action, ActionKind::ToggleTokenAccess(_)) {
-                let marker = match entry.value.as_deref() {
-                    Some("enabled") => "<*>",
-                    _ => "< >",
-                };
-                return format!("{selector} {marker} {}", entry.label);
-            }
-            if matches!(action, ActionKind::BindTargetCredentialRef { .. }) {
-                let marker = match entry.value.as_deref() {
-                    Some("selected") => "<*>",
-                    _ => "< >",
-                };
-                return format!("{selector} {marker} {}", entry.label);
-            }
-            if matches!(
-                action,
-                ActionKind::SelectTargetSshAuthNone(_)
-                    | ActionKind::SelectTargetSshAuthPassword(_)
-                    | ActionKind::SelectTargetSshAuthPrivateKey(_)
-            ) {
-                let marker = match entry.value.as_deref() {
-                    Some("selected") => "<*>",
-                    _ => "< >",
-                };
-                if matches!(action, ActionKind::SelectTargetSshAuthNone(_)) {
-                    return format!("{selector} {marker} {}", entry.label);
-                }
-                return format!("{selector} {marker} {} --->", entry.label);
-            }
-            format!("{selector}     {} --->", entry.label)
-        }
     }
+}
+
+fn row_value_is_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|item| item.trim().to_ascii_lowercase()),
+        Some(v)
+            if v == "true"
+                || v == "enabled"
+                || v == "on"
+                || v == "selected"
+                || v == "1"
+    )
+}
+
+fn row_value_is_selected(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|item| item.trim().to_ascii_lowercase()),
+        Some(v) if v == "selected" || v == "true" || v == "1"
+    )
 }
 
 fn format_menu_entry_styled_line(
@@ -4851,7 +4899,7 @@ fn format_menu_entry_styled_line(
             Span::styled(lock_state.clone(), lock_state_highlight_style(&lock_state)),
         ]);
     }
-    if is_security_unlocked_notice_entry(app, entry) {
+    if entry.template == RowTemplate::FixedEnabledRow {
         let selector = menu_entry_selector(app, index, entry);
         return Line::from(vec![
             Span::raw(format!("{selector} -*- ")),
@@ -4876,15 +4924,8 @@ fn menu_entry_selector(app: &MenuConfigApp, index: usize, entry: &MenuEntry) -> 
 
 fn is_security_lock_state_entry(app: &MenuConfigApp, entry: &MenuEntry) -> bool {
     matches!(app.screen, Screen::Security)
-        && matches!(entry.kind, MenuEntryKind::Info)
+        && entry.template == RowTemplate::InfoRow
         && entry.label == app.t("menu.security.lock_state")
-}
-
-fn is_security_unlocked_notice_entry(app: &MenuConfigApp, entry: &MenuEntry) -> bool {
-    matches!(app.screen, Screen::Security)
-        && matches!(entry.kind, MenuEntryKind::Info)
-        && entry.label == app.t("menu.security.unlocked_notice")
-        && entry.value.is_none()
 }
 
 fn target_screen_index(screen: &Screen) -> Option<usize> {
@@ -4928,82 +4969,146 @@ fn display_edit_field_label(app: &MenuConfigApp, field: &str) -> String {
     field.to_string()
 }
 
+fn popup_text_input(
+    title: String,
+    header: String,
+    hint: String,
+    input_prefix: String,
+    input_value: String,
+    cursor: usize,
+    area_percent_x: u16,
+    area_percent_y: u16,
+) -> TextInputPopupModel {
+    TextInputPopupModel {
+        template: PopupTemplate::TextInputModal,
+        area_percent_x,
+        area_percent_y,
+        title,
+        header,
+        hint,
+        input_prefix,
+        input_value,
+        cursor,
+    }
+}
+
+fn popup_choice_list(
+    title: String,
+    header: String,
+    hint: String,
+    options: Vec<String>,
+    selected: usize,
+    area_percent_x: u16,
+    area_percent_y: u16,
+) -> ChoiceListPopupModel {
+    ChoiceListPopupModel {
+        template: PopupTemplate::ChoiceListModal,
+        area_percent_x,
+        area_percent_y,
+        title,
+        header,
+        hint,
+        options,
+        selected,
+    }
+}
+
+fn render_text_input_modal(frame: &mut ratatui::Frame, popup: &TextInputPopupModel) {
+    debug_assert_eq!(popup.template, PopupTemplate::TextInputModal);
+    let area = centered_rect(popup.area_percent_x, popup.area_percent_y, frame.area());
+    frame.render_widget(Clear, area);
+    let paragraph = Paragraph::new(vec![
+        Line::from(popup.header.clone()),
+        Line::from(popup.hint.clone()),
+        Line::from(""),
+        Line::from(format!("{}{}", popup.input_prefix, popup.input_value)),
+    ])
+    .block(Block::default().title(popup.title.clone()).borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+
+    // Keep caret behavior shared by all text-input modal instances.
+    let content_x = area.x.saturating_add(1);
+    let content_y = area.y.saturating_add(4);
+    let desired_offset = popup.input_prefix.chars().count().saturating_add(popup.cursor);
+    let max_offset = area.width.saturating_sub(3) as usize;
+    let cursor_x = content_x.saturating_add(desired_offset.min(max_offset) as u16);
+    frame.set_cursor_position((cursor_x, content_y));
+}
+
+fn render_choice_list_modal(
+    frame: &mut ratatui::Frame,
+    popup: &ChoiceListPopupModel,
+    mode: SelectionHighlightMode,
+) {
+    debug_assert_eq!(popup.template, PopupTemplate::ChoiceListModal);
+    let area = centered_rect(popup.area_percent_x, popup.area_percent_y, frame.area());
+    frame.render_widget(Clear, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
+        .split(area);
+    let header = Paragraph::new(vec![
+        Line::from(popup.header.clone()),
+        Line::from(popup.hint.clone()),
+    ])
+    .block(Block::default().title(popup.title.clone()).borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(header, chunks[0]);
+
+    let items = popup
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let marker = if index == popup.selected { "*" } else { " " };
+            ListItem::new(render_choice_option_line(
+                option,
+                marker,
+                index == popup.selected,
+                mode,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items).block(Block::default().borders(Borders::ALL));
+    frame.render_widget(list, chunks[1]);
+}
+
 fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     let Some(field) = app.edit_field.as_deref() else {
         return;
     };
     let field_label = display_edit_field_label(app, field);
-    match app.edit_mode_kind {
-        EditModeKind::Text => {
-            let area = centered_rect(70, 28, frame.area());
-            frame.render_widget(Clear, area);
-            let input_prefix = app.t("menu.edit.input_prefix");
-            let display_value = if field == SSH_IMPORT_PASSPHRASE_FIELD {
+    match app.active_edit_popup_template() {
+        PopupTemplate::TextInputModal => {
+            let input_value = if field == SSH_IMPORT_PASSPHRASE_FIELD {
                 "•".repeat(app.edit_input.chars().count())
             } else {
                 app.edit_input.clone()
             };
-            let popup = Paragraph::new(vec![
-                Line::from(app.tf("menu.edit.field", &[("field", &field_label)])),
-                Line::from(app.t("menu.edit.hint")),
-                Line::from(""),
-                Line::from(format!("{input_prefix}{display_value}")),
-            ])
-            .block(
-                Block::default()
-                    .title(app.t("menu.edit.title"))
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false });
-            frame.render_widget(popup, area);
-
-            // Show the terminal caret at the end of input so operators can see the edit position.
-            let content_x = area.x.saturating_add(1);
-            let content_y = area.y.saturating_add(4);
-            let desired_offset = input_prefix.chars().count().saturating_add(app.edit_cursor);
-            let max_offset = area.width.saturating_sub(3) as usize;
-            let cursor_x = content_x.saturating_add(desired_offset.min(max_offset) as u16);
-            frame.set_cursor_position((cursor_x, content_y));
+            let popup = popup_text_input(
+                app.t("menu.edit.title"),
+                app.tf("menu.edit.field", &[("field", &field_label)]),
+                app.t("menu.edit.hint"),
+                app.t("menu.edit.input_prefix"),
+                input_value,
+                app.edit_cursor,
+                70,
+                28,
+            );
+            render_text_input_modal(frame, &popup);
         }
-        EditModeKind::Choice => {
-            let area = centered_rect(70, 55, frame.area());
-            frame.render_widget(Clear, area);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(4)])
-                .split(area);
-            let header = Paragraph::new(vec![
-                Line::from(app.tf("menu.choice.field", &[("field", &field_label)])),
-                Line::from(app.t("menu.choice.hint")),
-            ])
-            .block(
-                Block::default()
-                    .title(app.t("menu.choice.title"))
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false });
-            frame.render_widget(header, chunks[0]);
-
-            let items = app
-                .edit_options
-                .iter()
-                .enumerate()
-                .map(|(index, option)| {
-                    let marker = if index == app.edit_option_selected {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    ListItem::new(render_choice_option_line(
-                        option,
-                        marker,
-                        index == app.edit_option_selected,
-                        app.selection_highlight_mode,
-                    ))
-                })
-                .collect::<Vec<_>>();
-            let list = List::new(items).block(Block::default().borders(Borders::ALL));
-            frame.render_widget(list, chunks[1]);
+        PopupTemplate::ChoiceListModal => {
+            let popup = popup_choice_list(
+                app.t("menu.choice.title"),
+                app.tf("menu.choice.field", &[("field", &field_label)]),
+                app.t("menu.choice.hint"),
+                app.edit_options.clone(),
+                app.edit_option_selected,
+                70,
+                55,
+            );
+            render_choice_list_modal(frame, &popup, app.selection_highlight_mode);
         }
     }
 }
@@ -5139,10 +5244,10 @@ fn model_plane_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEn
             &settings.model_plane.http.port.to_string(),
             &catalog.t("menu.model.http_port.desc"),
         ),
-        edit_entry(
+        boolean_toggle_entry(
             &catalog.t("menu.model.allow_non_loopback"),
             "model_plane.http.allow_non_loopback",
-            &settings.model_plane.http.allow_non_loopback.to_string(),
+            settings.model_plane.http.allow_non_loopback,
             &catalog.t("menu.model.allow_non_loopback.desc"),
         ),
     ]
@@ -5228,9 +5333,8 @@ fn security_entries(summary: &SecuritySummary, catalog: &Catalog) -> Vec<MenuEnt
             ));
         }
         "unlocked" => {
-            entries.push(info_entry(
+            entries.push(fixed_enabled_entry(
                 &catalog.t("menu.security.unlocked_notice"),
-                None,
                 &catalog.t("menu.security.unlocked_notice.desc"),
             ));
             entries.push(action_entry(
@@ -5272,39 +5376,36 @@ fn ssh_key_import_entries(app: &MenuConfigApp, catalog: &Catalog) -> Vec<MenuEnt
             &catalog.t("menu.ssh_key.management.locked_hint.desc"),
         )];
     }
+    let passphrase_state = if app.ssh_import_draft.passphrase.is_some() {
+        catalog.t("menu.ssh_key.import.passphrase_set")
+    } else {
+        catalog.t("menu.ssh_key.import.passphrase_unset")
+    };
     let mut entries = vec![
-        MenuEntry {
-            label: catalog.t("menu.ssh_key.import.key_name"),
-            value: Some(app.ssh_import_draft.key_name.clone()),
-            description: catalog.t("menu.ssh_key.import.key_name.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::EditField(SSH_IMPORT_KEY_NAME_FIELD.to_string()),
-        },
-        MenuEntry {
-            label: catalog.t("menu.ssh_key.import.label"),
-            value: Some(app.ssh_import_draft.label.clone()),
-            description: catalog.t("menu.ssh_key.import.label.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::EditField(SSH_IMPORT_LABEL_FIELD.to_string()),
-        },
-        MenuEntry {
-            label: catalog.t("menu.ssh_key.import.source_path"),
-            value: Some(app.ssh_import_draft.source_path.clone()),
-            description: catalog.t("menu.ssh_key.import.source_path.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::EditField(SSH_IMPORT_SOURCE_PATH_FIELD.to_string()),
-        },
-        MenuEntry {
-            label: catalog.t("menu.ssh_key.import.passphrase"),
-            value: Some(if app.ssh_import_draft.passphrase.is_some() {
-                catalog.t("menu.ssh_key.import.passphrase_set")
-            } else {
-                catalog.t("menu.ssh_key.import.passphrase_unset")
-            }),
-            description: catalog.t("menu.ssh_key.import.passphrase.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::EditField(SSH_IMPORT_PASSPHRASE_FIELD.to_string()),
-        },
+        field_entry(
+            &catalog.t("menu.ssh_key.import.key_name"),
+            SSH_IMPORT_KEY_NAME_FIELD,
+            app.ssh_import_draft.key_name.as_str(),
+            &catalog.t("menu.ssh_key.import.key_name.desc"),
+        ),
+        field_entry(
+            &catalog.t("menu.ssh_key.import.label"),
+            SSH_IMPORT_LABEL_FIELD,
+            app.ssh_import_draft.label.as_str(),
+            &catalog.t("menu.ssh_key.import.label.desc"),
+        ),
+        field_entry(
+            &catalog.t("menu.ssh_key.import.source_path"),
+            SSH_IMPORT_SOURCE_PATH_FIELD,
+            app.ssh_import_draft.source_path.as_str(),
+            &catalog.t("menu.ssh_key.import.source_path.desc"),
+        ),
+        field_entry(
+            &catalog.t("menu.ssh_key.import.passphrase"),
+            SSH_IMPORT_PASSPHRASE_FIELD,
+            &passphrase_state,
+            &catalog.t("menu.ssh_key.import.passphrase.desc"),
+        ),
     ];
     if let Ok(preview) = canonical_ssh_private_key_ref_from_key_name(&app.ssh_import_draft.key_name)
     {
@@ -5593,65 +5694,46 @@ fn target_credential_source_entries(
             }),
             &catalog.t("menu.target.ssh_auth_kind.desc"),
         ),
-        MenuEntry {
-            label: catalog.t("menu.target.ssh_auth_pick.none"),
-            value: Some(
-                if auth.kind == SshAuthKind::None {
-                    "selected"
-                } else {
-                    "unselected"
-                }
-                .to_string(),
-            ),
-            description: catalog.t("menu.target.ssh_auth_pick.none.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(index)),
-        },
-        MenuEntry {
-            label: catalog.t("menu.target.ssh_auth_pick.password"),
-            value: Some(
-                if auth.kind == SshAuthKind::Password {
-                    "selected"
-                } else {
-                    "unselected"
-                }
-                .to_string(),
-            ),
-            description: catalog.t("menu.target.ssh_auth_pick.password.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(index)),
-        },
-        MenuEntry {
-            label: catalog.t("menu.target.ssh_auth_pick.private_key"),
-            value: Some(
-                if auth.kind == SshAuthKind::PrivateKey {
-                    "selected"
-                } else {
-                    "unselected"
-                }
-                .to_string(),
-            ),
-            description: catalog.t("menu.target.ssh_auth_pick.private_key.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPrivateKey(index)),
-        },
+        exclusive_choice_entry(
+            &catalog.t("menu.target.ssh_auth_pick.none"),
+            auth.kind == SshAuthKind::None,
+            &catalog.t("menu.target.ssh_auth_pick.none.desc"),
+            ActionKind::SelectTargetSshAuthNone(index),
+        ),
+        exclusive_choice_detail_entry(
+            &catalog.t("menu.target.ssh_auth_pick.password"),
+            auth.kind == SshAuthKind::Password,
+            &catalog.t("menu.target.ssh_auth_pick.password.desc"),
+            ActionKind::SelectTargetSshAuthPassword(index),
+        ),
+        exclusive_choice_detail_entry(
+            &catalog.t("menu.target.ssh_auth_pick.private_key"),
+            auth.kind == SshAuthKind::PrivateKey,
+            &catalog.t("menu.target.ssh_auth_pick.private_key.desc"),
+            ActionKind::SelectTargetSshAuthPrivateKey(index),
+        ),
     ];
 
     if auth.kind.is_secret_backed() {
         if is_sensitive_target(target) {
-            entries.push(info_entry(
+            entries.push(required_readonly_entry(
                 &catalog.t("menu.target.ssh_secure_access"),
-                Some(catalog.t("menu.target.ssh_secure_access.required")),
+                catalog.t("menu.target.ssh_secure_access.required"),
                 &catalog.t("menu.target.ssh_secure_access.required.desc"),
             ));
         } else {
-            let secure_value = if auth.secure_access {
-                catalog.t("menu.value.true")
-            } else {
-                catalog.t("menu.value.false")
-            };
-            entries.push(action_entry(
-                &format!("{} = {}", catalog.t("menu.target.ssh_secure_access"), secure_value),
+            let secure_label = format!(
+                "{} = {}",
+                catalog.t("menu.target.ssh_secure_access"),
+                if auth.secure_access {
+                    catalog.t("menu.value.true")
+                } else {
+                    catalog.t("menu.value.false")
+                }
+            );
+            entries.push(boolean_toggle_action_entry(
+                &secure_label,
+                auth.secure_access,
                 &catalog.t("menu.target.ssh_secure_access.desc"),
                 ActionKind::ToggleTargetSshSecureAccess(index),
             ));
@@ -5731,9 +5813,9 @@ fn target_credential_source_entries(
     }
 
     if let Some(reason) = ssh_auth_setup_continue_block_reason(target) {
-        entries.push(info_entry(
+        entries.push(blocked_action_entry(
             &catalog.t("menu.target.ssh_auth_continue"),
-            Some(catalog.t(reason.summary_key())),
+            catalog.t(reason.summary_key()),
             &catalog.t("menu.target.ssh_auth_continue.blocked.desc"),
         ));
     } else {
@@ -5787,22 +5869,17 @@ fn target_credential_picker_entries(
     let mut entries = app
         .ssh_key_rows
         .iter()
-        .map(|item| MenuEntry {
-            label: format!("{} [{}] {}", item.label, item.status, item.active_version),
-            value: Some(
-                if selected_ref == item.credential_ref {
-                    "selected"
-                } else {
-                    "unselected"
-                }
-                .to_string(),
-            ),
-            description: catalog.t("menu.target.credential_picker_row.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::Action(ActionKind::BindTargetCredentialRef {
+        .map(|item| {
+            let label = format!("{} [{}] {}", item.label, item.status, item.active_version);
+            exclusive_choice_entry(
+                &label,
+                selected_ref == item.credential_ref,
+                &catalog.t("menu.target.credential_picker_row.desc"),
+                ActionKind::BindTargetCredentialRef {
                 target_index: index,
                 credential_ref: item.credential_ref.clone(),
-            }),
+                },
+            )
         })
         .collect::<Vec<_>>();
     entries.push(action_entry(
@@ -5893,28 +5970,26 @@ fn token_detail_entries(app: &MenuConfigApp, catalog: &Catalog, token_id: &str) 
     ];
 
     match item.status.to_ascii_lowercase().as_str() {
-        "active" => entries.push(MenuEntry {
-            label: format!(
+        "active" => entries.push(boolean_toggle_action_entry(
+            &format!(
                 "{} = {}",
                 catalog.t("menu.token_detail.access_switch"),
                 catalog.t("menu.token_detail.access_state_enabled")
             ),
-            value: Some("enabled".into()),
-            description: catalog.t("menu.token_detail.access_switch.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::Action(ActionKind::ToggleTokenAccess(item.token_id.clone())),
-        }),
-        "disabled" => entries.push(MenuEntry {
-            label: format!(
+            true,
+            &catalog.t("menu.token_detail.access_switch.desc"),
+            ActionKind::ToggleTokenAccess(item.token_id.clone()),
+        )),
+        "disabled" => entries.push(boolean_toggle_action_entry(
+            &format!(
                 "{} = {}",
                 catalog.t("menu.token_detail.access_switch"),
                 catalog.t("menu.token_detail.access_state_disabled")
             ),
-            value: Some("disabled".into()),
-            description: catalog.t("menu.token_detail.access_switch.desc"),
-            dirty_key: None,
-            kind: MenuEntryKind::Action(ActionKind::ToggleTokenAccess(item.token_id.clone())),
-        }),
+            false,
+            &catalog.t("menu.token_detail.access_switch.desc"),
+            ActionKind::ToggleTokenAccess(item.token_id.clone()),
+        )),
         _ => entries.push(info_entry(
             &catalog.t("menu.token_detail.access_readonly"),
             None,
@@ -6022,16 +6097,18 @@ fn targets_entries(app: &MenuConfigApp, catalog: &Catalog) -> Vec<MenuEntry> {
         .targets
         .iter()
         .enumerate()
-        .map(|(index, target)| MenuEntry {
-            label: format!(
+        .map(|(index, target)| {
+            let label = format!(
                 "{} ({})",
                 target.display_name,
                 target_kind_label(&target.kind, catalog)
-            ),
-            value: Some(target.id.clone()),
-            description: catalog.t("menu.targets.editor_open"),
-            dirty_key: None,
-            kind: MenuEntryKind::Navigate(Screen::TargetEditor(index)),
+            );
+            status_nav_entry(
+                &label,
+                Some(target.id.clone()),
+                &catalog.t("menu.targets.editor_open"),
+                Screen::TargetEditor(index),
+            )
         })
         .collect::<Vec<_>>();
     entries.push(action_entry(
@@ -6047,16 +6124,18 @@ fn targets_entries_from_settings(settings: &CoreSettings, catalog: &Catalog) -> 
         .targets
         .iter()
         .enumerate()
-        .map(|(index, target)| MenuEntry {
-            label: format!(
+        .map(|(index, target)| {
+            let label = format!(
                 "{} ({})",
                 target.display_name,
                 target_kind_label(&target.kind, catalog)
-            ),
-            value: Some(target.id.clone()),
-            description: catalog.t("menu.targets.editor_open"),
-            dirty_key: None,
-            kind: MenuEntryKind::Navigate(Screen::TargetEditor(index)),
+            );
+            status_nav_entry(
+                &label,
+                Some(target.id.clone()),
+                &catalog.t("menu.targets.editor_open"),
+                Screen::TargetEditor(index),
+            )
         })
         .collect::<Vec<_>>();
     entries.push(action_entry(
@@ -6226,10 +6305,10 @@ fn target_public_descriptor_entries(
             &target.display_name,
             &catalog.t("menu.target.display_name.desc"),
         ),
-        edit_entry(
+        multi_select_entry(
             &catalog.t("menu.target.enabled"),
             &format!("targets[{index}].enabled"),
-            &target.enabled.to_string(),
+            target.enabled,
             &catalog.t("menu.target.enabled.desc"),
         ),
         edit_entry(
@@ -6595,6 +6674,7 @@ fn search_entries(settings: &CoreSettings, query: &str, catalog: &Catalog) -> Ve
         if text.contains(&query) {
             entries.push(match entry.kind {
                 MenuEntryKind::EditField(field) => MenuEntry {
+                    template: entry.template,
                     label: entry.label,
                     value: entry.value,
                     description: entry.description,
@@ -6605,6 +6685,7 @@ fn search_entries(settings: &CoreSettings, query: &str, catalog: &Catalog) -> Ve
                     },
                 },
                 MenuEntryKind::Navigate(Screen::TargetEditor(index)) => MenuEntry {
+                    template: entry.template,
                     label: entry.label,
                     value: entry.value,
                     description: entry.description,
@@ -6637,42 +6718,186 @@ fn flatten_target_fields(settings: &CoreSettings, catalog: &Catalog) -> Vec<Menu
 }
 
 fn nav_entry(label: &str, description: &str, screen: Screen) -> MenuEntry {
-    MenuEntry {
-        label: label.to_string(),
-        value: None,
-        description: description.to_string(),
-        dirty_key: None,
-        kind: MenuEntryKind::Navigate(screen),
-    }
+    menu_entry(
+        RowTemplate::ActionRow,
+        label,
+        None,
+        description,
+        None,
+        MenuEntryKind::Navigate(screen),
+    )
+}
+
+fn status_nav_entry(label: &str, value: Option<String>, description: &str, screen: Screen) -> MenuEntry {
+    menu_entry(
+        RowTemplate::StatusEntryCompat,
+        label,
+        value,
+        description,
+        None,
+        MenuEntryKind::Navigate(screen),
+    )
 }
 
 fn edit_entry(label: &str, field: &str, value: &str, description: &str) -> MenuEntry {
-    MenuEntry {
-        label: label.to_string(),
-        value: Some(value.to_string()),
-        description: description.to_string(),
-        dirty_key: Some(field.to_string()),
-        kind: MenuEntryKind::EditField(field.to_string()),
-    }
+    field_entry(label, field, value, description)
 }
 
 fn action_entry(label: &str, description: &str, action: ActionKind) -> MenuEntry {
-    MenuEntry {
-        label: label.to_string(),
-        value: None,
-        description: description.to_string(),
-        dirty_key: None,
-        kind: MenuEntryKind::Action(action),
-    }
+    action_row_entry(label, description, action)
 }
 
 fn info_entry(label: &str, value: Option<String>, description: &str) -> MenuEntry {
+    menu_entry(
+        RowTemplate::InfoRow,
+        label,
+        value,
+        description,
+        None,
+        MenuEntryKind::Info,
+    )
+}
+
+fn fixed_enabled_entry(label: &str, description: &str) -> MenuEntry {
+    menu_entry(
+        RowTemplate::FixedEnabledRow,
+        label,
+        None,
+        description,
+        None,
+        MenuEntryKind::Info,
+    )
+}
+
+fn required_readonly_entry(label: &str, value: String, description: &str) -> MenuEntry {
+    menu_entry(
+        RowTemplate::RequiredReadonlyRow,
+        label,
+        Some(value),
+        description,
+        None,
+        MenuEntryKind::Info,
+    )
+}
+
+fn blocked_action_entry(label: &str, reason: String, description: &str) -> MenuEntry {
+    menu_entry(
+        RowTemplate::BlockedActionRow,
+        label,
+        Some(reason),
+        description,
+        None,
+        MenuEntryKind::Info,
+    )
+}
+
+fn field_entry(label: &str, field: &str, value: &str, description: &str) -> MenuEntry {
+    menu_entry(
+        RowTemplate::FieldEntryRow,
+        label,
+        Some(value.to_string()),
+        description,
+        Some(field.to_string()),
+        MenuEntryKind::EditField(field.to_string()),
+    )
+}
+
+fn boolean_toggle_entry(label: &str, field: &str, enabled: bool, description: &str) -> MenuEntry {
+    menu_entry(
+        RowTemplate::BooleanToggleRow,
+        label,
+        Some(enabled.to_string()),
+        description,
+        Some(field.to_string()),
+        MenuEntryKind::EditField(field.to_string()),
+    )
+}
+
+fn multi_select_entry(label: &str, field: &str, enabled: bool, description: &str) -> MenuEntry {
+    menu_entry(
+        RowTemplate::MultiSelectRow,
+        label,
+        Some(enabled.to_string()),
+        description,
+        Some(field.to_string()),
+        MenuEntryKind::EditField(field.to_string()),
+    )
+}
+
+fn action_row_entry(label: &str, description: &str, action: ActionKind) -> MenuEntry {
+    menu_entry(
+        RowTemplate::ActionRow,
+        label,
+        None,
+        description,
+        None,
+        MenuEntryKind::Action(action),
+    )
+}
+
+fn boolean_toggle_action_entry(
+    label: &str,
+    enabled: bool,
+    description: &str,
+    action: ActionKind,
+) -> MenuEntry {
+    menu_entry(
+        RowTemplate::BooleanToggleRow,
+        label,
+        Some(enabled.to_string()),
+        description,
+        None,
+        MenuEntryKind::Action(action),
+    )
+}
+
+fn exclusive_choice_entry(
+    label: &str,
+    selected: bool,
+    description: &str,
+    action: ActionKind,
+) -> MenuEntry {
+    menu_entry(
+        RowTemplate::ExclusiveChoiceRow,
+        label,
+        Some(if selected { "selected" } else { "unselected" }.to_string()),
+        description,
+        None,
+        MenuEntryKind::Action(action),
+    )
+}
+
+fn exclusive_choice_detail_entry(
+    label: &str,
+    selected: bool,
+    description: &str,
+    action: ActionKind,
+) -> MenuEntry {
+    menu_entry(
+        RowTemplate::ExclusiveChoiceEntryRow,
+        label,
+        Some(if selected { "selected" } else { "unselected" }.to_string()),
+        description,
+        None,
+        MenuEntryKind::Action(action),
+    )
+}
+
+fn menu_entry(
+    template: RowTemplate,
+    label: &str,
+    value: Option<String>,
+    description: &str,
+    dirty_key: Option<String>,
+    kind: MenuEntryKind,
+) -> MenuEntry {
     MenuEntry {
+        template,
         label: label.to_string(),
         value,
         description: description.to_string(),
-        dirty_key: None,
-        kind: MenuEntryKind::Info,
+        dirty_key,
+        kind,
     }
 }
 
@@ -6719,17 +6944,6 @@ fn field_options(field: &str) -> Option<Vec<String>> {
         }
     };
     Some(options.into_iter().map(|value| value.to_string()).collect())
-}
-
-fn is_boolean_toggle_field(field: &str) -> bool {
-    matches!(field, "model_plane.http.allow_non_loopback")
-        || parse_target_field(field)
-            .map(|(_, suffix)| suffix == "enabled" || suffix == "ssh_auth.secure_access")
-            .unwrap_or(false)
-}
-
-fn is_single_choice_toggle_field(field: &str) -> bool {
-    matches!(field, "model_plane.http.allow_non_loopback")
 }
 
 fn char_to_byte_index(input: &str, char_index: usize) -> usize {
@@ -9767,6 +9981,124 @@ Zm9v\n\
         let on_line = super::format_menu_entry_line(&app, index, &entries[index]);
         assert!(on_line.contains("<*>"));
         assert!(!on_line.contains("[*]"));
+    }
+
+    #[test]
+    fn representative_rows_use_explicit_row_templates() {
+        let config_path = temp_config_path("row-template-representatives");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+
+        app.screen = Screen::ModelPlane;
+        let model_entries = app.entries();
+        let allow_non_loopback = model_entries
+            .iter()
+            .find(|entry| matches!(
+                entry.kind,
+                MenuEntryKind::EditField(ref field)
+                    if field == "model_plane.http.allow_non_loopback"
+            ))
+            .expect("allow_non_loopback entry");
+        assert_eq!(allow_non_loopback.template, super::RowTemplate::BooleanToggleRow);
+
+        app.screen = Screen::TargetPublicDescriptor(0);
+        let target_entries = app.entries();
+        let enabled = target_entries
+            .iter()
+            .find(|entry| matches!(
+                entry.kind,
+                MenuEntryKind::EditField(ref field) if field == "targets[0].enabled"
+            ))
+            .expect("target enabled entry");
+        assert_eq!(enabled.template, super::RowTemplate::MultiSelectRow);
+
+        app.screen = Screen::Security;
+        app.security_summary.lock_state = "unlocked".into();
+        let security_entries = app.entries();
+        let unlocked_notice = security_entries
+            .iter()
+            .find(|entry| entry.label == app.t("menu.security.unlocked_notice"))
+            .expect("unlocked notice");
+        assert_eq!(unlocked_notice.template, super::RowTemplate::FixedEnabledRow);
+    }
+
+    #[test]
+    fn ssh_auth_rows_use_exclusive_required_and_blocked_templates() {
+        let config_path = temp_config_path("ssh-auth-template-coverage");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.security_summary.lock_state = "unlocked".into();
+        app.settings.targets[0].kind = TargetKind::Ssh;
+        app.settings.targets[0].storage_class = "sealed-overlay".into();
+        app.settings.targets[0].access_class = "token-scoped".into();
+        app.settings.targets[0].sealed_profile_ref =
+            Some("vault://bridgingio/target-profile/test-0".into());
+        app.settings.targets[0].ssh_auth = Some(SshAuthConfig {
+            kind: SshAuthKind::Password,
+            secure_access: true,
+            password: None,
+            private_key_source: None,
+            key_locator: None,
+        });
+        app.screen = Screen::TargetCredentialSource(0);
+        let entries = app.entries();
+
+        let none_entry = entries
+            .iter()
+            .find(|entry| matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(0))
+            ))
+            .expect("none entry");
+        assert_eq!(none_entry.template, super::RowTemplate::ExclusiveChoiceRow);
+
+        let password_entry = entries
+            .iter()
+            .find(|entry| matches!(
+                entry.kind,
+                MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(0))
+            ))
+            .expect("password entry");
+        assert_eq!(
+            password_entry.template,
+            super::RowTemplate::ExclusiveChoiceEntryRow
+        );
+
+        let secure_required = entries
+            .iter()
+            .find(|entry| entry.label == app.t("menu.target.ssh_secure_access"))
+            .expect("required readonly row");
+        assert_eq!(
+            secure_required.template,
+            super::RowTemplate::RequiredReadonlyRow
+        );
+
+        let blocked_continue = entries
+            .iter()
+            .find(|entry| entry.label == app.t("menu.target.ssh_auth_continue"))
+            .expect("continue row");
+        assert_eq!(
+            blocked_continue.template,
+            super::RowTemplate::BlockedActionRow
+        );
+    }
+
+    #[test]
+    fn edit_mode_maps_to_popup_templates() {
+        let config_path = temp_config_path("popup-template-mapping");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+
+        app.begin_edit("core.instance_name".into())
+            .expect("open text input popup");
+        assert_eq!(
+            app.active_edit_popup_template(),
+            super::PopupTemplate::TextInputModal
+        );
+
+        app.begin_edit("core.log_level".into())
+            .expect("open choice popup");
+        assert_eq!(
+            app.active_edit_popup_template(),
+            super::PopupTemplate::ChoiceListModal
+        );
     }
 
     #[test]
