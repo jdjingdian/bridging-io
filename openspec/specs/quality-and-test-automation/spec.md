@@ -328,3 +328,35 @@ BridgingIO 的 core contract automation 与 `--self-test` 文档必须维护正�
 - **那么** 测试必须验证 verbose 日志包含 probe context 区块（delivery plan、env overlay 键名、关键参数覆盖、carrier preflight 状态）
 - **并且** 必须验证该区块不包含 password 明文或私钥明文
 
+### 需求:menuconfig 的模板合同必须具备自动化回归覆盖
+针对 `menuconfig` 的自动化或 contract 测试，系统必须覆盖 row template、group template 与 popup template 的核心合同，而不是只验证某个具体页面“看起来差不多”。测试必须能够回答：某类模板是否稳定渲染、是否使用了正确键位语义、是否保持了组内约束，以及当实现偏离模板合同后能否被及时发现。
+
+#### 场景:模板级渲染合同可回归验证
+- **当** 系统为 `menuconfig` 定义一种正式 row template
+- **那么** 自动化测试必须覆盖该模板的核心渲染合同
+- **并且** 至少验证前缀、`--->` 使用条件、可聚焦性与选中态表现
+
+#### 场景:纯开关误带箭头时测试失败
+- **当** 某个 `boolean toggle` 或等价纯开关模板被实现为带 `--->` 的入口行
+- **那么** 自动化测试必须能够检测并报告该偏差
+
+#### 场景:互斥单选组保持唯一选中
+- **当** 自动化测试操作一个 `exclusive choice group` 或等价互斥单选组
+- **那么** 测试必须验证组内任意时刻有且仅有一个候选被选中
+- **并且** 必须验证 `Space` 与 `Enter` 的职责分工符合模板定义
+
+#### 场景:阻断态与强制态不会伪装成交互控件
+- **当** 自动化测试覆盖 `blocked action` 或 `required readonly` 模板
+- **那么** 测试必须验证这些模板不会错误响应切换操作
+- **并且** 必须验证阻断原因或强制状态说明对操作者可见
+
+#### 场景:popup template 复用共享控件原语
+- **当** 自动化测试覆盖 `confirm modal`、`text-input modal` 或 `choice-list modal`
+- **那么** 测试必须验证这些弹框使用统一的按钮高亮、输入 caret 或 choice 选中态合同
+- **并且** 必须能够在新增同类弹框时复用同一类测试口径
+
+#### 场景:新增 overlay 不得破坏统一优先级与关闭语义
+- **当** 自动化测试覆盖多个 overlay 同时存在或连续切换的场景
+- **那么** 测试必须验证系统遵守统一 overlay model 约束
+- **并且** 必须验证等待态、结果态、确认态和 reveal 态各自的关闭规则没有互相污染
+

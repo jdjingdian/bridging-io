@@ -19,6 +19,64 @@ menuconfig grammar.
 - `Esc` first closes the current popup, then backs out one level, then exits
   from root.
 - Future menuconfig feature work must match this matrix before merge.
+- Screen implementations must choose a template first, then fill data.
+- Screen implementations must not handcraft semantic prefixes or `--->`.
+
+## Template-First Rules
+
+- Any new row must map to one `row template`.
+- Any mutually-exclusive option family must map to one `group template`.
+- Any popup or overlay must map to one `popup template`.
+- Template-level key semantics override screen-local conventions.
+- `boolean-toggle-row` and `exclusive-choice-row` are different semantics and
+  must never be merged into one ambiguous type.
+- `blocked-action-row` and `required-readonly-row` must stay visually and
+  behaviorally distinct from normal info rows and action rows.
+
+## Row Template Catalog
+
+| Template ID | Intent | Focusable | Canonical Grammar | Key Contract | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `info-row` | Read-only status/description | no | `--- Label` or `--- Label = Value` | none | navigation must skip |
+| `fixed-disabled-row` | Permanently disabled feature projection | no | `- - Label` | none | not an actionable control |
+| `fixed-enabled-row` | Permanently enabled feature projection | no | `-*- Label` | none | not an actionable control |
+| `boolean-toggle-row` | Pure boolean on/off, no follow-up page | yes | `< > Label` / `<*> Label` | `Space` toggles; `Enter` must not toggle | must not carry `--->` |
+| `exclusive-choice-row` | One option inside an exclusive group | yes | `< > Label` / `<*> Label` | `Space` toggles group selection; `Enter` does not change selection | used with `exclusive-choice-group` |
+| `exclusive-choice-entry-row` | Exclusive option that also owns a detail entry | yes | `< > Label --->` / `<*> Label --->` | `Space` toggles group selection; `Enter` enters detail of current selected option | used with `exclusive-choice-group` |
+| `multi-select-row` | Independent multi-select option | yes | `[ ] Label` / `[*] Label` | `Space` toggles only | must not carry `--->` |
+| `field-entry-row` | Field editor entry (text/enum/etc.) | yes | `Label (value) --->` | `Enter` opens editor popup | prefix column kept aligned and blank |
+| `action-row` | Navigation/action entry | yes | `Label --->` | `Enter` opens flow | used for submenu and managed actions |
+| `blocked-action-row` | Action exists but currently blocked | no | `--- Label (blocked: reason)` | none | reason must be visible inline |
+| `required-readonly-row` | Policy/system-enforced fixed state | no | `--- Label = required` | none | must not respond to toggle keys |
+
+## Group Template Catalog
+
+| Template ID | Intent | Allowed Row Templates | Group Contract | Key Contract |
+| --- | --- | --- | --- | --- |
+| `exclusive-choice-group` | Mutually-exclusive mode/strategy chooser | `exclusive-choice-row`, `exclusive-choice-entry-row` | exactly one option selected at any time | `Space` changes selected option; `Enter` only enters selected option detail when supported |
+| `selection-picker-group` | Mutually-exclusive object picker (key/profile/backend) | `exclusive-choice-row`, `exclusive-choice-entry-row` | exactly one option selected; selection binds to external object reference | same as `exclusive-choice-group`; picker outcome must be persisted |
+
+## Popup Template Catalog
+
+| Template ID | Intent | Primitive Composition | Key Contract | Notes |
+| --- | --- | --- | --- | --- |
+| `message-modal` | Read-only policy/help/info popup | `modal-shell` + body text (+ optional `button-row`) | `Esc` closes; `Enter` closes when acknowledge exists | used by help/auth-block/reveal-like read-only notices |
+| `confirm-modal` | Confirm/cancel decision popup | `modal-shell` + body + `button-row` | `Left/Right` focus button; `Enter` confirms current button; `Esc` cancels | used for delete/revoke/risk/exit confirms |
+| `text-input-modal` | One-line text input editor | `modal-shell` + `input-line` (+ optional `button-row`) | `Left/Right` move caret; `Backspace` deletes; `Enter` commits; `Esc` cancels | used by generic edit and timeout input flows |
+| `choice-list-modal` | One-of-many option picker | `modal-shell` + `choice-list` | `Up/Down` move; `Enter` or `Space` confirms; `Esc` cancels | used by enum/choice editing |
+| `waiting-modal` | In-progress blocking state | `modal-shell` + waiting body | usually `Esc` cancel when operation supports it | background menu is frozen |
+| `result-modal` | Operation result acknowledgement | `modal-shell` + result body (+ optional `button-row`) | `Enter`/`Esc` acknowledge and close | used by unlock/test results |
+| `one-time-reveal-modal` | Sensitive value reveal with explicit close | `modal-shell` + reveal body (+ optional `button-row`) | `Enter`/`Esc` closes by flow contract | closing ends reveal lifetime |
+| `blocking-overlay` | Hard gate overlay (resize/policy lock) | `modal-shell` + blocking message (+ optional `button-row`) | normal navigation disabled until resolved/exit | used when menu cannot safely continue |
+
+## Popup Primitive Mapping
+
+| Primitive | Responsibility | Shared Contract |
+| --- | --- | --- |
+| `modal-shell` | centered rect + clear + bordered container + title/body slots | all popup templates use one shell layout baseline |
+| `button-row` | horizontal button strip with one active button | selected button uses same fallback highlighting as menu rows |
+| `choice-list` | vertical selectable options list | active option uses same fallback highlighting as menu rows |
+| `input-line` | editable one-line input with caret | caret always visible, left/right/backspace contract stable across editors |
 
 ## Layout Matrix
 
@@ -31,78 +89,74 @@ menuconfig grammar.
 | Popup overlay | centered modal overlay | content left-aligned unless button row requires centering | background menu is frozen | `Esc` closes current popup first |
 | Resize guard | centered blocking overlay | centered or left-aligned prompt | normal navigation suspended until size recovers or operator exits | shown when viewport is smaller than minimum supported size |
 
-## Row Grammar Matrix
+## Row Grammar Matrix (Template-Derived)
 
-| Row Kind | Focus Marker | Semantic Prefix | Canonical Grammar | Focusable | Primary Keys | Selected Feedback | Notes |
+| Row Template | Focus Marker | Semantic Prefix | Canonical Grammar | Focusable | Primary Keys | Selected Feedback | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Read-only info / description | none | `---` | `--- Label` or `--- Label = Value` | no | none | none | navigation must skip |
-| Fixed disabled feature | none | `- -` | `- - Label` | no | none | none | navigation must skip |
-| Fixed enabled feature | none | `-*-` | `-*- Label` | no | none | none | navigation must skip |
-| Single-choice toggle, off (no submenu) | `>` when selected | `< >` | `< > Label` | yes | `Space` toggles only | reverse or shared fallback | use when the row is pure on/off without follow-up view |
-| Single-choice toggle, on (no submenu) | `>` when selected | `<*>` | `<*> Label` | yes | `Space` toggles only | reverse or shared fallback | pure on/off variant, no `--->` |
-| Single-choice entry, off (with submenu) | `>` when selected | `< >` | `< > Label --->` or `< > Label (value) --->` | yes | `Space` toggles state; `Enter` follows `--->` | reverse or shared fallback | use when a row has both enable-state and next-step navigation |
-| Single-choice entry, on (with submenu) | `>` when selected | `<*>` | `<*> Label --->` or `<*> Label (value) --->` | yes | `Space` toggles state; `Enter` follows `--->` | reverse or shared fallback | same semantics as off state |
-| Multi-select option, off | `>` when selected | `[ ]` | `[ ] Label` | yes | `Space` toggles only | reverse or shared fallback | must not be combined with `--->` |
-| Multi-select option, on | `>` when selected | `[*]` | `[*] Label` | yes | `Space` toggles only | reverse or shared fallback | must not be combined with `--->` |
-| Text or enum field | `>` when selected | blank fixed-width prefix column | `Label (value) --->` | yes | `Enter` opens popup; `Space` may mirror entry only when explicitly intended | reverse or shared fallback | prefix column remains visually aligned |
-| Submenu / action entry | `>` when selected | blank fixed-width prefix column | `Label --->` | yes | `Enter` opens submenu / popup / confirm chain | reverse or shared fallback | used for navigation and managed flows |
-| Placeholder / empty-state hint | none | `---` | `--- Message` | no | none | none | search-empty / locked-hint / missing-object rows use read-only grammar |
+| `info-row` | none | `---` | `--- Label` or `--- Label = Value` | no | none | none | navigation must skip |
+| `fixed-disabled-row` | none | `- -` | `- - Label` | no | none | none | navigation must skip |
+| `fixed-enabled-row` | none | `-*-` | `-*- Label` | no | none | none | navigation must skip |
+| `boolean-toggle-row` (off/on) | `>` when selected | `< >` / `<*>` | `< > Label` / `<*> Label` | yes | `Space` toggles only | reverse or shared fallback | no `--->` |
+| `exclusive-choice-row` (off/on) | `>` when selected | `< >` / `<*>` | `< > Label` / `<*> Label` | yes | `Space` toggles group selection | reverse or shared fallback | must be inside a group template |
+| `exclusive-choice-entry-row` (off/on) | `>` when selected | `< >` / `<*>` | `< > Label --->` / `<*> Label --->` | yes | `Space` toggles group selection; `Enter` enters detail | reverse or shared fallback | selection and detail are split responsibilities |
+| `multi-select-row` (off/on) | `>` when selected | `[ ]` / `[*]` | `[ ] Label` / `[*] Label` | yes | `Space` toggles only | reverse or shared fallback | must not be combined with `--->` |
+| `field-entry-row` | `>` when selected | blank fixed-width prefix column | `Label (value) --->` | yes | `Enter` opens popup | reverse or shared fallback | prefix column remains visually aligned |
+| `action-row` | `>` when selected | blank fixed-width prefix column | `Label --->` | yes | `Enter` opens submenu / popup / confirm chain | reverse or shared fallback | used for navigation and managed flows |
+| `blocked-action-row` | none | `---` | `--- Label (blocked: reason)` | no | none | none | must expose blocking reason |
+| `required-readonly-row` | none | `---` | `--- Label = required` | no | none | none | fixed by policy/system |
+| `info-row` empty-state variant | none | `---` | `--- Message` | no | none | none | search-empty / locked-hint / missing-object rows |
 
-## Field-To-Row Mapping (Current)
+## Field-To-Template Mapping (Current)
 
 This table maps current menuconfig fields and entry families to canonical row
 grammar. New menu fields should match one of these mappings.
 
-| Scope | Field / Entry | Row Kind | Canonical Prefix | Canonical Grammar | Keys |
+| Scope | Field / Entry | Template Mapping | Canonical Prefix | Canonical Grammar | Keys |
 | --- | --- | --- | --- | --- | --- |
-| Core | `core.instance_name` | Text field | blank prefix column | `Instance Name (value) --->` | `Enter` edits |
-| Core | `core.log_level` | Enum field | blank prefix column | `Log Level (value) --->` | `Enter` opens choice popup |
-| Core | `core.operator_locale` | Enum field | blank prefix column | `Core Locale (value) --->` | `Enter` opens choice popup |
-| Core | `core.data_dir` | Read-only info | `---` | `--- Data Dir = value` | none |
-| Storage | `storage.artifacts.backend` | Enum field | blank prefix column | `Artifact Backend (value) --->` | `Enter` opens choice popup |
-| Storage | `storage.artifacts.max_bytes` | Text field | blank prefix column | `Artifact Max Bytes (value) --->` | `Enter` edits |
-| Model Plane | `model_plane.http.host` | Text field | blank prefix column | `HTTP Host (value) --->` | `Enter` edits |
-| Model Plane | `model_plane.http.port` | Text field | blank prefix column | `HTTP Port (value) --->` | `Enter` edits |
-| Model Plane | `model_plane.http.allow_non_loopback` | Single-choice toggle (no submenu) | `< >` / `<*>` | `< > Allow Non Loopback` / `<*> Allow Non Loopback` | `Space` toggles, `Enter` does not toggle |
-| Vault | `vault.unlock.trigger_policy` | Enum field | blank prefix column | `Unlock Trigger (value) --->` | `Enter` opens choice popup |
-| Vault | `vault.backend` / `vault.unlock.preferred_method` / `vault.unlock.allowed_methods` | Read-only info | `---` | `--- Label = value` | none |
-| Targets | `targets[*].enabled` | Multi-select toggle | `[ ]` / `[*]` | `[ ] Enabled` / `[*] Enabled` | `Space` toggles, `Enter` does not toggle |
-| Targets | `targets[*].id` / `display_name` / `aliases` / connection fields | Text field | blank prefix column | `Label (value) --->` | `Enter` edits |
-| Targets | `Add Target` | Submenu/action entry | blank prefix column | `Add Target --->` | `Enter` follows mode-first flow |
-| Targets | `Add Target -> Choose Storage Mode` | Submenu/action entry | blank prefix column | `Plain Target --->` / `Sensitive Target --->` | `Enter` follows; sensitive path is replaced by `Unlock Vault --->` while vault is locked |
-| Targets | `sensitive target detail (vault locked)` | Placeholder/read-only | `---` + action row | `--- Sensitive overlay is locked` + `Unlock Vault --->` | read-only + unlock action only |
-| Targets | `SSH target -> SSH Authentication` | Submenu/action entry | blank prefix column | `SSH Authentication --->` | plain SSH row lives in `Connection Profile`; sealed SSH row lives in unlocked `Sensitive Overlay` |
-| Targets | `SSH Authentication Setup` auth kind picks | Single-choice toggle (`none`) + single-choice entry (`password`/`private-key`) + info rows | `< >` / `<*>` / `---` | `<*> Use none`, `< > Use password --->`, `< > Use private-key --->`, plus `--- Authentication Kind = value` | 三者互斥且必须单选其一；`Space` 切换认证类型，`Enter` 进入已选类型的后续输入；plain password selection requires risk confirm popup |
-| Targets | `SSH Authentication Setup` secure access | Single-choice toggle (plain) or read-only info (sealed) | `< >` / `<*>` or `---` | plain: `SSH Secure Access = true/false --->`; sealed: `--- SSH Secure Access = required` | plain secret-backed auth defaults `true` and can toggle; sealed secret-backed auth cannot toggle |
-| Targets | `SSH Authentication Setup` private-key branch | 条件子流程（plain 仅本地路径；sealed 支持 local/vault）+ text field | blank prefix column | plain: `Local SSH Key Path (value) --->`; sealed: `Use Local Key Path --->`, `Use Imported Vault Key --->`, `Local SSH Key Path (value) --->`, `Use Imported Vault SSH Key --->`, `Import Local SSH Key Into Vault --->` | local key path edit is blocked immediately when passphrase-protected key is detected; `Continue To Detail Editor` stays disabled until key input is valid |
-| Targets | `SSH target -> Test Connection` | Submenu/action entry | blank prefix column | `Test Connection --->` | `Enter` opens timeout input popup; plain SSH row lives in `Connection Profile`; sealed SSH row lives in `Sensitive Overlay` and is hidden while vault is locked |
-| Security | lock/backend/count summary rows | Read-only info | `---` | `--- Label = value` | none |
-| Security | unlocked notice | Fixed enabled feature | `-*-` | `-*- Credential Management Unlocked` | none |
-| Security | `Init/Unlock/Import SSH Key/SSH Key Management/Create Token/Token Management/Delete Vault` | Submenu/action entry | blank prefix column | `Label --->` | `Enter` follows action flow; locked state shows aggregate `SSH Key Count` only |
-| Security | `SSH Key Management` list/detail | Submenu/action entry + info rows | blank prefix column / `---` | list rows `Label [status] record-id --->`; detail rows `--- Field = value` + `Delete SSH Key --->` | detail/list are unlocked-only and display-safe only |
-| Token Detail | access switch (`enabled` / `disabled`) | Single-choice toggle (no submenu) | `< >` / `<*>` | `< > Access Switch = [disabled]` / `<*> Access Switch = [enabled]` | `Space` toggles, `Enter` does not toggle |
-| Token Detail | label edit | Submenu/action entry | blank prefix column | `Label = value --->` | `Enter` opens edit popup |
-| Token Detail | fingerprint/expiry/status/revoke reason | Read-only info | `---` | `--- Label = value` | none |
-| Token Detail | permissions/revoke/delete actions | Submenu/action entry | blank prefix column | `Label --->` | `Enter` follows action/confirm flow |
-| Search Results | matched editable field | Submenu/action entry | blank prefix column | `Label (value) --->` | `Enter` navigates/focuses |
-| Search Results | no-query / no-match hints | Placeholder/read-only | `---` | `--- Message` | none |
+| Core | `core.instance_name` | `field-entry-row` | blank prefix column | `Instance Name (value) --->` | `Enter` edits |
+| Core | `core.log_level` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Log Level (value) --->` | `Enter` opens choice popup |
+| Core | `core.operator_locale` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Core Locale (value) --->` | `Enter` opens choice popup |
+| Core | `core.data_dir` | `info-row` | `---` | `--- Data Dir = value` | none |
+| Storage | `storage.artifacts.backend` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Artifact Backend (value) --->` | `Enter` opens choice popup |
+| Storage | `storage.artifacts.max_bytes` | `field-entry-row` + `text-input-modal` | blank prefix column | `Artifact Max Bytes (value) --->` | `Enter` edits |
+| Model Plane | `model_plane.http.host` | `field-entry-row` + `text-input-modal` | blank prefix column | `HTTP Host (value) --->` | `Enter` edits |
+| Model Plane | `model_plane.http.port` | `field-entry-row` + `text-input-modal` | blank prefix column | `HTTP Port (value) --->` | `Enter` edits |
+| Model Plane | `model_plane.http.allow_non_loopback` | `boolean-toggle-row` | `< >` / `<*>` | `< > Allow Non Loopback` / `<*> Allow Non Loopback` | `Space` toggles, `Enter` does not toggle |
+| Vault | `vault.unlock.trigger_policy` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Unlock Trigger (value) --->` | `Enter` opens choice popup |
+| Vault | `vault.backend` / `vault.unlock.preferred_method` / `vault.unlock.allowed_methods` | `info-row` | `---` | `--- Label = value` | none |
+| Targets | `targets[*].enabled` | `multi-select-row` | `[ ]` / `[*]` | `[ ] Enabled` / `[*] Enabled` | `Space` toggles, `Enter` does not toggle |
+| Targets | `targets[*].id` / `display_name` / `aliases` / connection fields | `field-entry-row` | blank prefix column | `Label (value) --->` | `Enter` edits |
+| Targets | `Add Target` | `action-row` | blank prefix column | `Add Target --->` | `Enter` follows mode-first flow |
+| Targets | `Add Target -> Choose Storage Mode` | `action-row` | blank prefix column | `Plain Target --->` / `Sensitive Target --->` | `Enter` follows; sensitive path is replaced by `Unlock Vault --->` while vault is locked |
+| Targets | `sensitive target detail (vault locked)` | `info-row` + `action-row` | `---` + blank prefix column | `--- Sensitive overlay is locked` + `Unlock Vault --->` | read-only + unlock action only |
+| Targets | `SSH target -> SSH Authentication` | `action-row` | blank prefix column | `SSH Authentication --->` | plain SSH row lives in `Connection Profile`; sealed SSH row lives in unlocked `Sensitive Overlay` |
+| Targets | `SSH Authentication Setup` auth kind picks | `exclusive-choice-group` with `exclusive-choice-row` (`none`) + `exclusive-choice-entry-row` (`password`/`private-key`) + `info-row` | `< >` / `<*>` / `---` | `<*> Use none`, `< > Use password --->`, `< > Use private-key --->`, plus `--- Authentication Kind = value` | exactly one auth kind selected; `Space` switches choice; `Enter` enters selected detail; plain password selection requires `confirm-modal` |
+| Targets | `SSH Authentication Setup` secure access | plain: `boolean-toggle-row`; sealed: `required-readonly-row` | `< >` / `<*>` or `---` | plain: `SSH Secure Access = true/false --->`; sealed: `--- SSH Secure Access = required` | plain secret-backed auth defaults `true` and can toggle; sealed secret-backed auth cannot toggle |
+| Targets | `SSH Authentication Setup` private-key branch | `action-row` + `field-entry-row` + `blocked-action-row` | blank prefix column / `---` | plain: `Local SSH Key Path (value) --->`; sealed: `Use Local Key Path --->`, `Use Imported Vault Key --->`, `Local SSH Key Path (value) --->`, `Use Imported Vault SSH Key --->`, `Import Local SSH Key Into Vault --->`; blocked: `--- Continue To Detail Editor (blocked: key input required)` | local key path edit is blocked immediately when passphrase-protected key is detected; continue row remains blocked until input is valid |
+| Targets | `SSH target -> Test Connection` | `action-row` + `text-input-modal` + `waiting-modal` + `result-modal` | blank prefix column | `Test Connection --->` | `Enter` opens timeout input popup; plain SSH row lives in `Connection Profile`; sealed SSH row lives in `Sensitive Overlay` and is hidden while vault is locked |
+| Security | lock/backend/count summary rows | `info-row` | `---` | `--- Label = value` | none |
+| Security | unlocked notice | `fixed-enabled-row` | `-*-` | `-*- Credential Management Unlocked` | none |
+| Security | `Init/Unlock/Import SSH Key/SSH Key Management/Create Token/Token Management/Delete Vault` | `action-row` | blank prefix column | `Label --->` | `Enter` follows action flow; locked state shows aggregate `SSH Key Count` only |
+| Security | `SSH Key Management` list/detail | `action-row` + `info-row` | blank prefix column / `---` | list rows `Label [status] record-id --->`; detail rows `--- Field = value` + `Delete SSH Key --->` | detail/list are unlocked-only and display-safe only |
+| Token Detail | access switch (`enabled` / `disabled`) | `boolean-toggle-row` | `< >` / `<*>` | `< > Access Switch = [disabled]` / `<*> Access Switch = [enabled]` | `Space` toggles, `Enter` does not toggle |
+| Token Detail | label edit | `field-entry-row` + `text-input-modal` | blank prefix column | `Label = value --->` | `Enter` opens edit popup |
+| Token Detail | fingerprint/expiry/status/revoke reason | `info-row` | `---` | `--- Label = value` | none |
+| Token Detail | permissions/revoke/delete actions | `action-row` + `confirm-modal` | blank prefix column | `Label --->` | `Enter` follows action/confirm flow |
+| Search Results | matched editable field | `field-entry-row` or `action-row` | blank prefix column | `Label (value) --->` | `Enter` navigates/focuses |
+| Search Results | no-query / no-match hints | `info-row` | `---` | `--- Message` | none |
 
-## Popup Matrix
+## Popup Template Matrix
 
-| Popup Type | Layout | Focusable Elements | Keys | Selected Feedback | Notes |
+| Popup Template | Layout | Focusable Elements | Keys | Selected Feedback | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Confirm popup | centered modal with message and inline button row | buttons only | `←/→` move; `Enter` confirms current button; `Esc` cancels | current button must use same reverse / fallback as menu rows | applies to save/discard, delete, revoke, etc. |
-| Choice popup | centered modal with vertical options list | list rows | `↑/↓` move; `Enter` or `Space` confirms; `Esc` cancels | current row must use same reverse / fallback as menu rows | single-choice editor |
-| Text input popup | centered modal with one input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` commits; `Esc` cancels | caret must be visible | all text fields share one editing contract |
-| SSH test timeout popup | centered modal with one input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` starts probe; `Esc` cancels | caret must be visible | default timeout is `2000` milliseconds |
-| SSH test waiting popup | centered modal waiting state | none | `Esc` cancels pending probe | none required | background menu navigation is blocked while waiting |
-| SSH test result popup | centered modal with short status text | none | `Enter` or `Esc` closes | none required | result text is concise only (`succeeded`/`failed`/`cancelled`/`timed out`) |
-| Hidden passphrase popup | centered modal with one masked input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` commits; `Esc` cancels | caret visible; characters rendered as mask glyph | used for encrypted SSH key import passphrase capture |
-| Help popup | centered modal with read-only content | none | `Esc` closes; help shortcut may toggle | none required | read-only overlay |
-| One-time reveal popup | centered modal with read-only sensitive result | none or one acknowledge button | `Enter` / `Esc` closes according to concrete flow | if an acknowledge button exists, it follows shared selected feedback | closing the popup ends the one-time reveal path |
-| Risk confirm popup | centered modal with message and inline button row | buttons only | `←/→` move; `Enter` confirms current button; `Esc` cancels | current button must use same reverse / fallback as menu rows | used by `plain + ssh` create flow and by plain `password` auth selection |
-| SSH auth blocked popup | centered modal with policy message | none | `Enter` or `Esc` closes | none required | shown when local SSH key path is passphrase-protected and blocked by policy |
-| Resize-required popup | centered blocking overlay | optional exit button only | normal navigation blocked; `Esc` may exit from root flow | if a button exists, it follows shared selected feedback | shown for viewport smaller than minimum supported size |
+| `confirm-modal` | centered modal with message and inline button row | buttons only | `←/→` move; `Enter` confirms current button; `Esc` cancels | current button must use same reverse / fallback as menu rows | applies to save/discard, delete, revoke, risk confirm |
+| `choice-list-modal` | centered modal with vertical options list | list rows | `↑/↓` move; `Enter` or `Space` confirms; `Esc` cancels | current row must use same reverse / fallback as menu rows | single-choice editor |
+| `text-input-modal` | centered modal with one input row | input line | `Left/Right` move caret; `Backspace` deletes left char; `Enter` commits; `Esc` cancels | caret must be visible | all text fields and timeout editors share one contract |
+| `waiting-modal` | centered modal waiting state | none | `Esc` cancels pending operation when supported | none required | background menu navigation is blocked while waiting |
+| `result-modal` | centered modal with short status text | none or one acknowledge button | `Enter` or `Esc` closes | if a button exists, it follows shared selected feedback | result text is concise (`succeeded`/`failed`/`cancelled`/`timed out`) |
+| `message-modal` | centered modal with read-only content | none or one acknowledge button | `Esc` closes; `Enter` closes when acknowledge exists | if a button exists, it follows shared selected feedback | used by help and auth-block style notices |
+| `one-time-reveal-modal` | centered modal with read-only sensitive result | none or one acknowledge button | `Enter` / `Esc` closes according to flow | if a button exists, it follows shared selected feedback | closing ends one-time reveal path |
+| `blocking-overlay` | centered blocking overlay | optional exit button only | normal navigation blocked; `Esc` may exit from root flow | if a button exists, it follows shared selected feedback | shown for viewport smaller than minimum supported size |
 
 ## Navigation And Key Matrix
 
@@ -132,7 +186,7 @@ grammar. New menu fields should match one of these mappings.
 ## Known Current Deviations
 
 No known deviations currently remain for change
-`standardize-menuconfig-style-contract`.
+`abstract-menuconfig-row-templates`.
 
 ## Maintenance Rules
 
