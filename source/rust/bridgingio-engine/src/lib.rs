@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use bridgingio_domain::{
-    build_logical_session_key, AccessScope, ApprovalRequestRecord, ArtifactRecord, AuditEvent,
+    build_logical_session_key, derive_ssh_delivery_plan, extract_ssh_error_subcode,
+    validate_ssh_auth_config, AccessScope, ApprovalRequestRecord, ArtifactRecord, AuditEvent,
     ChannelKind, ChannelRecord, ChannelStatus, CommonErrorCode, ContractStatus,
-    EnvironmentFingerprint, ErrorDomain, LogicalSessionRecord, LogicalSessionStatus, SessionRecord,
-    SessionReusePolicy, SharedError, TargetKind, TargetProfile, TerminalConcurrencyPolicy,
+    EnvironmentFingerprint, ErrorDomain, LogicalSessionRecord, LogicalSessionStatus,
+    SessionRecord, SessionReusePolicy, SharedError, SshAuthConfig, SshAuthKind,
+    SshAuthStorageClass, SshAuthValidationContext, SshDeliveryPlan,
+    SshPrivateKeySource, TargetKind, TargetProfile, TerminalConcurrencyPolicy,
     TerminalTargetFamily, TransportSessionRecord, TransportSessionStatus,
 };
 
@@ -458,6 +461,7 @@ pub struct StandaloneTargetProfile {
     pub access_class: String,
     pub sealed_profile_ref: Option<String>,
     pub credential_ref: Option<String>,
+    pub ssh_auth: Option<SshAuthConfig>,
     pub notes: Option<String>,
     pub connection: StandaloneConnectionSection,
     pub terminal: StandaloneTerminalSection,
@@ -605,7 +609,13 @@ impl ConfigError {
             ),
             Self::InvalidValue { field, reason } => (
                 CommonErrorCode::ValidationFailed,
-                format!("config.invalid_value.{field}"),
+                if field == "targets[].ssh_auth" {
+                    extract_ssh_error_subcode(reason)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("config.invalid_value.{field}"))
+                } else {
+                    format!("config.invalid_value.{field}")
+                },
                 format!("invalid config value for `{field}`: {reason}"),
                 "fix the invalid config value and retry".to_string(),
             ),
@@ -681,6 +691,7 @@ impl CoreSettings {
             PoliciesDefaults,
             Target,
             TargetConnection,
+            TargetSshAuth,
             TargetTerminalConfig,
             TargetToolchain(String),
             TargetTerminal,
@@ -769,6 +780,7 @@ impl CoreSettings {
                             access_class: "anonymous-local".into(),
                             sealed_profile_ref: None,
                             credential_ref: None,
+                            ssh_auth: None,
                             notes: None,
                             connection: StandaloneConnectionSection::default(),
                             terminal: StandaloneTerminalSection::default(),
@@ -819,6 +831,7 @@ impl CoreSettings {
                     "model_plane.http.auth" => Section::ModelPlaneHttpAuth,
                     "policies.defaults" => Section::PoliciesDefaults,
                     "targets.connection" => Section::TargetConnection,
+                    "targets.ssh_auth" => Section::TargetSshAuth,
                     "targets.terminal" => Section::TargetTerminalConfig,
                     _ if section_name.starts_with("targets.toolchains.") => {
                         let name = section_name
@@ -846,7 +859,9 @@ impl CoreSettings {
                 field: "line".into(),
                 reason: format!("expected key=value, got: {line}"),
             })?;
-            if is_sensitive_key(key) {
+            let allows_sensitive_key = matches!(section, Section::TargetSshAuth)
+                && matches!(key, "password" | "private_key_source");
+            if is_sensitive_key(key) && !allows_sensitive_key {
                 return Err(ConfigError::SensitiveFieldInConfig(key.to_string()));
             }
 
@@ -1026,6 +1041,22 @@ impl CoreSettings {
                         _ => return Err(invalid_field(key, "targets.connection")),
                     }
                 }
+                Section::TargetSshAuth => {
+                    let target = targets
+                        .last_mut()
+                        .ok_or(ConfigError::MissingSection("targets"))?;
+                    let auth = target.ssh_auth.get_or_insert_with(SshAuthConfig::default);
+                    match key {
+                        "kind" => auth.kind = parse_ssh_auth_kind(value)?,
+                        "secure_access" => auth.secure_access = parse_bool(key, value)?,
+                        "password" => auth.password = Some(parse_string(key, value)?),
+                        "private_key_source" => {
+                            auth.private_key_source = Some(parse_ssh_private_key_source(value)?)
+                        }
+                        "key_locator" => auth.key_locator = Some(parse_string(key, value)?),
+                        _ => return Err(invalid_field(key, "targets.ssh_auth")),
+                    }
+                }
                 Section::TargetTerminalConfig => {
                     let target = targets
                         .last_mut()
@@ -1120,6 +1151,9 @@ impl CoreSettings {
         }
 
         canonicalize_vault_section(&mut vault)?;
+        for target in &mut targets {
+            normalize_target_ssh_auth(target)?;
+        }
 
         let config = Self {
             schema_version: schema_version.ok_or(ConfigError::MissingField("schema_version"))?,
@@ -1320,6 +1354,33 @@ impl CoreSettings {
                     });
                 }
             }
+            if target.kind == TargetKind::Ssh {
+                let ssh_auth = effective_ssh_auth_for_target(target)?;
+                if target.storage_class != "plain"
+                    && ssh_auth
+                        .password
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                {
+                    return Err(ConfigError::SensitiveFieldInConfig(
+                        "targets.ssh_auth.password".into(),
+                    ));
+                }
+                let storage_class = if target.storage_class == "plain" {
+                    SshAuthStorageClass::Plain
+                } else {
+                    SshAuthStorageClass::Sealed
+                };
+                validate_ssh_auth_config(
+                    storage_class,
+                    &ssh_auth,
+                    SshAuthValidationContext::default(),
+                )
+                .map_err(|err| ConfigError::InvalidValue {
+                    field: "targets[].ssh_auth".into(),
+                    reason: format!("{}: {}", err.code.as_str(), err.message),
+                })?;
+            }
             if let Some(family) = target.terminal.family.as_deref() {
                 if TerminalTargetFamily::parse(family).is_none() {
                     return Err(ConfigError::InvalidValue {
@@ -1456,7 +1517,24 @@ impl CoreSettings {
             },
             ConfigFieldDescription {
                 path: "targets[].credential_ref",
-                description: "凭据引用，只允许引用，不允许明文敏感字段。",
+                description:
+                    "legacy SSH 凭据引用输入，仅用于兼容读取；写回会规范化到 targets.ssh_auth。",
+            },
+            ConfigFieldDescription {
+                path: "targets.ssh_auth.kind",
+                description: "SSH 认证类型：none / password / private-key。",
+            },
+            ConfigFieldDescription {
+                path: "targets.ssh_auth.secure_access",
+                description: "SSH 安全访问开关；sealed secret-backed 组合强制为 true。",
+            },
+            ConfigFieldDescription {
+                path: "targets.ssh_auth.private_key_source",
+                description: "SSH 私钥来源：local-path / vault-ref。",
+            },
+            ConfigFieldDescription {
+                path: "targets.ssh_auth.key_locator",
+                description: "SSH 私钥定位符：本地路径或 canonical vault:// 引用。",
             },
             ConfigFieldDescription {
                 path: "targets[].storage_class",
@@ -1680,8 +1758,10 @@ impl CoreSettings {
                     toml_quote(sealed_profile_ref)
                 ));
             }
-            if let Some(credential_ref) = target.credential_ref.as_ref() {
-                lines.push(format!("credential_ref = {}", toml_quote(credential_ref)));
+            if target.kind != TargetKind::Ssh {
+                if let Some(credential_ref) = target.credential_ref.as_ref() {
+                    lines.push(format!("credential_ref = {}", toml_quote(credential_ref)));
+                }
             }
             if let Some(notes) = target.notes.as_ref() {
                 lines.push(format!("notes = {}", toml_quote(notes)));
@@ -1708,6 +1788,37 @@ impl CoreSettings {
                 lines.push(format!("selector_value = {}", toml_quote(selector_value)));
             }
             lines.push(String::new());
+
+            if target.kind == TargetKind::Ssh {
+                if let Some(ssh_auth) = target.ssh_auth.as_ref().cloned().or_else(|| {
+                    derive_ssh_auth_from_legacy_credential_ref(target.credential_ref.as_deref())
+                        .ok()
+                }) {
+                    lines.push("[targets.ssh_auth]".to_string());
+                    lines.push(format!("kind = {}", toml_quote(ssh_auth.kind.as_str())));
+                    lines.push(format!("secure_access = {}", ssh_auth.secure_access));
+                    if let Some(password) = ssh_auth.password.as_ref() {
+                        if !password.trim().is_empty() {
+                            lines.push(format!("password = {}", toml_quote(password)));
+                        }
+                    }
+                    if let Some(source) = ssh_auth.private_key_source {
+                        lines.push(format!(
+                            "private_key_source = {}",
+                            toml_quote(source.as_str())
+                        ));
+                    }
+                    if let Some(locator) = ssh_auth
+                        .key_locator
+                        .as_ref()
+                        .map(|value| value.trim())
+                        .filter(|value| !value.is_empty())
+                    {
+                        lines.push(format!("key_locator = {}", toml_quote(locator)));
+                    }
+                    lines.push(String::new());
+                }
+            }
 
             if target.terminal.family.is_some() || target.terminal.concurrency_policy.is_some() {
                 lines.push("[targets.terminal]".to_string());
@@ -1820,7 +1931,9 @@ impl PrepareSshProbeError {
             Self::UnsupportedTargetKind { .. } => "unsupported-target-kind",
             Self::MissingHost => "missing-host",
             Self::MissingUsername => "missing-username",
-            Self::InvalidCredentialRef { .. } => "invalid-credential-ref",
+            Self::InvalidCredentialRef { reason } => {
+                extract_ssh_error_subcode(reason).unwrap_or("invalid-credential-ref")
+            }
             Self::ToolchainUnavailable { .. } => "toolchain-unavailable",
         }
     }
@@ -1833,6 +1946,7 @@ pub struct PreparedSshProbe {
     pub port: u16,
     pub username: String,
     pub credential_ref: Option<String>,
+    pub delivery_plan: SshDeliveryPlan,
     pub vault_delivery_mode: String,
     pub vault_fallback_delivery_mode: String,
     pub toolchain_source: SshProbeToolchainSource,
@@ -1891,17 +2005,41 @@ pub fn prepare_standalone_ssh_probe(
         .filter(|value| !value.is_empty())
         .ok_or(PrepareSshProbeError::MissingUsername)?
         .to_string();
-    let credential_ref = target
-        .credential_ref
-        .as_ref()
+    let ssh_auth = effective_ssh_auth_for_target(target).map_err(|err| {
+        PrepareSshProbeError::InvalidCredentialRef {
+            reason: format!("{err:?}"),
+        }
+    })?;
+    let storage_class = if target.storage_class == "plain" {
+        SshAuthStorageClass::Plain
+    } else {
+        SshAuthStorageClass::Sealed
+    };
+    validate_ssh_auth_config(
+        storage_class,
+        &ssh_auth,
+        SshAuthValidationContext::default(),
+    )
+    .map_err(|err| PrepareSshProbeError::InvalidCredentialRef {
+        reason: format!("{}: {}", err.code.as_str(), err.message),
+    })?;
+    let credential_ref = legacy_credential_ref_from_ssh_auth(&ssh_auth)
         .map(|raw| {
-            canonicalize_credential_ref_input(raw).map_err(|err| {
+            canonicalize_credential_ref_input(&raw).map_err(|err| {
                 PrepareSshProbeError::InvalidCredentialRef {
                     reason: format!("{err:?}"),
                 }
             })
         })
         .transpose()?;
+    let delivery_plan = derive_ssh_delivery_plan(
+        storage_class,
+        &ssh_auth,
+        SshAuthValidationContext::default(),
+    )
+    .map_err(|err| PrepareSshProbeError::InvalidCredentialRef {
+        reason: format!("{}: {}", err.code.as_str(), err.message),
+    })?;
     let target_override = target
         .toolchains
         .get("ssh")
@@ -1927,6 +2065,7 @@ pub fn prepare_standalone_ssh_probe(
         port: target.connection.port.unwrap_or(22),
         username,
         credential_ref,
+        delivery_plan,
         vault_delivery_mode: settings.vault.ssh.delivery_mode.clone(),
         vault_fallback_delivery_mode: settings.vault.ssh.fallback_delivery_mode.clone(),
         toolchain_source,
@@ -2130,6 +2269,22 @@ fn parse_target_access_class(value: &str) -> Result<String, ConfigError> {
     }
 }
 
+fn parse_ssh_auth_kind(value: &str) -> Result<SshAuthKind, ConfigError> {
+    let raw = parse_string("targets.ssh_auth.kind", value)?;
+    SshAuthKind::parse(&raw).ok_or_else(|| ConfigError::InvalidValue {
+        field: "targets.ssh_auth.kind".into(),
+        reason: format!("unsupported ssh auth kind: {raw}"),
+    })
+}
+
+fn parse_ssh_private_key_source(value: &str) -> Result<SshPrivateKeySource, ConfigError> {
+    let raw = parse_string("targets.ssh_auth.private_key_source", value)?;
+    SshPrivateKeySource::parse(&raw).ok_or_else(|| ConfigError::InvalidValue {
+        field: "targets.ssh_auth.private_key_source".into(),
+        reason: format!("unsupported ssh private key source: {raw}"),
+    })
+}
+
 fn parse_reuse_policy(value: &str) -> Result<SessionReusePolicy, ConfigError> {
     let raw = parse_string("policies.defaults.reuse_policy", value)?;
     match raw.as_str() {
@@ -2165,6 +2320,102 @@ fn canonicalize_credential_ref_input(raw: &str) -> Result<String, ConfigError> {
         });
     }
     Ok(trimmed.to_string())
+}
+
+fn is_vault_credential_ref(raw: &str) -> bool {
+    raw.starts_with("vault:") || raw.starts_with("vault://")
+}
+
+fn canonicalize_ssh_auth(mut auth: SshAuthConfig) -> Result<SshAuthConfig, ConfigError> {
+    auth.password = auth
+        .password
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    auth.key_locator = auth
+        .key_locator
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if auth.kind == SshAuthKind::PrivateKey {
+        if let Some(SshPrivateKeySource::VaultRef) = auth.private_key_source {
+            if let Some(locator) = auth.key_locator.as_ref() {
+                auth.key_locator = Some(canonicalize_credential_ref_input(locator)?);
+            }
+        }
+    }
+    Ok(auth)
+}
+
+fn derive_ssh_auth_from_legacy_credential_ref(
+    credential_ref: Option<&str>,
+) -> Result<SshAuthConfig, ConfigError> {
+    let Some(raw) = credential_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(SshAuthConfig::default());
+    };
+    let normalized = canonicalize_credential_ref_input(raw)?;
+    if is_vault_credential_ref(&normalized) {
+        return Ok(SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::VaultRef),
+            key_locator: Some(normalized),
+        });
+    }
+    Ok(SshAuthConfig {
+        kind: SshAuthKind::PrivateKey,
+        secure_access: false,
+        password: None,
+        private_key_source: Some(SshPrivateKeySource::LocalPath),
+        key_locator: Some(normalized),
+    })
+}
+
+fn legacy_credential_ref_from_ssh_auth(auth: &SshAuthConfig) -> Option<String> {
+    if auth.kind != SshAuthKind::PrivateKey {
+        return None;
+    }
+    auth.key_locator
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn effective_ssh_auth_for_target(
+    target: &StandaloneTargetProfile,
+) -> Result<SshAuthConfig, ConfigError> {
+    let auth = if let Some(auth) = target.ssh_auth.as_ref() {
+        let canonical = canonicalize_ssh_auth(auth.clone())?;
+        let has_legacy_ref = target
+            .credential_ref
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if canonical.kind == SshAuthKind::None && has_legacy_ref {
+            derive_ssh_auth_from_legacy_credential_ref(target.credential_ref.as_deref())?
+        } else {
+            canonical
+        }
+    } else {
+        derive_ssh_auth_from_legacy_credential_ref(target.credential_ref.as_deref())?
+    };
+    canonicalize_ssh_auth(auth)
+}
+
+fn normalize_target_ssh_auth(target: &mut StandaloneTargetProfile) -> Result<(), ConfigError> {
+    if target.kind != TargetKind::Ssh {
+        target.ssh_auth = None;
+        return Ok(());
+    }
+    let auth = effective_ssh_auth_for_target(target)?;
+    target.credential_ref = legacy_credential_ref_from_ssh_auth(&auth);
+    target.ssh_auth = Some(auth);
+    Ok(())
 }
 
 fn normalize_vault_method(raw: &str) -> String {
@@ -2343,6 +2594,7 @@ mod tests {
                 transport: None,
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -2494,6 +2746,7 @@ mod tests {
                 username: "dev".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -2548,6 +2801,7 @@ mod tests {
                 description: "future localshell transport".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata,
@@ -2629,6 +2883,7 @@ mod config_tests {
         prepare_standalone_ssh_probe, ConfigError, CoreSettings, PrepareSshProbeError,
         SshProbeToolchainSource, ToolchainSection,
     };
+    use bridgingio_domain::{SshAuthConfig, SshAuthKind, SshPrivateKeySource};
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
@@ -2776,15 +3031,30 @@ mod config_tests {
 
     #[test]
     fn canonicalizes_legacy_vault_backend_and_reference_on_parse_and_rewrite() {
-        let legacy = CoreSettings::minimal_example().replace(
-            "credential_ref = \"vault://bridgingio/ssh-private-key/local\"",
-            "credential_ref = \"vault:ssh-key:local\"",
+        let legacy = format!(
+            "{}\n\n[[targets]]\nid = \"sealed-legacy\"\ndisplay_name = \"Sealed Legacy\"\nkind = \"ssh\"\nenabled = true\naliases = []\nstorage_class = \"sealed-overlay\"\naccess_class = \"token-scoped\"\nsealed_profile_ref = \"vault://bridgingio/target-profile/sealed-legacy\"\ncredential_ref = \"vault:ssh-key:local\"\n\n[targets.connection]\nhost = \"127.0.0.1\"\nport = 22\nusername = \"dev\"\n\n[targets.providers.terminal]\nenabled = true\n",
+            CoreSettings::minimal_example()
         );
         let parsed = CoreSettings::from_toml_str(&legacy).expect("parse legacy vault config");
         assert_eq!(parsed.vault.backend, "builtin-encrypted");
         assert_eq!(parsed.vault.protectors.primary.kind, "os-native");
+        let target = parsed
+            .targets
+            .iter()
+            .find(|item| item.id == "sealed-legacy")
+            .expect("sealed legacy target");
         assert_eq!(
-            parsed.targets[0].credential_ref.as_deref(),
+            target.credential_ref.as_deref(),
+            Some("vault://bridgingio/ssh-private-key/local")
+        );
+        let ssh_auth = target
+            .ssh_auth
+            .as_ref()
+            .expect("ssh auth should be normalized");
+        assert_eq!(ssh_auth.kind, SshAuthKind::PrivateKey);
+        assert!(ssh_auth.secure_access);
+        assert_eq!(
+            ssh_auth.key_locator.as_deref(),
             Some("vault://bridgingio/ssh-private-key/local")
         );
 
@@ -2794,7 +3064,13 @@ mod config_tests {
         assert!(rewritten.contains("[vault.ssh]"));
         assert!(rewritten.contains("backend = \"builtin-encrypted\""));
         assert!(!rewritten.contains("backend = \"os-native\""));
-        assert!(rewritten.contains("credential_ref = \"vault://bridgingio/ssh-private-key/local\""));
+        assert!(rewritten.contains("[targets.ssh_auth]"));
+        assert!(rewritten.contains("kind = \"private-key\""));
+        assert!(rewritten.contains("private_key_source = \"vault-ref\""));
+        assert!(rewritten.contains("key_locator = \"vault://bridgingio/ssh-private-key/local\""));
+        assert!(
+            !rewritten.contains("credential_ref = \"vault://bridgingio/ssh-private-key/local\"")
+        );
     }
 
     #[test]
@@ -2813,6 +3089,48 @@ mod config_tests {
         );
         let err = CoreSettings::from_toml_str(&invalid).expect_err("must reject secret field");
         assert!(matches!(err, ConfigError::SensitiveFieldInConfig(_)));
+    }
+
+    #[test]
+    fn accepts_plain_password_under_ssh_auth_for_plain_target() {
+        let base = CoreSettings::minimal_example();
+        let with_password = base.replace(
+            "credential_ref = \"vault://bridgingio/ssh-private-key/local\"",
+            r#"storage_class = "plain"
+access_class = "anonymous-local""#,
+        ) + r#"
+[targets.ssh_auth]
+kind = "password"
+secure_access = false
+password = "demo-password"
+"#;
+        let parsed = CoreSettings::from_toml_str(&with_password).expect("parse plain password ssh");
+        let auth = parsed.targets[0]
+            .ssh_auth
+            .as_ref()
+            .expect("ssh auth should exist");
+        assert_eq!(auth.kind, SshAuthKind::Password);
+        assert_eq!(auth.password.as_deref(), Some("demo-password"));
+    }
+
+    #[test]
+    fn rejects_plain_vault_key_auth_combination() {
+        let base = CoreSettings::minimal_example();
+        let invalid = base.replace(
+            "credential_ref = \"vault://bridgingio/ssh-private-key/local\"",
+            r#"storage_class = "plain"
+access_class = "anonymous-local""#,
+        ) + r#"
+[targets.ssh_auth]
+kind = "private-key"
+secure_access = true
+private_key_source = "vault-ref"
+key_locator = "vault://bridgingio/ssh-private-key/lab"
+"#;
+        let err = CoreSettings::from_toml_str(&invalid).expect_err("must reject plain vault key");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, reason } if field == "targets[].ssh_auth" && reason.contains("plain-vault-key-disallowed"))
+        );
     }
 
     #[test]
@@ -2862,6 +3180,19 @@ mod config_tests {
             Some("config.non_loopback_auth_required")
         );
         assert!(shared.recovery_hint.is_some());
+    }
+
+    #[test]
+    fn config_error_maps_ssh_auth_subcode_for_invalid_value() {
+        let shared = ConfigError::InvalidValue {
+            field: "targets[].ssh_auth".into(),
+            reason: "auth-combination-disallowed: invalid combination".into(),
+        }
+        .shared_error();
+        assert_eq!(
+            shared.module_code.as_deref(),
+            Some("auth-combination-disallowed")
+        );
     }
 
     #[test]
@@ -2930,5 +3261,23 @@ mod config_tests {
             }
         ));
         assert_eq!(err.code(), "unsupported-target-kind");
+    }
+
+    #[test]
+    fn ssh_probe_invalid_credential_ref_reports_stable_ssh_subcode() {
+        let mut settings =
+            CoreSettings::from_toml_str(CoreSettings::minimal_example()).expect("parse minimal");
+        settings.targets[0].storage_class = "plain".into();
+        settings.targets[0].access_class = "anonymous-local".into();
+        settings.targets[0].ssh_auth = Some(SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::VaultRef),
+            key_locator: Some("vault://bridgingio/ssh-private-key/lab".into()),
+        });
+        let err = prepare_standalone_ssh_probe(&settings, &settings.targets[0])
+            .expect_err("plain vault key must fail");
+        assert_eq!(err.code(), "plain-vault-key-disallowed");
     }
 }

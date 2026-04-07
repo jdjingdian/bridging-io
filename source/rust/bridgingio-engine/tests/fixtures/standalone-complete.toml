@@ -75,7 +75,6 @@ display_name = "Lab Ubuntu"
 kind = "ssh"
 enabled = true
 aliases = ["lab", "ubuntu-main"]
-credential_ref = "vault://bridgingio/ssh-private-key/lab"
 notes = "Primary lab server"
 
 [targets.connection]
@@ -83,6 +82,12 @@ host = "10.0.0.18"
 port = 22
 username = "debug"
 known_hosts_policy = "system-default"
+
+[targets.ssh_auth]
+kind = "private-key"
+secure_access = false
+private_key_source = "local-path"
+key_locator = "/tmp/lab-main-id_ed25519"
 
 [targets.providers.terminal]
 enabled = true

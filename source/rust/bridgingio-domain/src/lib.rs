@@ -255,6 +255,344 @@ pub enum TargetKind {
     Other(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshAuthKind {
+    None,
+    Password,
+    PrivateKey,
+}
+
+impl SshAuthKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Password => "password",
+            Self::PrivateKey => "private-key",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "password" => Some(Self::Password),
+            "private-key" | "private_key" | "privatekey" => Some(Self::PrivateKey),
+            _ => None,
+        }
+    }
+
+    pub fn is_secret_backed(self) -> bool {
+        matches!(self, Self::Password | Self::PrivateKey)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshPrivateKeySource {
+    LocalPath,
+    VaultRef,
+}
+
+impl SshPrivateKeySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPath => "local-path",
+            Self::VaultRef => "vault-ref",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "local-path" | "local_path" | "localpath" => Some(Self::LocalPath),
+            "vault-ref" | "vault_ref" | "vaultref" => Some(Self::VaultRef),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshAuthConfig {
+    pub kind: SshAuthKind,
+    pub secure_access: bool,
+    pub password: Option<String>,
+    pub private_key_source: Option<SshPrivateKeySource>,
+    pub key_locator: Option<String>,
+}
+
+impl Default for SshAuthConfig {
+    fn default() -> Self {
+        Self {
+            kind: SshAuthKind::None,
+            secure_access: false,
+            password: None,
+            private_key_source: None,
+            key_locator: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshAuthStorageClass {
+    Plain,
+    Sealed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SshAuthValidationContext {
+    pub local_private_key_encrypted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshAuthValidationCode {
+    AuthCombinationDisallowed,
+    SealedSecretBackedRequiresSecureAccess,
+    PlainVaultKeyDisallowed,
+    LocalKeyPassphraseRequiresVaultImport,
+}
+
+impl SshAuthValidationCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthCombinationDisallowed => "auth-combination-disallowed",
+            Self::SealedSecretBackedRequiresSecureAccess => {
+                "sealed-secret-backed-requires-secure-access"
+            }
+            Self::PlainVaultKeyDisallowed => "plain-vault-key-disallowed",
+            Self::LocalKeyPassphraseRequiresVaultImport => {
+                "local-key-passphrase-requires-vault-import"
+            }
+        }
+    }
+}
+
+pub const SSH_ERROR_SUBCODE_AUTH_COMBINATION_DISALLOWED: &str = "auth-combination-disallowed";
+pub const SSH_ERROR_SUBCODE_SEALED_SECRET_BACKED_REQUIRES_SECURE_ACCESS: &str =
+    "sealed-secret-backed-requires-secure-access";
+pub const SSH_ERROR_SUBCODE_PLAIN_VAULT_KEY_DISALLOWED: &str = "plain-vault-key-disallowed";
+pub const SSH_ERROR_SUBCODE_LOCAL_KEY_PASSPHRASE_REQUIRES_VAULT_IMPORT: &str =
+    "local-key-passphrase-requires-vault-import";
+pub const SSH_ERROR_SUBCODE_PASSWORD_DELIVERY_UNAVAILABLE: &str =
+    "password-delivery-unavailable";
+pub const SSH_ERROR_SUBCODE_PASSWORD_DELIVERY_REJECTED: &str = "password-delivery-rejected";
+pub const SSH_ERROR_SUBCODE_LOCAL_BROKERED_IDENTITY_UNAVAILABLE: &str =
+    "local-brokered-identity-unavailable";
+
+pub fn extract_ssh_error_subcode(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    [
+        SSH_ERROR_SUBCODE_AUTH_COMBINATION_DISALLOWED,
+        SSH_ERROR_SUBCODE_SEALED_SECRET_BACKED_REQUIRES_SECURE_ACCESS,
+        SSH_ERROR_SUBCODE_PLAIN_VAULT_KEY_DISALLOWED,
+        SSH_ERROR_SUBCODE_LOCAL_KEY_PASSPHRASE_REQUIRES_VAULT_IMPORT,
+        SSH_ERROR_SUBCODE_PASSWORD_DELIVERY_UNAVAILABLE,
+        SSH_ERROR_SUBCODE_PASSWORD_DELIVERY_REJECTED,
+        SSH_ERROR_SUBCODE_LOCAL_BROKERED_IDENTITY_UNAVAILABLE,
+    ]
+    .into_iter()
+    .find(|code| normalized.contains(code))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshAuthValidationError {
+    pub code: SshAuthValidationCode,
+    pub message: String,
+}
+
+impl SshAuthValidationError {
+    fn new(code: SshAuthValidationCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+pub fn validate_ssh_auth_config(
+    storage_class: SshAuthStorageClass,
+    auth: &SshAuthConfig,
+    context: SshAuthValidationContext,
+) -> Result<(), SshAuthValidationError> {
+    match auth.kind {
+        SshAuthKind::None => {
+            if auth.secure_access
+                || auth
+                    .password
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                || auth.private_key_source.is_some()
+                || auth
+                    .key_locator
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(SshAuthValidationError::new(
+                    SshAuthValidationCode::AuthCombinationDisallowed,
+                    "kind=none cannot carry password, private key source, key locator, or secure access",
+                ));
+            }
+        }
+        SshAuthKind::Password => {
+            if auth.private_key_source.is_some()
+                || auth
+                    .key_locator
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(SshAuthValidationError::new(
+                    SshAuthValidationCode::AuthCombinationDisallowed,
+                    "password auth cannot include private key source or key locator",
+                ));
+            }
+        }
+        SshAuthKind::PrivateKey => {
+            let source = auth.private_key_source.ok_or_else(|| {
+                SshAuthValidationError::new(
+                    SshAuthValidationCode::AuthCombinationDisallowed,
+                    "private-key auth requires private_key_source",
+                )
+            })?;
+            if auth
+                .password
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(SshAuthValidationError::new(
+                    SshAuthValidationCode::AuthCombinationDisallowed,
+                    "private-key auth cannot include password",
+                ));
+            }
+            let key_locator = auth
+                .key_locator
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    SshAuthValidationError::new(
+                        SshAuthValidationCode::AuthCombinationDisallowed,
+                        "private-key auth requires key_locator",
+                    )
+                })?;
+            match source {
+                SshPrivateKeySource::VaultRef => {
+                    if storage_class == SshAuthStorageClass::Plain {
+                        return Err(SshAuthValidationError::new(
+                            SshAuthValidationCode::PlainVaultKeyDisallowed,
+                            "plain target cannot use vault private key reference",
+                        ));
+                    }
+                    if !key_locator.starts_with("vault://") {
+                        return Err(SshAuthValidationError::new(
+                            SshAuthValidationCode::AuthCombinationDisallowed,
+                            "vault private key source requires canonical vault:// locator",
+                        ));
+                    }
+                }
+                SshPrivateKeySource::LocalPath => {
+                    if context.local_private_key_encrypted {
+                        return Err(SshAuthValidationError::new(
+                            SshAuthValidationCode::LocalKeyPassphraseRequiresVaultImport,
+                            "local passphrase-protected private key must be imported into vault",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if storage_class == SshAuthStorageClass::Sealed
+        && auth.kind.is_secret_backed()
+        && !auth.secure_access
+    {
+        return Err(SshAuthValidationError::new(
+            SshAuthValidationCode::SealedSecretBackedRequiresSecureAccess,
+            "sealed secret-backed auth requires secure_access=true",
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshDeliveryPlan {
+    None,
+    PasswordDirectAskpass,
+    PasswordManagedAskpass,
+    DirectIdentityFile {
+        identity_path: String,
+    },
+    LocalBrokeredIdentity {
+        identity_path: String,
+    },
+    VaultBrokeredIdentity {
+        credential_ref: String,
+    },
+}
+
+impl SshDeliveryPlan {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PasswordDirectAskpass => "password-direct-askpass",
+            Self::PasswordManagedAskpass => "password-managed-askpass",
+            Self::DirectIdentityFile { .. } => "direct-identity-file",
+            Self::LocalBrokeredIdentity { .. } => "local-brokered-identity",
+            Self::VaultBrokeredIdentity { .. } => "vault-brokered-identity",
+        }
+    }
+}
+
+pub fn derive_ssh_delivery_plan(
+    storage_class: SshAuthStorageClass,
+    auth: &SshAuthConfig,
+    context: SshAuthValidationContext,
+) -> Result<SshDeliveryPlan, SshAuthValidationError> {
+    validate_ssh_auth_config(storage_class, auth, context)?;
+    match auth.kind {
+        SshAuthKind::None => Ok(SshDeliveryPlan::None),
+        SshAuthKind::Password => {
+            if auth.secure_access {
+                Ok(SshDeliveryPlan::PasswordManagedAskpass)
+            } else {
+                Ok(SshDeliveryPlan::PasswordDirectAskpass)
+            }
+        }
+        SshAuthKind::PrivateKey => {
+            let key_locator = auth
+                .key_locator
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    SshAuthValidationError::new(
+                        SshAuthValidationCode::AuthCombinationDisallowed,
+                        "private-key auth requires key_locator",
+                    )
+                })?
+                .to_string();
+            match auth.private_key_source {
+                Some(SshPrivateKeySource::VaultRef) => {
+                    Ok(SshDeliveryPlan::VaultBrokeredIdentity {
+                        credential_ref: key_locator,
+                    })
+                }
+                Some(SshPrivateKeySource::LocalPath) => {
+                    if auth.secure_access {
+                        Ok(SshDeliveryPlan::LocalBrokeredIdentity {
+                            identity_path: key_locator,
+                        })
+                    } else {
+                        Ok(SshDeliveryPlan::DirectIdentityFile {
+                            identity_path: key_locator,
+                        })
+                    }
+                }
+                None => Err(SshAuthValidationError::new(
+                    SshAuthValidationCode::AuthCombinationDisallowed,
+                    "private-key auth requires private_key_source",
+                )),
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessScope {
     pub scope_id: String,
@@ -324,6 +662,7 @@ pub struct TargetProfile {
     pub kind: TargetKind,
     pub connection: ConnectionConfig,
     pub credential_ref: Option<CredentialRef>,
+    pub ssh_auth: Option<SshAuthConfig>,
     pub default_policy: PolicyProfile,
     pub notes: Option<String>,
     pub metadata: MetadataMap,
@@ -698,6 +1037,13 @@ mod tests {
                 id: "vault:ssh-key:ops-prod".into(),
                 provider: "system-keychain".into(),
             }),
+            ssh_auth: Some(SshAuthConfig {
+                kind: SshAuthKind::PrivateKey,
+                secure_access: true,
+                password: None,
+                private_key_source: Some(SshPrivateKeySource::VaultRef),
+                key_locator: Some("vault://bridgingio/ssh-private-key/ops-prod".into()),
+            }),
             default_policy: PolicyProfile::default(),
             notes: Some("production bastion".into()),
             metadata: MetadataMap::new(),
@@ -753,6 +1099,7 @@ mod tests {
                 kind,
                 connection,
                 credential_ref: None,
+                ssh_auth: None,
                 default_policy: PolicyProfile::default(),
                 notes: None,
                 metadata: MetadataMap::new(),
@@ -832,6 +1179,7 @@ mod tests {
                 description: "future localshell transport".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: MetadataMap::new(),
@@ -855,5 +1203,116 @@ mod tests {
             Some(TerminalConcurrencyPolicy::Exclusive)
         );
         assert!(is_terminal_target(&target));
+    }
+
+    #[test]
+    fn validator_rejects_plain_vault_key_and_sealed_insecure_secret_backed_auth() {
+        let plain_vault = SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::VaultRef),
+            key_locator: Some("vault://bridgingio/ssh-private-key/lab".into()),
+        };
+        let err = validate_ssh_auth_config(
+            SshAuthStorageClass::Plain,
+            &plain_vault,
+            SshAuthValidationContext::default(),
+        )
+        .expect_err("plain target should reject vault key");
+        assert_eq!(err.code, SshAuthValidationCode::PlainVaultKeyDisallowed);
+
+        let sealed_password = SshAuthConfig {
+            kind: SshAuthKind::Password,
+            secure_access: false,
+            password: None,
+            private_key_source: None,
+            key_locator: None,
+        };
+        let err = validate_ssh_auth_config(
+            SshAuthStorageClass::Sealed,
+            &sealed_password,
+            SshAuthValidationContext::default(),
+        )
+        .expect_err("sealed password must require secure access");
+        assert_eq!(
+            err.code,
+            SshAuthValidationCode::SealedSecretBackedRequiresSecureAccess
+        );
+    }
+
+    #[test]
+    fn validator_rejects_local_encrypted_key_when_context_requires_vault_import() {
+        let local_key = SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::LocalPath),
+            key_locator: Some("/tmp/id_ed25519".into()),
+        };
+        let err = validate_ssh_auth_config(
+            SshAuthStorageClass::Sealed,
+            &local_key,
+            SshAuthValidationContext {
+                local_private_key_encrypted: true,
+            },
+        )
+        .expect_err("encrypted local key must be blocked");
+        assert_eq!(
+            err.code,
+            SshAuthValidationCode::LocalKeyPassphraseRequiresVaultImport
+        );
+    }
+
+    #[test]
+    fn delivery_plan_derives_password_and_private_key_paths() {
+        let password_managed = SshAuthConfig {
+            kind: SshAuthKind::Password,
+            secure_access: true,
+            password: Some("demo".into()),
+            private_key_source: None,
+            key_locator: None,
+        };
+        let plan = derive_ssh_delivery_plan(
+            SshAuthStorageClass::Sealed,
+            &password_managed,
+            SshAuthValidationContext::default(),
+        )
+        .expect("managed password plan");
+        assert_eq!(plan, SshDeliveryPlan::PasswordManagedAskpass);
+
+        let direct_identity = SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: false,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::LocalPath),
+            key_locator: Some("/tmp/id_ed25519".into()),
+        };
+        let plan = derive_ssh_delivery_plan(
+            SshAuthStorageClass::Plain,
+            &direct_identity,
+            SshAuthValidationContext::default(),
+        )
+        .expect("direct identity plan");
+        assert_eq!(
+            plan,
+            SshDeliveryPlan::DirectIdentityFile {
+                identity_path: "/tmp/id_ed25519".into()
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_known_ssh_error_subcode_from_reason_text() {
+        let code = extract_ssh_error_subcode(
+            "validation failed: local-key-passphrase-requires-vault-import: import the key first",
+        );
+        assert_eq!(
+            code,
+            Some(SSH_ERROR_SUBCODE_LOCAL_KEY_PASSPHRASE_REQUIRES_VAULT_IMPORT)
+        );
+
+        let code = extract_ssh_error_subcode("password-delivery-unavailable");
+        assert_eq!(code, Some(SSH_ERROR_SUBCODE_PASSWORD_DELIVERY_UNAVAILABLE));
     }
 }

@@ -843,6 +843,27 @@ pub struct TrustedLocalSshKeyImportResult {
     pub last_used_at_unix_sec: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustedLocalSshPrivateKeyFormat {
+    OpenSsh,
+    Pem,
+}
+
+impl TrustedLocalSshPrivateKeyFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenSsh => "openssh",
+            Self::Pem => "pem",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedLocalSshPrivateKeyInspection {
+    pub format: TrustedLocalSshPrivateKeyFormat,
+    pub passphrase_protected: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetProfilePublicDescriptor {
     pub id: String,
@@ -2294,7 +2315,7 @@ impl SecretVaultRouter {
             label,
             status: metadata.record.status.as_str().to_string(),
             active_version,
-            encrypted_input: validation.encrypted_input,
+            encrypted_input: validation.passphrase_protected,
             last_rotated_at_unix_sec: metadata
                 .record
                 .last_rotated_at
@@ -5878,11 +5899,6 @@ fn secret_record_from_metadata(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SshPrivateKeyValidationSummary {
-    encrypted_input: bool,
-}
-
 fn canonical_ssh_private_key_name(raw: &str) -> Result<String, VaultError> {
     let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
     if normalized.is_empty() {
@@ -5917,23 +5933,9 @@ fn canonical_ssh_private_key_name(raw: &str) -> Result<String, VaultError> {
 fn validate_trusted_local_ssh_private_key_material(
     raw: &str,
     passphrase: Option<&str>,
-) -> Result<SshPrivateKeyValidationSummary, VaultError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(VaultError::InvalidSshPrivateKey(
-            "ssh private key payload is empty".into(),
-        ));
-    }
-    let encrypted = if trimmed.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
-        parse_openssh_private_key_encryption_state(trimmed)?
-    } else if trimmed.contains("-----BEGIN ") && trimmed.contains(" PRIVATE KEY-----") {
-        parse_pem_private_key_encryption_state(trimmed)?
-    } else {
-        return Err(VaultError::InvalidSshPrivateKey(
-            "missing private key envelope markers".into(),
-        ));
-    };
-    if encrypted
+) -> Result<TrustedLocalSshPrivateKeyInspection, VaultError> {
+    let inspection = inspect_trusted_local_ssh_private_key_material(raw)?;
+    if inspection.passphrase_protected
         && passphrase
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -5943,9 +5945,42 @@ fn validate_trusted_local_ssh_private_key_material(
             "encrypted ssh private key requires passphrase during import".into(),
         ));
     }
-    Ok(SshPrivateKeyValidationSummary {
-        encrypted_input: encrypted,
-    })
+    Ok(inspection)
+}
+
+pub fn inspect_trusted_local_ssh_private_key_path(
+    path: impl AsRef<Path>,
+) -> Result<TrustedLocalSshPrivateKeyInspection, VaultError> {
+    let raw = fs::read_to_string(path.as_ref()).map_err(|err| {
+        VaultError::InvalidSshPrivateKey(format!("read trusted local ssh key path failed: {err}"))
+    })?;
+    inspect_trusted_local_ssh_private_key_material(&raw)
+}
+
+pub fn inspect_trusted_local_ssh_private_key_material(
+    raw: &str,
+) -> Result<TrustedLocalSshPrivateKeyInspection, VaultError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(VaultError::InvalidSshPrivateKey(
+            "ssh private key payload is empty".into(),
+        ));
+    }
+    if trimmed.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
+        return Ok(TrustedLocalSshPrivateKeyInspection {
+            format: TrustedLocalSshPrivateKeyFormat::OpenSsh,
+            passphrase_protected: parse_openssh_private_key_encryption_state(trimmed)?,
+        });
+    }
+    if trimmed.contains("-----BEGIN ") && trimmed.contains(" PRIVATE KEY-----") {
+        return Ok(TrustedLocalSshPrivateKeyInspection {
+            format: TrustedLocalSshPrivateKeyFormat::Pem,
+            passphrase_protected: parse_pem_private_key_encryption_state(trimmed)?,
+        });
+    }
+    Err(VaultError::InvalidSshPrivateKey(
+        "missing private key envelope markers".into(),
+    ))
 }
 
 fn parse_pem_private_key_encryption_state(raw: &str) -> Result<bool, VaultError> {
@@ -6951,6 +6986,7 @@ fn unix_secs_to_system_time(value: u64) -> SystemTime {
 mod tests {
     use super::{
         canonical_ssh_private_key_ref_from_key_name, command_audit_preview,
+        inspect_trusted_local_ssh_private_key_material, inspect_trusted_local_ssh_private_key_path,
         normalize_credential_ref, os_native_protector_kek_verified_attempt,
         read_passive_vault_projection, reset_verified_os_native_state_for_tests,
         set_test_os_native_verified_loader, set_test_os_native_verified_timeout_ms,
@@ -6958,7 +6994,8 @@ mod tests {
         DeleteVaultRequest, LocalAdminActionKind, SecretBytes, SecretVaultRouter,
         SshAgentBrokerEndpointKind, SshAgentBrokerPrepareRequest, SshAgentBrokerSessionState,
         SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
-        TrustedLocalSshKeyImportRequest, UpdateAgentTokenAccessRequest,
+        TrustedLocalSshKeyImportRequest, TrustedLocalSshPrivateKeyFormat,
+        UpdateAgentTokenAccessRequest,
         UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
         VaultReadinessState, VaultUnlockPolicy, VaultUnlockTriggerPolicy,
     };
@@ -7111,6 +7148,15 @@ mod tests {
         )
     }
 
+    fn encrypted_pem_test_key() -> &'static str {
+        "-----BEGIN RSA PRIVATE KEY-----\n\
+Proc-Type: 4,ENCRYPTED\n\
+DEK-Info: AES-256-CBC,0123456789ABCDEF0123456789ABCDEF\n\
+\n\
+Zm9v\n\
+-----END RSA PRIVATE KEY-----\n"
+    }
+
     #[test]
     fn normalizes_legacy_credential_refs_to_canonical_uri() {
         let canonical = normalize_credential_ref("vault:ssh-key:ops-prod").expect("canonical");
@@ -7218,6 +7264,36 @@ mod tests {
             })
             .expect("encrypted key import");
         assert!(imported.encrypted_input);
+    }
+
+    #[test]
+    fn trusted_local_ssh_inspection_detects_format_and_passphrase_state() {
+        let openssh_unencrypted = inspect_trusted_local_ssh_private_key_material(&openssh_test_key(false))
+            .expect("inspect unencrypted openssh");
+        assert_eq!(openssh_unencrypted.format, TrustedLocalSshPrivateKeyFormat::OpenSsh);
+        assert!(!openssh_unencrypted.passphrase_protected);
+
+        let openssh_encrypted = inspect_trusted_local_ssh_private_key_material(&openssh_test_key(true))
+            .expect("inspect encrypted openssh");
+        assert_eq!(openssh_encrypted.format, TrustedLocalSshPrivateKeyFormat::OpenSsh);
+        assert!(openssh_encrypted.passphrase_protected);
+
+        let pem_encrypted = inspect_trusted_local_ssh_private_key_material(encrypted_pem_test_key())
+            .expect("inspect encrypted pem");
+        assert_eq!(pem_encrypted.format, TrustedLocalSshPrivateKeyFormat::Pem);
+        assert!(pem_encrypted.passphrase_protected);
+    }
+
+    #[test]
+    fn trusted_local_ssh_inspection_from_path_uses_same_contract() {
+        let root = new_temp_vault_dir("trusted-local-ssh-inspect-path");
+        let key_path = root.join("id_encrypted.pem");
+        fs::write(&key_path, encrypted_pem_test_key()).expect("write encrypted key");
+
+        let inspection =
+            inspect_trusted_local_ssh_private_key_path(&key_path).expect("inspect key path");
+        assert_eq!(inspection.format.as_str(), "pem");
+        assert!(inspection.passphrase_protected);
     }
 
     #[test]

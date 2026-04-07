@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
@@ -7,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
 use bridgingio_app_api::AppApiLineCodec;
@@ -25,14 +28,17 @@ use bridgingio_artifacts::{
 };
 use bridgingio_connectors::{
     target_shell_dialect_for, terminal_concurrency_policy_for, terminal_target_family_for,
-    AdbConnector, CommandInvocation, ExecutableSource, InvocationKind, InvocationResolution,
-    SshConnector, TerminalConnector, ToolchainResolver, TARGET_TERMINAL_CONCURRENCY_METADATA_KEY,
-    TARGET_TERMINAL_FAMILY_METADATA_KEY, TARGET_TERMINAL_SHELL_METADATA_KEY,
+    AdbConnector, CommandInvocation, ExecutableSource, InvocationCleanupAction, InvocationKind,
+    InvocationResolution, SshConnector, TerminalConnector, ToolchainResolver,
+    TARGET_TERMINAL_CONCURRENCY_METADATA_KEY, TARGET_TERMINAL_FAMILY_METADATA_KEY,
+    TARGET_TERMINAL_SHELL_METADATA_KEY,
 };
 use bridgingio_domain::{
-    AccessScope, ArtifactRecord, CapabilitySummary, ChannelKind, ChannelStatus, CommonErrorCode,
-    ConnectionConfig, ContractStatus, CredentialRef, ErrorDomain, SessionRecord,
-    SessionReusePolicy, SessionState, SharedError, TargetKind, TargetProfile,
+    derive_ssh_delivery_plan, extract_ssh_error_subcode, AccessScope, ArtifactRecord,
+    CapabilitySummary, ChannelKind, ChannelStatus, CommonErrorCode, ConnectionConfig,
+    ContractStatus, CredentialRef, ErrorDomain, SessionRecord, SessionReusePolicy, SessionState,
+    SharedError, SshAuthConfig, SshAuthKind, SshAuthStorageClass, SshAuthValidationContext,
+    SshDeliveryPlan, SshPrivateKeySource, TargetKind, TargetProfile,
 };
 use bridgingio_engine::{
     CoreSettings, CoreSettingsStore, StandaloneConnectionSection, StandaloneTargetProfile,
@@ -2498,73 +2504,319 @@ impl StandaloneCoreRuntime {
         if !matches!(target.kind, TargetKind::Ssh) {
             return Ok(None);
         }
-        let Some(credential_ref) = target.credential_ref.as_ref() else {
-            return Ok(None);
-        };
-        if !is_vault_managed_credential_ref(&credential_ref.id) {
-            let direct_identity_args = direct_identity_option_args(&credential_ref.id);
-            apply_ssh_delivery_args(invocation, &direct_identity_args);
-            invocation.resolution.warnings.push(format!(
-                "ssh credential source=direct-identity; broker bypass is active for `{}`",
-                credential_ref.id
+        let delivery_plan = derive_target_ssh_delivery_plan(target)?;
+        match delivery_plan {
+            SshDeliveryPlan::None => Ok(None),
+            SshDeliveryPlan::PasswordDirectAskpass => {
+                self.prepare_password_delivery_for_invocation(target, invocation, false)?;
+                Ok(None)
+            }
+            SshDeliveryPlan::PasswordManagedAskpass => {
+                self.prepare_password_delivery_for_invocation(target, invocation, true)?;
+                Ok(None)
+            }
+            SshDeliveryPlan::LocalBrokeredIdentity { identity_path } => {
+                self.prepare_secure_local_identity_delivery_for_invocation(
+                    invocation,
+                    &identity_path,
+                )?;
+                Ok(None)
+            }
+            SshDeliveryPlan::DirectIdentityFile { identity_path } => {
+                let direct_identity_args = direct_identity_option_args(&identity_path);
+                apply_ssh_delivery_args(invocation, &direct_identity_args);
+                if !invocation
+                    .env_overlay
+                    .unset
+                    .iter()
+                    .any(|key| key == "SSH_AUTH_SOCK")
+                {
+                    invocation.env_overlay.unset.push("SSH_AUTH_SOCK".to_string());
+                }
+                invocation.resolution.warnings.push(format!(
+                    "ssh delivery plan={} broker bypass is active for `{identity_path}`",
+                    SshDeliveryPlan::DirectIdentityFile {
+                        identity_path: identity_path.clone()
+                    }
+                    .as_str()
+                ));
+                Ok(None)
+            }
+            SshDeliveryPlan::VaultBrokeredIdentity { credential_ref } => {
+                if target
+                    .metadata
+                    .get(TARGET_SSH_DELIVERY_MODE_METADATA_KEY)
+                    .map(|raw| !raw.trim().eq_ignore_ascii_case("ssh-agent-broker"))
+                    .unwrap_or(false)
+                {
+                    return Err(CoreRuntimeError::Config(format!(
+                        "vault-brokered delivery requires ssh.delivery_mode=ssh-agent-broker for `{credential_ref}`"
+                    )));
+                }
+
+                let host_key_policy = ssh_host_key_policy_for_target(target);
+                let allow_identity_fallback = target
+                    .metadata
+                    .get(TARGET_SSH_ALLOW_IDENTITY_FALLBACK_METADATA_KEY)
+                    .map(|raw| parse_bool_metadata(raw, true))
+                    .unwrap_or(true);
+                let runtime_passphrase_requested = target
+                    .metadata
+                    .get(TARGET_SSH_RUNTIME_PASSPHRASE_PROMPT_METADATA_KEY)
+                    .map(|raw| parse_bool_metadata(raw, false))
+                    .unwrap_or(false);
+                let prepared = self
+                    .vault_router
+                    .prepare_ssh_agent_broker_session(SshAgentBrokerPrepareRequest {
+                        target_id: target.id.clone(),
+                        credential_ref: credential_ref.clone(),
+                        principal_id: context.agent_id.clone(),
+                        logical_session_id: None,
+                        host_platform: runtime_host_platform_label(self.host_platform_adapter.as_ref()),
+                        allow_identity_fallback,
+                        host_key_policy,
+                        key_passphrase_handling: SshKeyPassphraseHandling::RuntimePromptForbidden,
+                        runtime_passphrase_requested,
+                        session_ttl: Some(Duration::from_secs(120)),
+                    })
+                    .map_err(vault_error_to_runtime)?;
+
+                apply_ssh_delivery_args(invocation, &prepared.ssh_option_args);
+                invocation
+                    .resolution
+                    .warnings
+                    .extend(prepared.diagnostics.clone());
+                invocation.resolution.warnings.push(format!(
+                    "ssh delivery plan={} broker session {} endpoint_kind={} degraded={}",
+                    SshDeliveryPlan::VaultBrokeredIdentity {
+                        credential_ref: credential_ref.clone()
+                    }
+                    .as_str(),
+                    prepared.session.broker_session_id,
+                    prepared.session.endpoint_kind.as_str(),
+                    prepared.session.degraded
+                ));
+
+                if let Some(channel_id) = attach_channel_id {
+                    self.vault_router
+                        .attach_ssh_agent_broker_session(&prepared.session.broker_session_id, channel_id)
+                        .map_err(vault_error_to_runtime)?;
+                }
+
+                Ok(Some(prepared.session.broker_session_id))
+            }
+        }
+    }
+
+    fn prepare_password_delivery_for_invocation(
+        &mut self,
+        target: &TargetProfile,
+        invocation: &mut CommandInvocation,
+        managed: bool,
+    ) -> Result<(), CoreRuntimeError> {
+        if matches!(invocation.invocation_kind, InvocationKind::Interactive) {
+            return Err(CoreRuntimeError::Config(
+                "password-delivery-unavailable: interactive shell launch does not support invocation-scoped askpass env overlay".into(),
             ));
-            return Ok(None);
         }
-        if target
-            .metadata
-            .get(TARGET_SSH_DELIVERY_MODE_METADATA_KEY)
-            .map(|raw| !raw.trim().eq_ignore_ascii_case("ssh-agent-broker"))
-            .unwrap_or(true)
+        let auth = effective_ssh_auth_for_profile(target)?;
+        let password = auth
+            .password
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CoreRuntimeError::Config(
+                    "password-delivery-rejected: target password is missing".into(),
+                )
+            })?
+            .to_string();
+        self.tool_handler
+            .terminal_provider
+            .register_sensitive_value(&password);
+        self.vault_router.redaction_registry_mut().register(&password);
+
+        self.next_internal_artifact_seq += 1;
+        let session_id = format!("ssh-password-{:06}", self.next_internal_artifact_seq);
+        let runtime_root = PathBuf::from(&self.settings_store.settings.core.data_dir)
+            .join("runtime")
+            .join("ssh-password")
+            .join(&session_id);
+        fs::create_dir_all(&runtime_root).map_err(|err| {
+            CoreRuntimeError::Config(format!(
+                "password-delivery-unavailable: cannot create askpass runtime dir: {err}"
+            ))
+        })?;
+        #[cfg(unix)]
         {
-            return Ok(None);
+            let _ = fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700));
         }
 
-        let host_key_policy = ssh_host_key_policy_for_target(target);
-        let allow_identity_fallback = target
-            .metadata
-            .get(TARGET_SSH_ALLOW_IDENTITY_FALLBACK_METADATA_KEY)
-            .map(|raw| parse_bool_metadata(raw, true))
-            .unwrap_or(true);
-        let runtime_passphrase_requested = target
-            .metadata
-            .get(TARGET_SSH_RUNTIME_PASSPHRASE_PROMPT_METADATA_KEY)
-            .map(|raw| parse_bool_metadata(raw, false))
-            .unwrap_or(false);
-        let prepared = self
-            .vault_router
-            .prepare_ssh_agent_broker_session(SshAgentBrokerPrepareRequest {
-                target_id: target.id.clone(),
-                credential_ref: credential_ref.id.clone(),
-                principal_id: context.agent_id.clone(),
-                logical_session_id: None,
-                host_platform: runtime_host_platform_label(self.host_platform_adapter.as_ref()),
-                allow_identity_fallback,
-                host_key_policy,
-                key_passphrase_handling: SshKeyPassphraseHandling::RuntimePromptForbidden,
-                runtime_passphrase_requested,
-                session_ttl: Some(Duration::from_secs(120)),
-            })
-            .map_err(vault_error_to_runtime)?;
+        #[cfg(windows)]
+        let secret_path = runtime_root.join("password.txt");
+        #[cfg(not(windows))]
+        let secret_path = runtime_root.join("password");
+        fs::write(&secret_path, password.as_bytes()).map_err(|err| {
+            CoreRuntimeError::Config(format!(
+                "password-delivery-unavailable: cannot materialize askpass secret carrier: {err}"
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600));
+        }
 
-        apply_ssh_delivery_args(invocation, &prepared.ssh_option_args);
+        #[cfg(windows)]
+        let helper_path = runtime_root.join("askpass.cmd");
+        #[cfg(not(windows))]
+        let helper_path = runtime_root.join("askpass.sh");
+        fs::write(&helper_path, password_askpass_helper_script()).map_err(|err| {
+            CoreRuntimeError::Config(format!(
+                "password-delivery-unavailable: cannot write askpass helper: {err}"
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700));
+        }
+
+        let helper_path_text = helper_path.to_string_lossy().to_string();
+        let secret_path_text = secret_path.to_string_lossy().to_string();
         invocation
-            .resolution
-            .warnings
-            .extend(prepared.diagnostics.clone());
-        invocation.resolution.warnings.push(format!(
-            "ssh broker session {} endpoint_kind={} degraded={}",
-            prepared.session.broker_session_id,
-            prepared.session.endpoint_kind.as_str(),
-            prepared.session.degraded
-        ));
+            .env_overlay
+            .set
+            .insert("SSH_ASKPASS".into(), helper_path_text.clone());
+        invocation
+            .env_overlay
+            .set
+            .insert("SSH_ASKPASS_REQUIRE".into(), "force".into());
+        invocation
+            .env_overlay
+            .set
+            .insert("DISPLAY".into(), "bridgingio-headless".into());
+        invocation.env_overlay.set.insert(
+            "BRIDGINGIO_SSH_ASKPASS_SECRET_FILE".into(),
+            secret_path_text.clone(),
+        );
+        if !invocation
+            .env_overlay
+            .unset
+            .iter()
+            .any(|key| key == "SSH_AUTH_SOCK")
+        {
+            invocation.env_overlay.unset.push("SSH_AUTH_SOCK".to_string());
+        }
+        invocation
+            .cleanup_contract
+            .actions
+            .push(InvocationCleanupAction::RemoveFile {
+                path: helper_path.clone(),
+            });
+        invocation
+            .cleanup_contract
+            .actions
+            .push(InvocationCleanupAction::RemoveFile {
+                path: secret_path.clone(),
+            });
+        invocation
+            .cleanup_contract
+            .actions
+            .push(InvocationCleanupAction::RemoveDirAll { path: runtime_root });
 
-        if let Some(channel_id) = attach_channel_id {
-            self.vault_router
-                .attach_ssh_agent_broker_session(&prepared.session.broker_session_id, channel_id)
-                .map_err(vault_error_to_runtime)?;
+        let password_delivery_args = vec![
+            "-o".to_string(),
+            "BatchMode=no".to_string(),
+            "-o".to_string(),
+            "PreferredAuthentications=password,keyboard-interactive".to_string(),
+            "-o".to_string(),
+            "NumberOfPasswordPrompts=1".to_string(),
+            "-o".to_string(),
+            "PubkeyAuthentication=no".to_string(),
+        ];
+        apply_ssh_delivery_args(invocation, &password_delivery_args);
+        invocation.resolution.warnings.push(format!(
+            "ssh password delivery session={} mode={}",
+            session_id,
+            if managed {
+                "managed-askpass"
+            } else {
+                "direct-askpass"
+            }
+        ));
+        Ok(())
+    }
+
+    fn prepare_secure_local_identity_delivery_for_invocation(
+        &mut self,
+        invocation: &mut CommandInvocation,
+        identity_path: &str,
+    ) -> Result<(), CoreRuntimeError> {
+        if matches!(invocation.invocation_kind, InvocationKind::Interactive) {
+            return Err(CoreRuntimeError::Config(
+                "local-brokered-identity-unavailable: interactive shell launch does not support secure-local staging cleanup".into(),
+            ));
+        }
+        self.next_internal_artifact_seq += 1;
+        let session_id = format!("ssh-local-identity-{:06}", self.next_internal_artifact_seq);
+        let runtime_root = PathBuf::from(&self.settings_store.settings.core.data_dir)
+            .join("runtime")
+            .join("ssh-local-identity")
+            .join(&session_id);
+        fs::create_dir_all(&runtime_root).map_err(|err| {
+            CoreRuntimeError::Config(format!(
+                "local-brokered-identity-unavailable: cannot create secure-local runtime dir: {err}"
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700));
         }
 
-        Ok(Some(prepared.session.broker_session_id))
+        #[cfg(windows)]
+        let staged_identity_path = runtime_root.join("identity.key");
+        #[cfg(not(windows))]
+        let staged_identity_path = runtime_root.join("identity");
+        let identity_bytes = fs::read(identity_path).map_err(|_| {
+            CoreRuntimeError::Config(
+                "local-brokered-identity-unavailable: cannot read local key material".into(),
+            )
+        })?;
+        fs::write(&staged_identity_path, identity_bytes).map_err(|_| {
+            CoreRuntimeError::Config(
+                "local-brokered-identity-unavailable: cannot stage secure-local identity".into(),
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&staged_identity_path, fs::Permissions::from_mode(0o600));
+        }
+
+        let staged_identity = staged_identity_path.to_string_lossy().to_string();
+        let option_args = direct_identity_option_args(&staged_identity);
+        apply_ssh_delivery_args(invocation, &option_args);
+        if !invocation
+            .env_overlay
+            .unset
+            .iter()
+            .any(|key| key == "SSH_AUTH_SOCK")
+        {
+            invocation.env_overlay.unset.push("SSH_AUTH_SOCK".to_string());
+        }
+        invocation
+            .cleanup_contract
+            .actions
+            .push(InvocationCleanupAction::RemoveFile {
+                path: staged_identity_path,
+            });
+        invocation
+            .cleanup_contract
+            .actions
+            .push(InvocationCleanupAction::RemoveDirAll { path: runtime_root });
+        invocation.resolution.warnings.push(format!(
+            "ssh secure-local identity session={} mode=local-brokered-identity",
+            session_id
+        ));
+        Ok(())
     }
 
     fn release_interactive_ssh_broker(
@@ -3834,11 +4086,7 @@ impl StandaloneCoreRuntime {
                 let profile = match self.project_catalog_profile_by_id(&target_id) {
                     Ok(profile) => profile,
                     Err(CoreRuntimeError::Config(message)) => {
-                        return error_response(
-                            request.request_id,
-                            ApiErrorCode::ValidationFailed,
-                            &message,
-                        )
+                        return validation_error_response(request.request_id, &message)
                     }
                     Err(err) => {
                         return error_response(
@@ -3860,7 +4108,7 @@ impl StandaloneCoreRuntime {
                         apply_strategy: Some(apply_strategy),
                     },
                     Err(CoreRuntimeError::Config(message)) => {
-                        error_response(request.request_id, ApiErrorCode::ValidationFailed, &message)
+                        validation_error_response(request.request_id, &message)
                     }
                     Err(err) => error_response(
                         request.request_id,
@@ -3901,7 +4149,7 @@ impl StandaloneCoreRuntime {
                         apply_strategy: Some(apply_strategy),
                     },
                     Err(CoreRuntimeError::Config(message)) => {
-                        error_response(request.request_id, ApiErrorCode::ValidationFailed, &message)
+                        validation_error_response(request.request_id, &message)
                     }
                     Err(err) => error_response(
                         request.request_id,
@@ -3916,7 +4164,7 @@ impl StandaloneCoreRuntime {
                     apply_strategy: Some("live_applied".to_string()),
                 },
                 Err(CoreRuntimeError::Config(message)) => {
-                    error_response(request.request_id, ApiErrorCode::ValidationFailed, &message)
+                    validation_error_response(request.request_id, &message)
                 }
                 Err(err) => error_response(
                     request.request_id,
@@ -4537,6 +4785,80 @@ fn shared_error_response(request_id: String, error: SharedError) -> ApiResponse 
     }
 }
 
+fn ssh_shared_error_from_message(message: &str) -> Option<SharedError> {
+    let subcode = extract_ssh_error_subcode(message)?;
+    let (status, common_code) = match subcode {
+        "password-delivery-unavailable"
+        | "password-delivery-rejected"
+        | "local-brokered-identity-unavailable" => (
+            ContractStatus::NotReady,
+            CommonErrorCode::DependencyUnavailable,
+        ),
+        _ => (ContractStatus::Failed, CommonErrorCode::ValidationFailed),
+    };
+    let display_message = match subcode {
+        "auth-combination-disallowed" => "ssh auth combination is not allowed",
+        "sealed-secret-backed-requires-secure-access" => {
+            "sealed secret-backed ssh auth requires secure access"
+        }
+        "plain-vault-key-disallowed" => "plain ssh target cannot use vault-managed private key",
+        "local-key-passphrase-requires-vault-import" => {
+            "local passphrase-protected ssh key must be imported into vault"
+        }
+        "password-delivery-unavailable" => "password delivery is unavailable for this ssh invocation",
+        "password-delivery-rejected" => "password delivery was rejected by policy",
+        "local-brokered-identity-unavailable" => {
+            "secure-local identity delivery is unavailable for this ssh invocation"
+        }
+        _ => "ssh authentication failed",
+    };
+    let recovery_hint = match subcode {
+        "auth-combination-disallowed" => {
+            "choose a supported ssh auth combination and retry"
+        }
+        "sealed-secret-backed-requires-secure-access" => {
+            "enable SSH 安全访问 for sealed secret-backed ssh auth"
+        }
+        "plain-vault-key-disallowed" => {
+            "switch target storage to sealed or use local unencrypted key for plain target"
+        }
+        "local-key-passphrase-requires-vault-import" => {
+            "unlock vault and use Import Local SSH Key Into Vault"
+        }
+        "password-delivery-unavailable" => {
+            "use non-password auth or enable an available password delivery runtime"
+        }
+        "password-delivery-rejected" => {
+            "adjust policy/attestation and retry managed password delivery"
+        }
+        "local-brokered-identity-unavailable" => {
+            "verify local key runtime prerequisites and retry secure-local identity delivery"
+        }
+        _ => "review ssh authentication settings and retry",
+    };
+    Some(
+        SharedError::new(status, ErrorDomain::Mcp, common_code, display_message)
+            .with_module_code(subcode)
+            .with_recovery_hint(recovery_hint),
+    )
+}
+
+fn validation_error_response(request_id: String, message: &str) -> ApiResponse {
+    if let Some(shared) = ssh_shared_error_from_message(message) {
+        shared_error_response(request_id, shared)
+    } else {
+        error_response(request_id, ApiErrorCode::ValidationFailed, message)
+    }
+}
+
+fn model_plane_error_line_from_config_message(message: &str) -> String {
+    if let Some(shared) = ssh_shared_error_from_message(message) {
+        shared_error_to_model_plane_response_line(shared)
+    } else {
+        format!("result=error|message={message}")
+    }
+}
+
 fn normalize_target_ref(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -4765,6 +5087,7 @@ fn redacted_sealed_catalog_profile(
     let mut redacted = profile.clone();
     redacted.notes = None;
     redacted.credential_ref = None;
+    redacted.ssh_auth = None;
     redacted.connection = match &profile.connection {
         ConnectionConfig::Ssh { .. } => ConnectionConfig::Ssh {
             host: "<sealed-redacted>".to_string(),
@@ -4848,6 +5171,75 @@ fn apply_sealed_overlay_to_target_profile(
             _ => {
                 return Err(CoreRuntimeError::Config(
                     "sealed overlay field `credential_ref` must be string, object, or null".into(),
+                ));
+            }
+        };
+    }
+
+    if let Some(ssh_auth_value) = map.get("ssh_auth") {
+        profile.ssh_auth = match ssh_auth_value {
+            Value::Null => None,
+            Value::Object(obj) => {
+                let kind = obj
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .and_then(SshAuthKind::parse)
+                    .ok_or_else(|| {
+                        CoreRuntimeError::Config(
+                            "sealed overlay ssh_auth.kind must be one of none/password/private-key"
+                                .into(),
+                        )
+                    })?;
+                let secure_access = obj
+                    .get("secure_access")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let password = match obj.get("password") {
+                    Some(Value::Null) | None => None,
+                    Some(Value::String(value)) => Some(value.clone()),
+                    _ => {
+                        return Err(CoreRuntimeError::Config(
+                            "sealed overlay ssh_auth.password must be string or null".into(),
+                        ));
+                    }
+                };
+                let private_key_source = match obj.get("private_key_source") {
+                    Some(Value::Null) | None => None,
+                    Some(Value::String(value)) => {
+                        Some(SshPrivateKeySource::parse(value).ok_or_else(|| {
+                            CoreRuntimeError::Config(
+                                "sealed overlay ssh_auth.private_key_source must be local-path or vault-ref"
+                                    .into(),
+                            )
+                        })?)
+                    }
+                    _ => {
+                        return Err(CoreRuntimeError::Config(
+                            "sealed overlay ssh_auth.private_key_source must be string or null"
+                                .into(),
+                        ));
+                    }
+                };
+                let key_locator = match obj.get("key_locator") {
+                    Some(Value::Null) | None => None,
+                    Some(Value::String(value)) => Some(value.clone()),
+                    _ => {
+                        return Err(CoreRuntimeError::Config(
+                            "sealed overlay ssh_auth.key_locator must be string or null".into(),
+                        ));
+                    }
+                };
+                Some(canonicalize_profile_ssh_auth(&SshAuthConfig {
+                    kind,
+                    secure_access,
+                    password,
+                    private_key_source,
+                    key_locator,
+                })?)
+            }
+            _ => {
+                return Err(CoreRuntimeError::Config(
+                    "sealed overlay field `ssh_auth` must be object or null".into(),
                 ));
             }
         };
@@ -5048,6 +5440,8 @@ fn apply_sealed_overlay_to_target_profile(
         }
     }
 
+    let normalized = normalize_profile_credential_ref(profile.clone())?;
+    *profile = normalized;
     Ok(())
 }
 
@@ -5257,10 +5651,24 @@ fn to_sensitive_public_cache_target_profile(
     standalone.access_class = access_class.as_str().to_string();
     standalone.sealed_profile_ref = Some(sealed_profile_ref.to_string());
     standalone.credential_ref = None;
+    standalone.ssh_auth = None;
     standalone.notes = None;
     standalone.connection = public_cache_connection_for_kind(&profile.kind);
     standalone.toolchains.clear();
     Ok(standalone)
+}
+
+fn ssh_auth_json_value(ssh_auth: Option<&SshAuthConfig>) -> Value {
+    match ssh_auth {
+        Some(auth) => json!({
+            "kind": auth.kind.as_str(),
+            "secure_access": auth.secure_access,
+            "password": auth.password,
+            "private_key_source": auth.private_key_source.map(|value| value.as_str()),
+            "key_locator": auth.key_locator,
+        }),
+        None => Value::Null,
+    }
 }
 
 fn sensitive_overlay_json_from_profile(profile: &TargetProfile) -> Value {
@@ -5299,6 +5707,7 @@ fn sensitive_overlay_json_from_profile(profile: &TargetProfile) -> Value {
     json!({
         "notes": profile.notes,
         "credential_ref": profile.credential_ref.as_ref().map(|value| value.id.clone()),
+        "ssh_auth": ssh_auth_json_value(profile.ssh_auth.as_ref()),
         "connection": connection,
         "toolchains": Value::Object(toolchains),
         "policy": {
@@ -5423,6 +5832,7 @@ fn reconciled_sensitive_public_cache_target(
         access_class: descriptor.access_class.as_str().to_string(),
         sealed_profile_ref: descriptor.sealed_profile_ref.clone(),
         credential_ref: None,
+        ssh_auth: None,
         notes: None,
         connection: public_cache_connection_for_kind(&descriptor.kind),
         terminal: StandaloneTerminalSection::default(),
@@ -5443,6 +5853,7 @@ fn reconciled_sensitive_public_cache_target(
     target.access_class = descriptor.access_class.as_str().to_string();
     target.sealed_profile_ref = descriptor.sealed_profile_ref.clone();
     target.credential_ref = None;
+    target.ssh_auth = None;
     target.notes = None;
     target.connection = public_cache_connection_for_kind(&descriptor.kind);
     target.toolchains.clear();
@@ -5683,6 +6094,17 @@ fn direct_identity_option_args(identity_path: &str) -> Vec<String> {
     ]
 }
 
+fn password_askpass_helper_script() -> String {
+    #[cfg(windows)]
+    {
+        "@echo off\r\nif not \"%BRIDGINGIO_SSH_ASKPASS_SECRET_FILE%\"==\"\" type \"%BRIDGINGIO_SSH_ASKPASS_SECRET_FILE%\"\r\n".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "#!/bin/sh\nif [ -n \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\" ] && [ -f \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\" ]; then\n  cat \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\"\nfi\n".to_string()
+    }
+}
+
 fn parse_bool_metadata(raw: &str, default: bool) -> bool {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => true,
@@ -5738,7 +6160,14 @@ fn invocation_json(invocation: Option<&CommandInvocation>) -> Value {
         "quoting_boundary": {
             "host_shell_runtime": view.quoting_host_shell_runtime,
             "target_shell_dialect": view.quoting_target_shell_dialect
-        }
+        },
+        "env_overlay": {
+            "set_keys": view.env_overlay_set_keys,
+            "unset_keys": view.env_overlay_unset_keys
+        },
+        "cleanup_contract": {
+            "actions": view.cleanup_actions
+        },
     })
 }
 
@@ -5870,12 +6299,139 @@ fn credential_ref_provider_for(raw: &str) -> String {
     }
 }
 
+fn canonicalize_profile_ssh_auth(auth: &SshAuthConfig) -> Result<SshAuthConfig, CoreRuntimeError> {
+    let mut canonical = auth.clone();
+    canonical.password = canonical
+        .password
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    canonical.key_locator = canonical
+        .key_locator
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if canonical.kind == SshAuthKind::PrivateKey
+        && matches!(
+            canonical.private_key_source,
+            Some(SshPrivateKeySource::VaultRef)
+        )
+    {
+        if let Some(locator) = canonical.key_locator.as_ref() {
+            canonical.key_locator = Some(canonicalize_profile_credential_ref(locator)?);
+        }
+    }
+    Ok(canonical)
+}
+
+fn derive_ssh_auth_from_legacy_credential_ref(
+    credential_ref: Option<&str>,
+) -> Result<SshAuthConfig, CoreRuntimeError> {
+    let Some(raw) = credential_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(SshAuthConfig::default());
+    };
+    let normalized = canonicalize_profile_credential_ref(raw)?;
+    if is_vault_managed_credential_ref(&normalized) {
+        return Ok(SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::VaultRef),
+            key_locator: Some(normalized),
+        });
+    }
+    Ok(SshAuthConfig {
+        kind: SshAuthKind::PrivateKey,
+        secure_access: false,
+        password: None,
+        private_key_source: Some(SshPrivateKeySource::LocalPath),
+        key_locator: Some(normalized),
+    })
+}
+
+fn legacy_credential_ref_from_ssh_auth(auth: &SshAuthConfig) -> Option<String> {
+    if auth.kind != SshAuthKind::PrivateKey {
+        return None;
+    }
+    auth.key_locator
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn ssh_auth_storage_class_for_profile(target: &TargetProfile) -> SshAuthStorageClass {
+    let raw = target
+        .metadata
+        .get(TARGET_STORAGE_CLASS_METADATA_KEY)
+        .map(String::as_str)
+        .unwrap_or("sealed-overlay")
+        .trim()
+        .to_ascii_lowercase();
+    if raw == "plain" {
+        SshAuthStorageClass::Plain
+    } else {
+        SshAuthStorageClass::Sealed
+    }
+}
+
+fn effective_ssh_auth_for_profile(target: &TargetProfile) -> Result<SshAuthConfig, CoreRuntimeError> {
+    let auth = if let Some(auth) = target.ssh_auth.as_ref() {
+        let canonical = canonicalize_profile_ssh_auth(auth)?;
+        let has_legacy_ref = target
+            .credential_ref
+            .as_ref()
+            .map(|value| value.id.trim())
+            .is_some_and(|value| !value.is_empty());
+        if canonical.kind == SshAuthKind::None && has_legacy_ref {
+            derive_ssh_auth_from_legacy_credential_ref(
+                target.credential_ref.as_ref().map(|value| value.id.as_str()),
+            )?
+        } else {
+            canonical
+        }
+    } else {
+        derive_ssh_auth_from_legacy_credential_ref(
+            target.credential_ref.as_ref().map(|value| value.id.as_str()),
+        )?
+    };
+    canonicalize_profile_ssh_auth(&auth)
+}
+
+fn derive_target_ssh_delivery_plan(target: &TargetProfile) -> Result<SshDeliveryPlan, CoreRuntimeError> {
+    let storage_class = ssh_auth_storage_class_for_profile(target);
+    let auth = effective_ssh_auth_for_profile(target)?;
+    derive_ssh_delivery_plan(storage_class, &auth, SshAuthValidationContext::default()).map_err(
+        |err| {
+            CoreRuntimeError::Config(format!(
+                "{}: {}",
+                err.code.as_str(),
+                err.message
+            ))
+        },
+    )
+}
+
 fn normalize_profile_credential_ref(
     mut profile: TargetProfile,
 ) -> Result<TargetProfile, CoreRuntimeError> {
-    if let Some(credential_ref) = profile.credential_ref.as_mut() {
-        credential_ref.id = canonicalize_profile_credential_ref(&credential_ref.id)?;
-        credential_ref.provider = credential_ref_provider_for(&credential_ref.id);
+    if profile.kind == TargetKind::Ssh {
+        let ssh_auth = effective_ssh_auth_for_profile(&profile)?;
+        profile.credential_ref =
+            legacy_credential_ref_from_ssh_auth(&ssh_auth).map(|id| CredentialRef {
+                provider: credential_ref_provider_for(&id),
+                id,
+            });
+        profile.ssh_auth = Some(ssh_auth);
+    } else {
+        if let Some(credential_ref) = profile.credential_ref.as_mut() {
+            credential_ref.id = canonicalize_profile_credential_ref(&credential_ref.id)?;
+            credential_ref.provider = credential_ref_provider_for(&credential_ref.id);
+        }
+        profile.ssh_auth = None;
     }
     Ok(profile)
 }
@@ -5965,23 +6521,57 @@ fn to_target_profile(
             }
         })
         .collect::<bridgingio_domain::MetadataMap>();
-    let credential_ref = configured
-        .credential_ref
-        .as_ref()
-        .map(|reference| {
-            let canonicalized = canonicalize_profile_credential_ref(reference)?;
-            Ok(bridgingio_domain::CredentialRef {
-                provider: credential_ref_provider_for(&canonicalized),
-                id: canonicalized,
+    let ssh_auth = if configured.kind == TargetKind::Ssh {
+        let auth = if let Some(auth) = configured.ssh_auth.as_ref() {
+            let canonical = canonicalize_profile_ssh_auth(auth)?;
+            let has_legacy_ref = configured
+                .credential_ref
+                .as_ref()
+                .map(|value| value.trim())
+                .is_some_and(|value| !value.is_empty());
+            if canonical.kind == SshAuthKind::None && has_legacy_ref {
+                derive_ssh_auth_from_legacy_credential_ref(configured.credential_ref.as_deref())?
+            } else {
+                canonical
+            }
+        } else {
+            derive_ssh_auth_from_legacy_credential_ref(configured.credential_ref.as_deref())?
+        };
+        Some(auth)
+    } else {
+        None
+    };
+    let credential_ref = if configured.kind == TargetKind::Ssh {
+        ssh_auth
+            .as_ref()
+            .and_then(legacy_credential_ref_from_ssh_auth)
+            .map(|canonicalized| {
+                Ok(bridgingio_domain::CredentialRef {
+                    provider: credential_ref_provider_for(&canonicalized),
+                    id: canonicalized,
+                })
             })
-        })
-        .transpose()?;
+            .transpose()?
+    } else {
+        configured
+            .credential_ref
+            .as_ref()
+            .map(|reference| {
+                let canonicalized = canonicalize_profile_credential_ref(reference)?;
+                Ok(bridgingio_domain::CredentialRef {
+                    provider: credential_ref_provider_for(&canonicalized),
+                    id: canonicalized,
+                })
+            })
+            .transpose()?
+    };
     Ok(TargetProfile {
         id: configured.id.clone(),
         name: configured.display_name.clone(),
         kind: configured.kind.clone(),
         connection,
         credential_ref,
+        ssh_auth,
         default_policy: bridgingio_domain::PolicyProfile::default(),
         notes: configured.notes.clone(),
         metadata,
@@ -6094,6 +6684,49 @@ fn to_standalone_target_profile(
             }
         })
         .collect::<HashMap<_, _>>();
+    let ssh_auth = if profile.kind == TargetKind::Ssh {
+        let auth = if let Some(auth) = profile.ssh_auth.as_ref() {
+            let canonical = canonicalize_profile_ssh_auth(auth)?;
+            let has_legacy_ref = profile
+                .credential_ref
+                .as_ref()
+                .map(|value| value.id.trim())
+                .is_some_and(|value| !value.is_empty());
+            if canonical.kind == SshAuthKind::None && has_legacy_ref {
+                derive_ssh_auth_from_legacy_credential_ref(
+                    profile
+                        .credential_ref
+                        .as_ref()
+                        .map(|value| value.id.as_str()),
+                )?
+            } else {
+                canonical
+            }
+        } else {
+            derive_ssh_auth_from_legacy_credential_ref(
+                profile
+                    .credential_ref
+                    .as_ref()
+                    .map(|value| value.id.as_str()),
+            )?
+        };
+        Some(auth)
+    } else {
+        None
+    };
+    let credential_ref = if profile.kind == TargetKind::Ssh {
+        ssh_auth
+            .as_ref()
+            .and_then(legacy_credential_ref_from_ssh_auth)
+            .map(|value| canonicalize_profile_credential_ref(&value))
+            .transpose()?
+    } else {
+        profile
+            .credential_ref
+            .as_ref()
+            .map(|value| canonicalize_profile_credential_ref(&value.id))
+            .transpose()?
+    };
 
     Ok(StandaloneTargetProfile {
         id: profile.id.clone(),
@@ -6124,11 +6757,8 @@ fn to_standalone_target_profile(
             .get(TARGET_SEALED_PROFILE_REF_METADATA_KEY)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
-        credential_ref: profile
-            .credential_ref
-            .as_ref()
-            .map(|value| canonicalize_profile_credential_ref(&value.id))
-            .transpose()?,
+        credential_ref,
+        ssh_auth,
         notes: profile.notes.clone(),
         connection,
         terminal: StandaloneTerminalSection {
@@ -6239,6 +6869,15 @@ fn target_profile_json_value(profile: &TargetProfile) -> Value {
             .cloned(),
         "notes": profile.notes,
         "credential_ref": profile.credential_ref.as_ref().map(|value| value.id.clone()),
+        "ssh_auth": profile.ssh_auth.as_ref().map(|auth| {
+            json!({
+                "kind": auth.kind.as_str(),
+                "secure_access": auth.secure_access,
+                "private_key_source": auth.private_key_source.map(|value| value.as_str()),
+                "key_locator": auth.key_locator,
+                "has_password": auth.password.as_ref().is_some_and(|value| !value.trim().is_empty()),
+            })
+        }),
         "toolchains": profile.toolchains.iter().map(|(command, path_override)| {
             json!({
                 "command": command,
@@ -6638,7 +7277,11 @@ fn handle_http_connection(
                             )
                         }
                         Err(CoreRuntimeError::Config(message)) => {
-                            (400, "text/plain", format!("result=error|message={message}"))
+                            (
+                                400,
+                                "text/plain",
+                                model_plane_error_line_from_config_message(&message),
+                            )
                         }
                         Err(err) => (
                             500,
@@ -8627,6 +9270,7 @@ enabled = true
                 username: "dev".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -8677,6 +9321,7 @@ enabled = true
                 baud_rate: 115200,
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: BTreeMap::new(),
@@ -9961,6 +10606,26 @@ enabled = true
     }
 
     #[test]
+    fn ssh_config_error_subcode_maps_to_shared_error_and_display_safe_model_plane_line() {
+        let shared = super::ssh_shared_error_from_message(
+            "password-delivery-unavailable: askpass helper payload failed to initialize",
+        )
+        .expect("ssh shared error");
+        assert_eq!(
+            shared.module_code.as_deref(),
+            Some("password-delivery-unavailable")
+        );
+        assert_eq!(shared.common_code.as_str(), "dependency_unavailable");
+        assert!(!shared.message.contains("askpass"));
+
+        let response_line = super::model_plane_error_line_from_config_message(
+            "password-delivery-unavailable: askpass helper payload failed to initialize",
+        );
+        assert!(response_line.contains("module_code=password-delivery-unavailable"));
+        assert!(!response_line.contains("helper payload"));
+    }
+
+    #[test]
     fn list_profiles_redacts_sealed_target_while_vault_locked() {
         let mut runtime = sealed_overlay_runtime("sealed-catalog-redacted-locked");
         install_sealed_overlay(
@@ -10454,6 +11119,18 @@ enabled = true
             "ssh.delivery_mode".to_string(),
             "ssh-agent-broker".to_string(),
         );
+        target.metadata.insert(
+            super::TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "sealed-overlay".to_string(),
+        );
+        target.metadata.insert(
+            super::TARGET_ACCESS_CLASS_METADATA_KEY.to_string(),
+            "token-scoped".to_string(),
+        );
+        target.metadata.insert(
+            super::TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(),
+            "vault://bridgingio/target-profile/local".to_string(),
+        );
         target
             .metadata
             .insert("ssh.host_key_policy".to_string(), "accept-new".to_string());
@@ -10493,7 +11170,7 @@ enabled = true
             .resolution
             .warnings
             .iter()
-            .any(|line| line.contains("ssh broker session")));
+            .any(|line| line.contains("broker session")));
 
         let summary = runtime
             .vault_router
@@ -10583,6 +11260,333 @@ enabled = true
     }
 
     #[test]
+    fn password_direct_askpass_delivery_uses_env_overlay_and_cleanup_without_argv_leak() {
+        let root = temp_dir("password-direct-askpass");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+
+        let mut target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        target.metadata.insert(
+            super::TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "plain".to_string(),
+        );
+        target.credential_ref = None;
+        target.ssh_auth = Some(bridgingio_domain::SshAuthConfig {
+            kind: bridgingio_domain::SshAuthKind::Password,
+            secure_access: false,
+            password: Some("plain-password-demo".into()),
+            private_key_source: None,
+            key_locator: None,
+        });
+
+        let mut invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        let session = runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-password-direct",
+                    "run-password-direct",
+                    "client-password-direct",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut invocation,
+                None,
+            )
+            .expect("prepare direct password");
+        assert!(session.is_none());
+        assert!(invocation
+            .env_overlay
+            .set
+            .contains_key("SSH_ASKPASS"));
+        assert!(invocation
+            .env_overlay
+            .set
+            .contains_key("BRIDGINGIO_SSH_ASKPASS_SECRET_FILE"));
+        assert!(invocation
+            .cleanup_contract
+            .actions
+            .iter()
+            .any(|action| matches!(
+                action,
+                bridgingio_connectors::InvocationCleanupAction::RemoveFile { .. }
+            )));
+        assert!(invocation.args.iter().any(|arg| arg == "BatchMode=no"));
+        assert!(!invocation.args.iter().any(|arg| arg.contains("plain-password-demo")));
+        let shell_command = invocation.to_host_shell_command();
+        assert!(!shell_command.contains("plain-password-demo"));
+    }
+
+    #[test]
+    fn password_managed_askpass_delivery_for_sealed_target_uses_managed_mode() {
+        let root = temp_dir("password-managed-askpass");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+
+        let mut target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        target.metadata.insert(
+            super::TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "sealed-overlay".to_string(),
+        );
+        target.metadata.insert(
+            super::TARGET_ACCESS_CLASS_METADATA_KEY.to_string(),
+            "token-scoped".to_string(),
+        );
+        target.metadata.insert(
+            super::TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(),
+            "vault://bridgingio/target-profile/local".to_string(),
+        );
+        target.credential_ref = None;
+        target.ssh_auth = Some(bridgingio_domain::SshAuthConfig {
+            kind: bridgingio_domain::SshAuthKind::Password,
+            secure_access: true,
+            password: Some("sealed-password-demo".into()),
+            private_key_source: None,
+            key_locator: None,
+        });
+
+        let mut invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-password-managed",
+                    "run-password-managed",
+                    "client-password-managed",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut invocation,
+                None,
+            )
+            .expect("prepare managed password");
+        assert!(invocation
+            .resolution
+            .warnings
+            .iter()
+            .any(|line| line.contains("mode=managed-askpass")));
+        assert!(!invocation
+            .resolution
+            .warnings
+            .iter()
+            .any(|line| line.contains("sealed-password-demo")));
+    }
+
+    #[test]
+    fn local_brokered_identity_delivery_stages_secure_local_identity_and_isolates_agent_env() {
+        let root = temp_dir("local-brokered-identity");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+        let local_identity = root.join("id_local_brokered");
+        fs::write(&local_identity, "LOCAL-UNENCRYPTED-SSH-KEY").expect("write local key");
+
+        let mut target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        target.metadata.insert(
+            super::TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "plain".to_string(),
+        );
+        target.credential_ref = None;
+        target.ssh_auth = Some(bridgingio_domain::SshAuthConfig {
+            kind: bridgingio_domain::SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(bridgingio_domain::SshPrivateKeySource::LocalPath),
+            key_locator: Some(local_identity.to_string_lossy().to_string()),
+        });
+
+        let mut invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-local-broker",
+                    "run-local-broker",
+                    "client-local-broker",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut invocation,
+                None,
+            )
+            .expect("prepare local brokered identity");
+        assert!(invocation.args.iter().any(|arg| arg == "-i"));
+        assert!(invocation
+            .args
+            .iter()
+            .any(|arg| arg.contains("ssh-local-identity")));
+        assert!(!invocation
+            .args
+            .iter()
+            .any(|arg| arg == &local_identity.to_string_lossy().to_string()));
+        assert!(invocation
+            .env_overlay
+            .unset
+            .iter()
+            .any(|key| key == "SSH_AUTH_SOCK"));
+        assert!(invocation
+            .cleanup_contract
+            .actions
+            .iter()
+            .any(|action| matches!(
+                action,
+                bridgingio_connectors::InvocationCleanupAction::RemoveDirAll { .. }
+            )));
+    }
+
+    #[test]
+    fn local_brokered_identity_failure_does_not_fallback_to_direct_identity() {
+        let root = temp_dir("local-brokered-identity-fail");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+
+        let missing_identity = root.join("missing-id-local-brokered");
+        let mut target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        target.metadata.insert(
+            super::TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "plain".to_string(),
+        );
+        target.credential_ref = None;
+        target.ssh_auth = Some(bridgingio_domain::SshAuthConfig {
+            kind: bridgingio_domain::SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(bridgingio_domain::SshPrivateKeySource::LocalPath),
+            key_locator: Some(missing_identity.to_string_lossy().to_string()),
+        });
+
+        let mut invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        let err = runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-local-broker-fail",
+                    "run-local-broker-fail",
+                    "client-local-broker-fail",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut invocation,
+                None,
+            )
+            .expect_err("missing secure-local key must fail");
+        match err {
+            CoreRuntimeError::Config(message) => {
+                assert!(message.contains("local-brokered-identity-unavailable"));
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
+        assert!(!invocation.args.iter().any(|arg| arg == "-i"));
+    }
+
+    #[test]
+    fn password_delivery_rejects_when_password_secret_is_missing() {
+        let root = temp_dir("password-delivery-missing-secret");
+        let settings = bridgingio_engine::CoreSettings::from_toml_str(
+            &bridgingio_engine::CoreSettings::minimal_example(),
+        )
+        .expect("parse settings");
+        let resolver = super::ToolchainResolver::new(
+            ExecutableResolver::with_search_paths(Vec::new()),
+            &root,
+            Vec::new(),
+        );
+        let mut runtime =
+            StandaloneCoreRuntime::from_settings(settings, resolver).expect("runtime");
+
+        let mut target = runtime
+            .resolve_target_profile_by_ref("local")
+            .expect("local target");
+        target.metadata.insert(
+            super::TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "plain".to_string(),
+        );
+        target.credential_ref = None;
+        target.ssh_auth = Some(bridgingio_domain::SshAuthConfig {
+            kind: bridgingio_domain::SshAuthKind::Password,
+            secure_access: false,
+            password: None,
+            private_key_source: None,
+            key_locator: None,
+        });
+
+        let mut invocation = runtime
+            .resolve_structured_exec_invocation(&target, "whoami")
+            .expect("resolve invocation")
+            .expect("invocation");
+        let err = runtime
+            .prepare_ssh_secret_delivery_for_invocation(
+                &target,
+                &context(
+                    "agent-password-missing",
+                    "run-password-missing",
+                    "client-password-missing",
+                    bridgingio_domain::SessionReusePolicy::ReuseIfAlive,
+                ),
+                &mut invocation,
+                None,
+            )
+            .expect_err("missing password must be rejected");
+        match err {
+            CoreRuntimeError::Config(message) => {
+                assert!(message.contains("password-delivery-rejected"));
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn secret_backed_ssh_delivery_rejects_when_vault_not_unlocked() {
         let root = temp_dir("secret-backed-ssh-locked-gate");
         let settings = bridgingio_engine::CoreSettings::from_toml_str(
@@ -10611,6 +11615,18 @@ enabled = true
         target.metadata.insert(
             "ssh.delivery_mode".to_string(),
             "ssh-agent-broker".to_string(),
+        );
+        target.metadata.insert(
+            super::TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "sealed-overlay".to_string(),
+        );
+        target.metadata.insert(
+            super::TARGET_ACCESS_CLASS_METADATA_KEY.to_string(),
+            "token-scoped".to_string(),
+        );
+        target.metadata.insert(
+            super::TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(),
+            "vault://bridgingio/target-profile/local".to_string(),
         );
         target.credential_ref = Some(bridgingio_domain::CredentialRef {
             id: "vault:ssh-key:ops".into(),
@@ -10997,6 +12013,7 @@ exit 1
                 username: "root".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: BTreeMap::new(),
@@ -11036,6 +12053,19 @@ exit 1
         .expect("write config");
         runtime.settings_store.runtime_metadata.config_path =
             Some(config_path.to_string_lossy().to_string());
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            super::TARGET_STORAGE_CLASS_METADATA_KEY.to_string(),
+            "sealed-overlay".to_string(),
+        );
+        metadata.insert(
+            super::TARGET_ACCESS_CLASS_METADATA_KEY.to_string(),
+            "token-scoped".to_string(),
+        );
+        metadata.insert(
+            super::TARGET_SEALED_PROFILE_REF_METADATA_KEY.to_string(),
+            "vault://bridgingio/target-profile/legacy-ref-target".to_string(),
+        );
 
         let response = runtime.handle_app_request(ApiRequest {
             request_id: "upsert-legacy-ref".into(),
@@ -11054,9 +12084,10 @@ exit 1
                         id: "vault:ssh-key:ops_prod".into(),
                         provider: "legacy".into(),
                     }),
+                    ssh_auth: None,
                     default_policy: PolicyProfile::default(),
                     notes: None,
-                    metadata: BTreeMap::new(),
+                    metadata,
                     toolchains: BTreeMap::new(),
                 },
             },
@@ -11128,6 +12159,7 @@ exit 1
                         id: identity_path.to_string_lossy().to_string(),
                         provider: "manual".into(),
                     }),
+                    ssh_auth: None,
                     default_policy: PolicyProfile::default(),
                     notes: None,
                     metadata: BTreeMap::new(),
@@ -11231,6 +12263,7 @@ exit 1
                         id: "vault://bridgingio/adb/default".into(),
                         provider: "vault".into(),
                     }),
+                    ssh_auth: None,
                     default_policy: PolicyProfile::default(),
                     notes: None,
                     metadata: BTreeMap::new(),

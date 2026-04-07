@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::SystemTime;
@@ -185,12 +186,22 @@ impl TerminalProvider {
             });
         }
 
-        let output = Command::new(&invocation.program)
-            .args(&invocation.args)
-            .output()
-            .map_err(|err| ProviderError {
-                message: format!("failed to execute structured invocation: {err}"),
-            })?;
+        let mut command = Command::new(&invocation.program);
+        command.args(&invocation.args);
+        for key in &invocation.env_overlay.unset {
+            if !key.trim().is_empty() {
+                command.env_remove(key);
+            }
+        }
+        command.envs(invocation.env_overlay.set.clone());
+        let output = command.output();
+        let cleanup_warnings = run_invocation_cleanup(invocation);
+        let output = output.map_err(|err| ProviderError {
+            message: format!(
+                "failed to execute structured invocation: {err}{}",
+                format_cleanup_warning_suffix(&cleanup_warnings)
+            ),
+        })?;
 
         let created = self.artifacts.create_raw(
             artifact_id.to_string(),
@@ -211,6 +222,10 @@ impl TerminalProvider {
                 &created.id,
                 self.redact_for_display(&format!("stderr: {line}")),
             );
+        }
+        for warning in cleanup_warnings {
+            self.artifacts
+                .append_chunk(&created.id, self.redact_for_display(&format!("stderr: {warning}")));
         }
 
         Ok(created)
@@ -606,6 +621,42 @@ fn decode_output_text(bytes: &[u8]) -> String {
     decoded.text
 }
 
+fn format_cleanup_warning_suffix(cleanup_warnings: &[String]) -> String {
+    if cleanup_warnings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; cleanup warnings={}",
+            cleanup_warnings
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )
+    }
+}
+
+fn run_invocation_cleanup(invocation: &CommandInvocation) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for action in &invocation.cleanup_contract.actions {
+        let cleanup_result = match action {
+            bridgingio_connectors::InvocationCleanupAction::RemoveFile { path } => {
+                fs::remove_file(path)
+            }
+            bridgingio_connectors::InvocationCleanupAction::RemoveDirAll { path } => {
+                fs::remove_dir_all(path)
+            }
+        };
+        if let Err(err) = cleanup_result {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            warnings.push(format!("invocation cleanup failed for {}: {err}", action.label()));
+        }
+    }
+    warnings
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -778,6 +829,8 @@ mod tests {
             target_shell_dialect: bridgingio_connectors::TargetShellDialect::SshPosix,
             resolution: bridgingio_connectors::InvocationResolution::default(),
             quoting_boundary: bridgingio_connectors::InvocationQuotingBoundary::default(),
+            env_overlay: bridgingio_connectors::InvocationEnvironmentOverlay::default(),
+            cleanup_contract: bridgingio_connectors::InvocationCleanupContract::default(),
         };
         #[cfg(not(windows))]
         let invocation = bridgingio_connectors::CommandInvocation {
@@ -790,6 +843,8 @@ mod tests {
             target_shell_dialect: bridgingio_connectors::TargetShellDialect::SshPosix,
             resolution: bridgingio_connectors::InvocationResolution::default(),
             quoting_boundary: bridgingio_connectors::InvocationQuotingBoundary::default(),
+            env_overlay: bridgingio_connectors::InvocationEnvironmentOverlay::default(),
+            cleanup_contract: bridgingio_connectors::InvocationCleanupContract::default(),
         };
 
         let artifact = provider
@@ -809,6 +864,59 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("structured-direct-ok")),
             "artifact chunks: {chunks:?}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn exec_structured_invocation_applies_env_overlay_and_cleanup_contract() {
+        let mut provider = TerminalProvider::default();
+        let policy = PolicyProfile::default();
+        let helper = temp_dir("structured-cleanup").join("askpass-helper.sh");
+        fs::write(&helper, "#!/bin/sh\nexit 0\n").expect("write helper");
+        let mut env_overlay = bridgingio_connectors::InvocationEnvironmentOverlay::default();
+        env_overlay
+            .set
+            .insert("BRIDGINGIO_ENV_OVERLAY_TEST".into(), "overlay-ok".into());
+
+        let invocation = bridgingio_connectors::CommandInvocation {
+            program: "/bin/sh".into(),
+            args: vec!["-lc".into(), "printf '%s\\n' \"$BRIDGINGIO_ENV_OVERLAY_TEST\"".into()],
+            invocation_kind: bridgingio_connectors::InvocationKind::OneShot,
+            target_terminal_family: bridgingio_domain::TerminalTargetFamily::Terminal,
+            target_terminal_concurrency_policy:
+                bridgingio_domain::TerminalConcurrencyPolicy::Multiplexed,
+            target_shell_dialect: bridgingio_connectors::TargetShellDialect::SshPosix,
+            resolution: bridgingio_connectors::InvocationResolution::default(),
+            quoting_boundary: bridgingio_connectors::InvocationQuotingBoundary::default(),
+            env_overlay,
+            cleanup_contract: bridgingio_connectors::InvocationCleanupContract {
+                actions: vec![bridgingio_connectors::InvocationCleanupAction::RemoveFile {
+                    path: helper.clone(),
+                }],
+            },
+        };
+
+        let artifact = provider
+            .exec_structured_invocation(
+                "session",
+                Some("ch-structured-overlay"),
+                Some("ts-structured-overlay"),
+                &invocation,
+                "__do_not_execute_this_via_shell__",
+                "art-structured-overlay",
+                &policy,
+            )
+            .expect("exec structured invocation with env overlay");
+        let chunks = provider.artifacts.read_chunks(&artifact.id, 0, 20);
+        assert!(
+            chunks.iter().any(|line| line.contains("overlay-ok")),
+            "artifact chunks: {chunks:?}"
+        );
+        assert!(
+            !helper.exists(),
+            "cleanup contract must remove helper file: {}",
+            helper.display()
         );
     }
 

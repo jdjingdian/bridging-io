@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use bridgingio_domain::TargetKind;
+use bridgingio_domain::{SshAuthConfig, SshAuthKind, SshPrivateKeySource, SshDeliveryPlan, TargetKind};
 use bridgingio_engine::{
     i18n::Catalog, prepare_standalone_ssh_probe, CoreSettings, PrepareSshProbeError,
     StandaloneConnectionSection, StandaloneTargetProfile, StandaloneTerminalSection,
@@ -22,11 +22,12 @@ use bridgingio_secrets::{
     canonical_ssh_private_key_ref_from_key_name, local_admin_create_token_target,
     local_admin_delete_vault_target, local_admin_payload_digest_for_create_agent_token,
     local_admin_payload_digest_for_delete_agent_token, local_admin_payload_digest_for_delete_vault,
-    read_passive_vault_projection, take_last_verified_os_native_event, CreateAgentTokenRequest,
-    DeleteAgentTokenRequest, DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter,
-    SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
-    TrustedLocalSshKeyImportRequest, TrustedLocalSshKeyImportResult, UpdateAgentTokenAccessRequest,
-    UpdateAgentTokenLabelRequest, VaultError, VaultPassiveProjection, VerifiedOsNativeEvent,
+    inspect_trusted_local_ssh_private_key_path, read_passive_vault_projection,
+    take_last_verified_os_native_event, CreateAgentTokenRequest, DeleteAgentTokenRequest,
+    DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter, SshAgentBrokerPrepareRequest,
+    SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput, TrustedLocalSshKeyImportRequest,
+    TrustedLocalSshKeyImportResult, UpdateAgentTokenAccessRequest, UpdateAgentTokenLabelRequest,
+    VaultError, VaultPassiveProjection, VerifiedOsNativeEvent,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -107,7 +108,7 @@ impl Screen {
             Screen::TargetPublicDescriptor(_) => catalog.t("menu.target.public_descriptor"),
             Screen::TargetConnectionProfile(_) => catalog.t("menu.target.connection_profile"),
             Screen::TargetSensitiveOverlay(_) => catalog.t("menu.target.sensitive_overlay"),
-            Screen::TargetCredentialSource(_) => catalog.t("menu.target.credential_source"),
+            Screen::TargetCredentialSource(_) => catalog.t("menu.target.ssh_auth_setup"),
             Screen::TargetCredentialPicker(_) => catalog.t("menu.target.credential_picker"),
             Screen::TargetPolicy(_) => catalog.t("menu.target.policy"),
             Screen::SearchResults => catalog.t("menu.search_results.title"),
@@ -148,14 +149,19 @@ enum ActionKind {
     OpenSshKeyDetail(String),
     DeleteSshKey(String),
     OpenTargetCredentialSource(usize),
+    ContinueTargetSshAuthSetup(usize),
+    SelectTargetSshAuthNone(usize),
+    SelectTargetSshAuthPassword(usize),
+    SelectTargetSshAuthPrivateKey(usize),
+    SelectTargetSshKeySourceLocal(usize),
+    SelectTargetSshKeySourceVault(usize),
+    ToggleTargetSshSecureAccess(usize),
     OpenTargetCredentialPicker(usize),
     ApplyTarget(usize),
     BindTargetCredentialRef {
         target_index: usize,
         credential_ref: String,
     },
-    ClearTargetCredentialRef(usize),
-    EditTargetCredentialRef(usize),
     ImportLocalSshKeyIntoVault(usize),
     TestTargetConnection(usize),
     UnlockVault,
@@ -278,6 +284,7 @@ struct SshKeyImportDraft {
 enum ConfirmAction {
     DeleteVault,
     ConfirmPlainSshRisk,
+    ConfirmPlainSshPasswordRisk(usize),
     DeleteSshKey(String),
     RevokeToken(String),
     DeleteToken(String),
@@ -311,6 +318,7 @@ const OP_SSH_KEY_DELETE: &str = "ssh_key.delete";
 const OP_AUTH_TOKEN_CREATE: &str = "auth.token.create";
 const OP_AUTH_TOKEN_DELETE: &str = "auth.token.delete";
 const OP_TARGET_SSH_TEST_CONNECTION: &str = "target.ssh.test_connection";
+const SSH_LOCAL_KEY_PASSPHRASE_BLOCK_SUBCODE: &str = "local-key-passphrase-requires-vault-import";
 const SSH_TEST_DEFAULT_TIMEOUT_MS: u64 = 2000;
 const SSH_TEST_REMOTE_COMMAND: &str = "exit 0";
 const SSH_TEST_VERBOSE_CAPTURE_LIMIT_BYTES: usize = 32 * 1024;
@@ -401,6 +409,7 @@ pub struct MenuConfigApp {
     confirm_action: Option<ConfirmAction>,
     confirm_flow_id: Option<String>,
     confirm_selected: usize,
+    ssh_auth_block_popup: Option<String>,
     token_reveal: Option<String>,
     pending_token_label: Option<String>,
     selection_highlight_mode: SelectionHighlightMode,
@@ -466,6 +475,7 @@ impl MenuConfigApp {
             confirm_action: None,
             confirm_flow_id: None,
             confirm_selected: 0,
+            ssh_auth_block_popup: None,
             token_reveal: None,
             pending_token_label: None,
             selection_highlight_mode: detect_selection_highlight_mode(),
@@ -707,6 +717,10 @@ impl MenuConfigApp {
                 self.handle_token_reveal_key(key.code);
                 continue;
             }
+            if self.ssh_auth_block_popup.is_some() {
+                self.handle_ssh_auth_block_popup_key(key.code);
+                continue;
+            }
             if self.confirm_action.is_some() {
                 self.handle_confirm_key(key.code)?;
                 continue;
@@ -771,7 +785,12 @@ impl MenuConfigApp {
         match self.edit_mode_kind {
             EditModeKind::Text => match code {
                 KeyCode::Esc => self.cancel_edit("menu.status.edit_cancelled"),
-                KeyCode::Enter => self.commit_edit()?,
+                KeyCode::Enter => {
+                    if let Err(err) = self.commit_edit() {
+                        self.maybe_show_ssh_auth_block_popup(&err);
+                        self.last_status = err;
+                    }
+                }
                 KeyCode::Left => self.move_text_cursor(-1),
                 KeyCode::Right => self.move_text_cursor(1),
                 KeyCode::Backspace => self.backspace_text_char(),
@@ -782,7 +801,12 @@ impl MenuConfigApp {
                 KeyCode::Esc => self.cancel_edit("menu.status.select_cancelled"),
                 KeyCode::Down | KeyCode::Char('j') => self.move_edit_option(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_edit_option(-1),
-                KeyCode::Enter | KeyCode::Char(' ') => self.commit_edit()?,
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Err(err) = self.commit_edit() {
+                        self.maybe_show_ssh_auth_block_popup(&err);
+                        self.last_status = err;
+                    }
+                }
                 _ => {}
             },
         }
@@ -857,6 +881,18 @@ impl MenuConfigApp {
             }
             MenuEntryKind::Action(ActionKind::BindTargetCredentialRef { .. }) => {
                 self.last_status = self.t("menu.status.target_credential_picker_space_only");
+            }
+            MenuEntryKind::Action(ActionKind::ToggleTargetSshSecureAccess(_)) => {
+                self.last_status = self.t("menu.status.bool_toggle_space_only");
+            }
+            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(index)) => {
+                self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::None)?;
+            }
+            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(index)) => {
+                self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::Password)?;
+            }
+            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPrivateKey(index)) => {
+                self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::PrivateKey)?;
             }
             MenuEntryKind::Action(action) => self.run_action(action)?,
             MenuEntryKind::Info => {
@@ -1130,6 +1166,8 @@ impl MenuConfigApp {
     fn apply_edit_value(&mut self, field: &str, value: &str) -> Result<(), String> {
         let mut next = self.settings.clone();
         apply_field_edit(&mut next, field, value)?;
+        validate_trusted_local_ssh_private_key_constraints(&next)
+            .map_err(|err| self.tf("menu.error.validate_edited", &[("error", &err)]))?;
         next.validate().map_err(|err| {
             self.tf(
                 "menu.error.validate_edited",
@@ -1148,6 +1186,117 @@ impl MenuConfigApp {
         }
         self.refresh_security_summary();
         Ok(())
+    }
+
+    fn set_ssh_auth_kind(&mut self, target_index: usize, kind: SshAuthKind) -> Result<(), String> {
+        if self.settings.targets.get(target_index).is_none() {
+            return Err(self.t("menu.error.target_not_found"));
+        }
+        let field_kind = format!("targets[{target_index}].ssh_auth.kind");
+        let field_secure = format!("targets[{target_index}].ssh_auth.secure_access");
+        let field_password = format!("targets[{target_index}].ssh_auth.password");
+        let field_source = format!("targets[{target_index}].ssh_auth.private_key_source");
+        let field_locator = format!("targets[{target_index}].ssh_auth.key_locator");
+        apply_target_field_edit(&mut self.settings, &field_kind, kind.as_str())?;
+        match kind {
+            SshAuthKind::None => {
+                apply_target_field_edit(&mut self.settings, &field_secure, "false")?;
+                apply_target_field_edit(&mut self.settings, &field_password, "")?;
+                apply_target_field_edit(&mut self.settings, &field_source, "")?;
+                apply_target_field_edit(&mut self.settings, &field_locator, "")?;
+            }
+            SshAuthKind::Password => {
+                apply_target_field_edit(&mut self.settings, &field_secure, "true")?;
+                apply_target_field_edit(&mut self.settings, &field_source, "")?;
+                apply_target_field_edit(&mut self.settings, &field_locator, "")?;
+            }
+            SshAuthKind::PrivateKey => {
+                apply_target_field_edit(&mut self.settings, &field_secure, "true")?;
+                apply_target_field_edit(&mut self.settings, &field_password, "")?;
+                let source = self
+                    .settings
+                    .targets
+                    .get(target_index)
+                    .and_then(|item| {
+                        if is_sensitive_target(item) {
+                            item.ssh_auth
+                                .as_ref()
+                                .and_then(|auth| auth.private_key_source)
+                                .or(Some(SshPrivateKeySource::LocalPath))
+                        } else {
+                            Some(SshPrivateKeySource::LocalPath)
+                        }
+                    })
+                    .unwrap_or(SshPrivateKeySource::LocalPath);
+                apply_target_field_edit(&mut self.settings, &field_source, source.as_str())?;
+            }
+        }
+        for field in [
+            field_kind,
+            field_secure,
+            field_password,
+            field_source,
+            field_locator,
+        ] {
+            if !self.dirty_paths.contains(&field) {
+                self.dirty_paths.push(field);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_ssh_private_key_source(
+        &mut self,
+        target_index: usize,
+        source: SshPrivateKeySource,
+    ) -> Result<(), String> {
+        if let Some(target) = self.settings.targets.get(target_index) {
+            if !is_sensitive_target(target) && source == SshPrivateKeySource::VaultRef {
+                return Err(self.t("menu.error.plain_ssh_vault_key_disallowed"));
+            }
+        }
+        self.set_ssh_auth_kind(target_index, SshAuthKind::PrivateKey)?;
+        let field_source = format!("targets[{target_index}].ssh_auth.private_key_source");
+        let field_locator = format!("targets[{target_index}].ssh_auth.key_locator");
+        apply_target_field_edit(&mut self.settings, &field_source, source.as_str())?;
+        let auth = self
+            .settings
+            .targets
+            .get(target_index)
+            .map(effective_ssh_auth_for_menu_target)
+            .unwrap_or_default();
+        match source {
+            SshPrivateKeySource::LocalPath => {
+                if auth
+                    .key_locator
+                    .as_deref()
+                    .is_some_and(is_vault_credential_locator)
+                {
+                    apply_target_field_edit(&mut self.settings, &field_locator, "")?;
+                }
+            }
+            SshPrivateKeySource::VaultRef => {
+                if auth
+                    .key_locator
+                    .as_deref()
+                    .is_some_and(|locator| !is_vault_credential_locator(locator))
+                {
+                    apply_target_field_edit(&mut self.settings, &field_locator, "")?;
+                }
+            }
+        }
+        for field in [field_source, field_locator] {
+            if !self.dirty_paths.contains(&field) {
+                self.dirty_paths.push(field);
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_show_ssh_auth_block_popup(&mut self, error_message: &str) {
+        if error_message.contains(SSH_LOCAL_KEY_PASSPHRASE_BLOCK_SUBCODE) {
+            self.ssh_auth_block_popup = Some(error_message.to_string());
+        }
     }
 
     fn reset_edit_state(&mut self) {
@@ -1233,12 +1382,59 @@ impl MenuConfigApp {
                     credential_ref,
                 })?;
             }
+            MenuEntryKind::Action(ActionKind::ToggleTargetSshSecureAccess(index)) => {
+                self.run_action(ActionKind::ToggleTargetSshSecureAccess(index))?;
+            }
+            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(index)) => {
+                self.run_action(ActionKind::SelectTargetSshAuthNone(index))?;
+            }
+            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(index)) => {
+                self.run_action(ActionKind::SelectTargetSshAuthPassword(index))?;
+            }
+            MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPrivateKey(index)) => {
+                self.run_action(ActionKind::SelectTargetSshAuthPrivateKey(index))?;
+            }
             _ => {}
         }
         Ok(())
     }
 
+    fn handle_enter_on_ssh_auth_kind_entry(
+        &mut self,
+        index: usize,
+        kind: SshAuthKind,
+    ) -> Result<(), String> {
+        let Some(target) = self.settings.targets.get(index) else {
+            self.last_status = self.t("menu.error.target_not_found");
+            return Ok(());
+        };
+        let auth = effective_ssh_auth_for_menu_target(target);
+        let sensitive = is_sensitive_target(target);
+        if auth.kind != kind {
+            self.last_status = self.t("menu.status.ssh_auth_kind_space_only");
+            return Ok(());
+        }
+        match kind {
+            SshAuthKind::None => {
+                self.last_status = self.t("menu.status.ssh_auth_none_enter_hint");
+            }
+            SshAuthKind::Password => {
+                self.begin_edit(format!("targets[{index}].ssh_auth.password"))?;
+            }
+            SshAuthKind::PrivateKey => {
+                if sensitive && auth.private_key_source == Some(SshPrivateKeySource::VaultRef) {
+                    self.run_action(ActionKind::OpenTargetCredentialPicker(index))?;
+                } else {
+                    self.begin_edit(format!("targets[{index}].ssh_auth.key_locator"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn save(&mut self) -> Result<(), String> {
+        validate_trusted_local_ssh_private_key_constraints(&self.settings)
+            .map_err(|err| self.tf("menu.error.validate_settings", &[("error", &err)]))?;
         self.settings.validate().map_err(|err| {
             self.tf(
                 "menu.error.validate_settings",
@@ -2267,17 +2463,23 @@ impl MenuConfigApp {
                 self.ssh_import_draft.source_path.clear();
                 let bound_target = self.ssh_import_draft.bind_target_index;
                 if let Some(index) = bound_target {
-                    apply_target_field_edit(
-                        &mut self.settings,
-                        &format!("targets[{index}].credential_ref"),
+                    if let Err(err) = self.set_ssh_auth_kind(index, SshAuthKind::PrivateKey) {
+                        self.last_status = err;
+                        return Ok(());
+                    }
+                    if let Err(err) = self.apply_edit_value(
+                        &format!("targets[{index}].ssh_auth.private_key_source"),
+                        SshPrivateKeySource::VaultRef.as_str(),
+                    ) {
+                        self.last_status = err;
+                        return Ok(());
+                    }
+                    if let Err(err) = self.apply_edit_value(
+                        &format!("targets[{index}].ssh_auth.key_locator"),
                         &imported.credential_ref,
-                    )?;
-                    if !self
-                        .dirty_paths
-                        .contains(&format!("targets[{index}].credential_ref"))
-                    {
-                        self.dirty_paths
-                            .push(format!("targets[{index}].credential_ref"));
+                    ) {
+                        self.last_status = err;
+                        return Ok(());
                     }
                     self.ssh_import_draft.bind_target_index = None;
                     self.screen = Screen::TargetCredentialSource(index);
@@ -2472,7 +2674,100 @@ impl MenuConfigApp {
                 self.screen = Screen::TargetCredentialSource(index);
                 self.selected = 0;
                 self.sync_selection_to_focusable();
-                self.last_status = self.t("menu.status.opened_target_credential_source");
+                self.last_status = self.t("menu.status.opened_target_ssh_auth_setup");
+            }
+            ActionKind::ContinueTargetSshAuthSetup(index) => {
+                let Some(target) = self.settings.targets.get(index) else {
+                    self.last_status = self.t("menu.error.target_not_found");
+                    return Ok(());
+                };
+                if let Some(reason) = ssh_auth_setup_continue_block_reason(target) {
+                    let reason_text = self.t(reason.summary_key());
+                    self.last_status = self.tf(
+                        "menu.status.target_ssh_auth_setup_incomplete",
+                        &[("reason", &reason_text)],
+                    );
+                    return Ok(());
+                }
+                self.screen = Screen::TargetEditor(index);
+                self.selected = 0;
+                self.sync_selection_to_focusable();
+                self.last_status = self.t("menu.status.target_ssh_auth_setup_done");
+            }
+            ActionKind::SelectTargetSshAuthNone(index) => {
+                if let Err(err) = self.set_ssh_auth_kind(index, SshAuthKind::None) {
+                    self.maybe_show_ssh_auth_block_popup(&err);
+                    self.last_status = err;
+                } else {
+                    self.last_status = self.t("menu.status.ssh_auth_none_selected");
+                }
+            }
+            ActionKind::SelectTargetSshAuthPassword(index) => {
+                let Some(target) = self.settings.targets.get(index) else {
+                    self.last_status = self.t("menu.error.target_not_found");
+                    return Ok(());
+                };
+                if !is_sensitive_target(target) {
+                    self.confirm_action = Some(ConfirmAction::ConfirmPlainSshPasswordRisk(index));
+                    self.confirm_selected = 0;
+                    self.last_status = self.t("menu.status.plain_ssh_password_risk_confirm_pending");
+                    return Ok(());
+                }
+                if let Err(err) = self.set_ssh_auth_kind(index, SshAuthKind::Password) {
+                    self.maybe_show_ssh_auth_block_popup(&err);
+                    self.last_status = err;
+                } else {
+                    self.last_status = self.t("menu.status.ssh_auth_password_selected");
+                }
+            }
+            ActionKind::SelectTargetSshAuthPrivateKey(index) => {
+                if let Err(err) = self.set_ssh_auth_kind(index, SshAuthKind::PrivateKey) {
+                    self.maybe_show_ssh_auth_block_popup(&err);
+                    self.last_status = err;
+                    return Ok(());
+                }
+                if let Err(err) = self.set_ssh_private_key_source(index, SshPrivateKeySource::LocalPath) {
+                    self.maybe_show_ssh_auth_block_popup(&err);
+                    self.last_status = err;
+                } else {
+                    self.last_status = self.t("menu.status.ssh_auth_private_key_selected");
+                }
+            }
+            ActionKind::SelectTargetSshKeySourceLocal(index) => {
+                if let Err(err) = self.set_ssh_private_key_source(index, SshPrivateKeySource::LocalPath) {
+                    self.maybe_show_ssh_auth_block_popup(&err);
+                    self.last_status = err;
+                } else {
+                    self.last_status = self.t("menu.status.ssh_key_source_local_selected");
+                }
+            }
+            ActionKind::SelectTargetSshKeySourceVault(index) => {
+                if let Err(err) = self.set_ssh_auth_kind(index, SshAuthKind::PrivateKey) {
+                    self.maybe_show_ssh_auth_block_popup(&err);
+                    self.last_status = err;
+                } else {
+                    self.run_action(ActionKind::OpenTargetCredentialPicker(index))?;
+                }
+            }
+            ActionKind::ToggleTargetSshSecureAccess(index) => {
+                let Some(target) = self.settings.targets.get(index) else {
+                    self.last_status = self.t("menu.error.target_not_found");
+                    return Ok(());
+                };
+                if is_sensitive_target(target) {
+                    self.last_status = self.t("menu.status.ssh_secure_access_required");
+                    return Ok(());
+                }
+                let auth = effective_ssh_auth_for_menu_target(target);
+                let next = (!auth.secure_access).to_string();
+                if let Err(err) =
+                    self.apply_edit_value(&format!("targets[{index}].ssh_auth.secure_access"), &next)
+                {
+                    self.maybe_show_ssh_auth_block_popup(&err);
+                    self.last_status = err;
+                } else {
+                    self.last_status = self.t("menu.status.ssh_secure_access_toggled");
+                }
             }
             ActionKind::OpenTargetCredentialPicker(index) => {
                 if self.vault_router.is_none() {
@@ -2491,6 +2786,18 @@ impl MenuConfigApp {
                 self.last_status = self.t("menu.status.opened_target_credential_picker");
             }
             ActionKind::ApplyTarget(index) => {
+                if let Err(err) = validate_trusted_local_ssh_private_key_constraints(&self.settings)
+                {
+                    self.last_status = self.tf("menu.error.validate_settings", &[("error", &err)]);
+                    return Ok(());
+                }
+                if let Err(err) = self.settings.validate() {
+                    self.last_status = self.tf(
+                        "menu.error.validate_settings",
+                        &[("error", &format!("{err:?}"))],
+                    );
+                    return Ok(());
+                }
                 let Some(current) = self.settings.targets.get(index).cloned() else {
                     self.last_status = self.t("menu.error.target_not_found");
                     return Ok(());
@@ -2519,40 +2826,22 @@ impl MenuConfigApp {
                 target_index,
                 credential_ref,
             } => {
-                apply_target_field_edit(
-                    &mut self.settings,
-                    &format!("targets[{target_index}].credential_ref"),
+                self.set_ssh_auth_kind(target_index, SshAuthKind::PrivateKey)?;
+                self.apply_edit_value(
+                    &format!("targets[{target_index}].ssh_auth.private_key_source"),
+                    SshPrivateKeySource::VaultRef.as_str(),
+                )?;
+                self.apply_edit_value(
+                    &format!("targets[{target_index}].ssh_auth.key_locator"),
                     &credential_ref,
                 )?;
-                if !self
-                    .dirty_paths
-                    .contains(&format!("targets[{target_index}].credential_ref"))
-                {
-                    self.dirty_paths
-                        .push(format!("targets[{target_index}].credential_ref"));
+                if matches!(self.screen, Screen::TargetCredentialPicker(_)) {
+                    self.go_back();
                 }
                 self.last_status = self.tf(
                     "menu.status.bound_target_credential_ref",
                     &[("ref", credential_ref.as_str())],
                 );
-            }
-            ActionKind::ClearTargetCredentialRef(index) => {
-                apply_target_field_edit(
-                    &mut self.settings,
-                    &format!("targets[{index}].credential_ref"),
-                    "",
-                )?;
-                if !self
-                    .dirty_paths
-                    .contains(&format!("targets[{index}].credential_ref"))
-                {
-                    self.dirty_paths
-                        .push(format!("targets[{index}].credential_ref"));
-                }
-                self.last_status = self.t("menu.status.cleared_target_credential_ref");
-            }
-            ActionKind::EditTargetCredentialRef(index) => {
-                self.begin_edit(format!("targets[{index}].credential_ref"))?;
             }
             ActionKind::ImportLocalSshKeyIntoVault(index) => {
                 if self.vault_router.is_none() {
@@ -2588,10 +2877,10 @@ impl MenuConfigApp {
                     .push(default_sensitive_ssh_target(index));
                 self.push_navigation_state();
                 self.start_target_edit_session(index, true);
-                self.screen = Screen::TargetEditor(index);
+                self.screen = Screen::TargetCredentialSource(index);
                 self.selected = 0;
                 self.sync_selection_to_focusable();
-                self.last_status = self.t("menu.status.added_sensitive_ssh_target");
+                self.last_status = self.t("menu.status.opened_target_ssh_auth_setup");
             }
             ActionKind::AddSensitiveAdbTarget => {
                 if self.security_summary.lock_state != "unlocked" {
@@ -2770,6 +3059,13 @@ impl MenuConfigApp {
         }
     }
 
+    fn handle_ssh_auth_block_popup_key(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ')) {
+            self.ssh_auth_block_popup = None;
+            self.last_status = self.t("menu.status.ssh_auth_block_acknowledged");
+        }
+    }
+
     fn handle_confirm_key(&mut self, code: KeyCode) -> Result<(), String> {
         match code {
             KeyCode::Left => {
@@ -2894,10 +3190,14 @@ impl MenuConfigApp {
                         self.settings.targets.push(default_ssh_target(index));
                         self.push_navigation_state();
                         self.start_target_edit_session(index, true);
-                        self.screen = Screen::TargetEditor(index);
+                        self.screen = Screen::TargetCredentialSource(index);
                         self.selected = 0;
                         self.sync_selection_to_focusable();
-                        self.last_status = self.t("menu.status.added_ssh_target");
+                        self.last_status = self.t("menu.status.opened_target_ssh_auth_setup");
+                    }
+                    Some(ConfirmAction::ConfirmPlainSshPasswordRisk(index)) => {
+                        self.set_ssh_auth_kind(index, SshAuthKind::Password)?;
+                        self.last_status = self.t("menu.status.plain_ssh_password_selected");
                     }
                     Some(ConfirmAction::RevokeToken(token_id)) => {
                         self.revoke_token_confirmed(&token_id)?
@@ -3751,6 +4051,9 @@ fn render(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     if app.confirm_action.is_some() {
         render_confirm_popup(frame, app);
     }
+    if app.ssh_auth_block_popup.is_some() {
+        render_ssh_auth_block_popup(frame, app);
+    }
     if app.token_reveal.is_some() {
         render_token_reveal_popup(frame, app);
     }
@@ -4289,6 +4592,7 @@ fn render_confirm_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     let action_text = match action {
         ConfirmAction::DeleteVault => app.t("menu.confirm.delete_vault"),
         ConfirmAction::ConfirmPlainSshRisk => app.t("menu.confirm.plain_ssh_risk"),
+        ConfirmAction::ConfirmPlainSshPasswordRisk(_) => app.t("menu.confirm.plain_ssh_password_risk"),
         ConfirmAction::DeleteSshKey(reference) => app.tf(
             "menu.confirm.delete_ssh_key",
             &[("ref", reference.as_str())],
@@ -4318,6 +4622,28 @@ fn render_confirm_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     .block(
         Block::default()
             .title(app.t("menu.confirm.title"))
+            .borders(Borders::ALL),
+    )
+    .wrap(Wrap { trim: false });
+    frame.render_widget(popup, area);
+}
+
+fn render_ssh_auth_block_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
+    let Some(message) = app.ssh_auth_block_popup.as_ref() else {
+        return;
+    };
+    let area = centered_rect(76, 38, frame.area());
+    frame.render_widget(Clear, area);
+    let popup = Paragraph::new(vec![
+        Line::from(app.t("menu.ssh_auth.block.message")),
+        Line::from(""),
+        Line::from(message.clone()),
+        Line::from(""),
+        Line::from(app.t("menu.ssh_auth.block.hint")),
+    ])
+    .block(
+        Block::default()
+            .title(app.t("menu.ssh_auth.block.title"))
             .borders(Borders::ALL),
     )
     .wrap(Wrap { trim: false });
@@ -4491,6 +4817,21 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
                     _ => "< >",
                 };
                 return format!("{selector} {marker} {}", entry.label);
+            }
+            if matches!(
+                action,
+                ActionKind::SelectTargetSshAuthNone(_)
+                    | ActionKind::SelectTargetSshAuthPassword(_)
+                    | ActionKind::SelectTargetSshAuthPrivateKey(_)
+            ) {
+                let marker = match entry.value.as_deref() {
+                    Some("selected") => "<*>",
+                    _ => "< >",
+                };
+                if matches!(action, ActionKind::SelectTargetSshAuthNone(_)) {
+                    return format!("{selector} {marker} {}", entry.label);
+                }
+                return format!("{selector} {marker} {} --->", entry.label);
             }
             format!("{selector}     {} --->", entry.label)
         }
@@ -5108,6 +5449,110 @@ fn ssh_key_detail_entries(
     entries
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshAuthSetupContinueBlockReason {
+    PasswordMissing,
+    LocalKeyPathMissing,
+    LocalKeyPathInvalid,
+    LocalKeyPassphraseProtected,
+    VaultKeyMissing,
+}
+
+impl SshAuthSetupContinueBlockReason {
+    fn summary_key(self) -> &'static str {
+        match self {
+            Self::PasswordMissing => "menu.target.ssh_auth_continue.blocked.password_missing",
+            Self::LocalKeyPathMissing => "menu.target.ssh_auth_continue.blocked.local_key_missing",
+            Self::LocalKeyPathInvalid => "menu.target.ssh_auth_continue.blocked.local_key_invalid",
+            Self::LocalKeyPassphraseProtected => {
+                "menu.target.ssh_auth_continue.blocked.local_key_passphrase"
+            }
+            Self::VaultKeyMissing => "menu.target.ssh_auth_continue.blocked.vault_key_missing",
+        }
+    }
+}
+
+fn ssh_auth_setup_continue_block_reason(
+    target: &StandaloneTargetProfile,
+) -> Option<SshAuthSetupContinueBlockReason> {
+    if target.kind != TargetKind::Ssh {
+        return None;
+    }
+    let auth = effective_ssh_auth_for_menu_target(target);
+    match auth.kind {
+        SshAuthKind::None => None,
+        SshAuthKind::Password => {
+            if auth
+                .password
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+            {
+                None
+            } else {
+                Some(SshAuthSetupContinueBlockReason::PasswordMissing)
+            }
+        }
+        SshAuthKind::PrivateKey => {
+            if !is_sensitive_target(target) {
+                let Some(locator) = auth
+                    .key_locator
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && !is_vault_credential_locator(value))
+                else {
+                    return Some(SshAuthSetupContinueBlockReason::LocalKeyPathMissing);
+                };
+                return match inspect_trusted_local_ssh_private_key_path(Path::new(locator)) {
+                    Ok(inspection) => {
+                        if inspection.passphrase_protected {
+                            Some(SshAuthSetupContinueBlockReason::LocalKeyPassphraseProtected)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => Some(SshAuthSetupContinueBlockReason::LocalKeyPathInvalid),
+                };
+            }
+            let source = auth.private_key_source.unwrap_or(SshPrivateKeySource::LocalPath);
+            match source {
+                SshPrivateKeySource::LocalPath => {
+                    let Some(locator) = auth
+                        .key_locator
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        return Some(SshAuthSetupContinueBlockReason::LocalKeyPathMissing);
+                    };
+                    match inspect_trusted_local_ssh_private_key_path(Path::new(locator)) {
+                        Ok(inspection) => {
+                            if inspection.passphrase_protected {
+                                Some(SshAuthSetupContinueBlockReason::LocalKeyPassphraseProtected)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => Some(SshAuthSetupContinueBlockReason::LocalKeyPathInvalid),
+                    }
+                }
+                SshPrivateKeySource::VaultRef => {
+                    if auth
+                        .key_locator
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(is_vault_credential_locator)
+                    {
+                        None
+                    } else {
+                        Some(SshAuthSetupContinueBlockReason::VaultKeyMissing)
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn target_credential_source_entries(
     app: &MenuConfigApp,
     index: usize,
@@ -5137,33 +5582,168 @@ fn target_credential_source_entries(
             ),
         ];
     }
-    vec![
+    let auth = effective_ssh_auth_for_menu_target(target);
+    let mut entries = vec![
         info_entry(
-            &catalog.t("menu.target.credential_ref"),
-            Some(target.credential_ref.as_deref().unwrap_or("").to_string()),
-            &catalog.t("menu.target.credential_ref.desc"),
+            &catalog.t("menu.target.ssh_auth_kind"),
+            Some(match auth.kind {
+                SshAuthKind::None => catalog.t("menu.target.ssh_auth_kind.none"),
+                SshAuthKind::Password => catalog.t("menu.target.ssh_auth_kind.password"),
+                SshAuthKind::PrivateKey => catalog.t("menu.target.ssh_auth_kind.private_key"),
+            }),
+            &catalog.t("menu.target.ssh_auth_kind.desc"),
         ),
-        action_entry(
-            &catalog.t("menu.target.credential_picker"),
-            &catalog.t("menu.target.credential_picker.desc"),
-            ActionKind::OpenTargetCredentialPicker(index),
-        ),
-        action_entry(
-            &catalog.t("menu.target.import_local_ssh_key"),
-            &catalog.t("menu.target.import_local_ssh_key.desc"),
-            ActionKind::ImportLocalSshKeyIntoVault(index),
-        ),
-        action_entry(
-            &catalog.t("menu.target.manual_credential_ref"),
-            &catalog.t("menu.target.manual_credential_ref.desc"),
-            ActionKind::EditTargetCredentialRef(index),
-        ),
-        action_entry(
-            &catalog.t("menu.target.clear_credential_ref"),
-            &catalog.t("menu.target.clear_credential_ref.desc"),
-            ActionKind::ClearTargetCredentialRef(index),
-        ),
-    ]
+        MenuEntry {
+            label: catalog.t("menu.target.ssh_auth_pick.none"),
+            value: Some(
+                if auth.kind == SshAuthKind::None {
+                    "selected"
+                } else {
+                    "unselected"
+                }
+                .to_string(),
+            ),
+            description: catalog.t("menu.target.ssh_auth_pick.none.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(index)),
+        },
+        MenuEntry {
+            label: catalog.t("menu.target.ssh_auth_pick.password"),
+            value: Some(
+                if auth.kind == SshAuthKind::Password {
+                    "selected"
+                } else {
+                    "unselected"
+                }
+                .to_string(),
+            ),
+            description: catalog.t("menu.target.ssh_auth_pick.password.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(index)),
+        },
+        MenuEntry {
+            label: catalog.t("menu.target.ssh_auth_pick.private_key"),
+            value: Some(
+                if auth.kind == SshAuthKind::PrivateKey {
+                    "selected"
+                } else {
+                    "unselected"
+                }
+                .to_string(),
+            ),
+            description: catalog.t("menu.target.ssh_auth_pick.private_key.desc"),
+            dirty_key: None,
+            kind: MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPrivateKey(index)),
+        },
+    ];
+
+    if auth.kind.is_secret_backed() {
+        if is_sensitive_target(target) {
+            entries.push(info_entry(
+                &catalog.t("menu.target.ssh_secure_access"),
+                Some(catalog.t("menu.target.ssh_secure_access.required")),
+                &catalog.t("menu.target.ssh_secure_access.required.desc"),
+            ));
+        } else {
+            let secure_value = if auth.secure_access {
+                catalog.t("menu.value.true")
+            } else {
+                catalog.t("menu.value.false")
+            };
+            entries.push(action_entry(
+                &format!("{} = {}", catalog.t("menu.target.ssh_secure_access"), secure_value),
+                &catalog.t("menu.target.ssh_secure_access.desc"),
+                ActionKind::ToggleTargetSshSecureAccess(index),
+            ));
+        }
+    }
+
+    match auth.kind {
+        SshAuthKind::Password => {
+            entries.push(edit_entry(
+                &catalog.t("menu.target.ssh_password"),
+                &format!("targets[{index}].ssh_auth.password"),
+                auth.password.as_deref().unwrap_or(""),
+                &catalog.t("menu.target.ssh_password.desc"),
+            ));
+        }
+        SshAuthKind::PrivateKey => {
+            if is_sensitive_target(target) {
+                let source = auth.private_key_source.unwrap_or(SshPrivateKeySource::LocalPath);
+                let source_value = match source {
+                    SshPrivateKeySource::LocalPath => catalog.t("menu.target.ssh_key_source.local"),
+                    SshPrivateKeySource::VaultRef => catalog.t("menu.target.ssh_key_source.vault"),
+                };
+                entries.push(info_entry(
+                    &catalog.t("menu.target.ssh_key_source"),
+                    Some(source_value),
+                    &catalog.t("menu.target.ssh_key_source.desc"),
+                ));
+                if source == SshPrivateKeySource::LocalPath {
+                    entries.push(action_entry(
+                        &catalog.t("menu.target.ssh_key_source_pick.vault"),
+                        &catalog.t("menu.target.ssh_key_source_pick.vault.desc"),
+                        ActionKind::SelectTargetSshKeySourceVault(index),
+                    ));
+                    entries.push(edit_entry(
+                        &catalog.t("menu.target.ssh_local_key_path"),
+                        &format!("targets[{index}].ssh_auth.key_locator"),
+                        auth.key_locator.as_deref().unwrap_or(""),
+                        &catalog.t("menu.target.ssh_local_key_path.desc"),
+                    ));
+                } else {
+                    entries.push(action_entry(
+                        &catalog.t("menu.target.ssh_key_source_pick.local"),
+                        &catalog.t("menu.target.ssh_key_source_pick.local.desc"),
+                        ActionKind::SelectTargetSshKeySourceLocal(index),
+                    ));
+                    entries.push(info_entry(
+                        &catalog.t("menu.target.credential_ref"),
+                        Some(auth.key_locator.as_deref().unwrap_or("").to_string()),
+                        &catalog.t("menu.target.credential_ref.desc"),
+                    ));
+                    entries.push(action_entry(
+                        &catalog.t("menu.target.credential_picker"),
+                        &catalog.t("menu.target.credential_picker.desc"),
+                        ActionKind::OpenTargetCredentialPicker(index),
+                    ));
+                    entries.push(action_entry(
+                        &catalog.t("menu.target.import_local_ssh_key"),
+                        &catalog.t("menu.target.import_local_ssh_key.desc"),
+                        ActionKind::ImportLocalSshKeyIntoVault(index),
+                    ));
+                }
+            } else {
+                let local_locator = auth
+                    .key_locator
+                    .as_deref()
+                    .filter(|locator| !is_vault_credential_locator(locator))
+                    .unwrap_or("");
+                entries.push(edit_entry(
+                    &catalog.t("menu.target.ssh_local_key_path"),
+                    &format!("targets[{index}].ssh_auth.key_locator"),
+                    local_locator,
+                    &catalog.t("menu.target.ssh_local_key_path.desc"),
+                ));
+            }
+        }
+        SshAuthKind::None => {}
+    }
+
+    if let Some(reason) = ssh_auth_setup_continue_block_reason(target) {
+        entries.push(info_entry(
+            &catalog.t("menu.target.ssh_auth_continue"),
+            Some(catalog.t(reason.summary_key())),
+            &catalog.t("menu.target.ssh_auth_continue.blocked.desc"),
+        ));
+    } else {
+        entries.push(action_entry(
+            &catalog.t("menu.target.ssh_auth_continue"),
+            &catalog.t("menu.target.ssh_auth_continue.desc"),
+            ActionKind::ContinueTargetSshAuthSetup(index),
+        ));
+    }
+    entries
 }
 
 fn target_credential_picker_entries(
@@ -5196,8 +5776,14 @@ fn target_credential_picker_entries(
         .settings
         .targets
         .get(index)
-        .and_then(|target| target.credential_ref.as_deref())
-        .unwrap_or("");
+        .map(effective_ssh_auth_for_menu_target)
+        .and_then(|auth| {
+            (auth.kind == SshAuthKind::PrivateKey
+                && auth.private_key_source == Some(SshPrivateKeySource::VaultRef))
+            .then_some(auth)
+        })
+        .and_then(|auth| auth.key_locator)
+        .unwrap_or_default();
     let mut entries = app
         .ssh_key_rows
         .iter()
@@ -5681,21 +6267,13 @@ fn target_connection_profile_entries(
             entries.insert(
                 0,
                 action_entry(
-                    &catalog.t("menu.target.credential_source"),
-                    &catalog.t("menu.target.credential_source.desc"),
+                    &catalog.t("menu.target.ssh_authentication"),
+                    &catalog.t("menu.target.ssh_authentication.desc"),
                     ActionKind::OpenTargetCredentialSource(index),
                 ),
             );
             entries.insert(
                 1,
-                info_entry(
-                    &catalog.t("menu.target.credential_ref"),
-                    Some(target.credential_ref.as_deref().unwrap_or("").to_string()),
-                    &catalog.t("menu.target.credential_ref.desc"),
-                ),
-            );
-            entries.insert(
-                2,
                 action_entry(
                     &catalog.t("menu.target.test_connection"),
                     &catalog.t("menu.target.test_connection.desc"),
@@ -5806,14 +6384,9 @@ fn target_sensitive_overlay_entries_from_settings(
     let mut entries = Vec::new();
     if target.kind == TargetKind::Ssh {
         entries.push(action_entry(
-            &catalog.t("menu.target.credential_source"),
-            &catalog.t("menu.target.credential_source.desc"),
+            &catalog.t("menu.target.ssh_authentication"),
+            &catalog.t("menu.target.ssh_authentication.desc"),
             ActionKind::OpenTargetCredentialSource(index),
-        ));
-        entries.push(info_entry(
-            &catalog.t("menu.target.credential_ref"),
-            Some(target.credential_ref.as_deref().unwrap_or("").to_string()),
-            &catalog.t("menu.target.credential_ref.desc"),
         ));
         entries.push(action_entry(
             &catalog.t("menu.target.test_connection"),
@@ -6134,10 +6707,11 @@ fn field_options(field: &str) -> Option<Vec<String>> {
         "model_plane.http.allow_non_loopback" => vec!["false", "true"],
         _ => {
             if let Some((_, suffix)) = parse_target_field(field) {
-                if suffix == "enabled" {
-                    vec!["false", "true"]
-                } else {
-                    return None;
+                match suffix {
+                    "enabled" | "ssh_auth.secure_access" => vec!["false", "true"],
+                    "ssh_auth.kind" => vec!["none", "password", "private-key"],
+                    "ssh_auth.private_key_source" => vec!["local-path", "vault-ref"],
+                    _ => return None,
                 }
             } else {
                 return None;
@@ -6150,7 +6724,7 @@ fn field_options(field: &str) -> Option<Vec<String>> {
 fn is_boolean_toggle_field(field: &str) -> bool {
     matches!(field, "model_plane.http.allow_non_loopback")
         || parse_target_field(field)
-            .map(|(_, suffix)| suffix == "enabled")
+            .map(|(_, suffix)| suffix == "enabled" || suffix == "ssh_auth.secure_access")
             .unwrap_or(false)
 }
 
@@ -6172,6 +6746,7 @@ fn char_to_byte_index(input: &str, char_index: usize) -> usize {
 fn target_field_value(settings: &CoreSettings, field: &str) -> Option<String> {
     let (index, suffix) = parse_target_field(field)?;
     let target = settings.targets.get(index)?;
+    let auth = effective_ssh_auth_for_menu_target(target);
     match suffix {
         "id" => Some(target.id.clone()),
         "display_name" => Some(target.display_name.clone()),
@@ -6197,6 +6772,15 @@ fn target_field_value(settings: &CoreSettings, field: &str) -> Option<String> {
         "connection.selector_value" => {
             Some(target.connection.selector_value.clone().unwrap_or_default())
         }
+        "ssh_auth.kind" => Some(auth.kind.as_str().to_string()),
+        "ssh_auth.secure_access" => Some(auth.secure_access.to_string()),
+        "ssh_auth.password" => Some(auth.password.unwrap_or_default()),
+        "ssh_auth.private_key_source" => Some(
+            auth.private_key_source
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_default(),
+        ),
+        "ssh_auth.key_locator" => Some(auth.key_locator.unwrap_or_default()),
         _ => None,
     }
 }
@@ -6317,6 +6901,67 @@ fn apply_target_field_edit(
                 Some(value.to_string())
             };
         }
+        "ssh_auth.kind" => {
+            let auth = target.ssh_auth.get_or_insert_with(SshAuthConfig::default);
+            auth.kind = SshAuthKind::parse(value)
+                .ok_or_else(|| "ssh_auth.kind must be one of none/password/private-key".to_string())?;
+            match auth.kind {
+                SshAuthKind::None => {
+                    auth.secure_access = false;
+                    auth.password = None;
+                    auth.private_key_source = None;
+                    auth.key_locator = None;
+                }
+                SshAuthKind::Password => {
+                    auth.private_key_source = None;
+                    auth.key_locator = None;
+                }
+                SshAuthKind::PrivateKey => {
+                    auth.password = None;
+                }
+            }
+            sync_legacy_credential_ref_from_ssh_auth(target);
+        }
+        "ssh_auth.secure_access" => {
+            let auth = target.ssh_auth.get_or_insert_with(SshAuthConfig::default);
+            auth.secure_access = value
+                .parse::<bool>()
+                .map_err(|_| "ssh_auth.secure_access must be bool".to_string())?;
+            sync_legacy_credential_ref_from_ssh_auth(target);
+        }
+        "ssh_auth.password" => {
+            let auth = target.ssh_auth.get_or_insert_with(SshAuthConfig::default);
+            auth.password = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+            sync_legacy_credential_ref_from_ssh_auth(target);
+        }
+        "ssh_auth.private_key_source" => {
+            let auth = target.ssh_auth.get_or_insert_with(SshAuthConfig::default);
+            auth.private_key_source = if value.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    SshPrivateKeySource::parse(value)
+                        .ok_or_else(|| {
+                            "ssh_auth.private_key_source must be local-path or vault-ref"
+                                .to_string()
+                        })?,
+                )
+            };
+            sync_legacy_credential_ref_from_ssh_auth(target);
+        }
+        "ssh_auth.key_locator" => {
+            let auth = target.ssh_auth.get_or_insert_with(SshAuthConfig::default);
+            auth.key_locator = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.trim().to_string())
+            };
+            sync_legacy_credential_ref_from_ssh_auth(target);
+        }
         other => return Err(format!("`{other}` is not editable in menuconfig")),
     }
     Ok(())
@@ -6359,8 +7004,22 @@ fn screen_for_field(settings: &CoreSettings, field: &str) -> Screen {
                 | "connection.port"
                 | "connection.username"
                 | "connection.selector_kind"
-                | "connection.selector_value" => {
-                    if suffix == "credential_ref" && matches!(target.kind, TargetKind::Ssh) {
+                | "connection.selector_value"
+                | "ssh_auth.kind"
+                | "ssh_auth.secure_access"
+                | "ssh_auth.password"
+                | "ssh_auth.private_key_source"
+                | "ssh_auth.key_locator" => {
+                    if matches!(
+                        suffix,
+                        "credential_ref"
+                            | "ssh_auth.kind"
+                            | "ssh_auth.secure_access"
+                            | "ssh_auth.password"
+                            | "ssh_auth.private_key_source"
+                            | "ssh_auth.key_locator"
+                    ) && matches!(target.kind, TargetKind::Ssh)
+                    {
                         return Screen::TargetCredentialSource(index);
                     }
                     if is_sensitive_target(target) {
@@ -6611,6 +7270,56 @@ fn capture_child_stderr_snapshot(child: &mut std::process::Child, max_bytes: usi
     String::from_utf8_lossy(&bytes).to_string()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SshTestVerboseContext {
+    executable_path: String,
+    delivery_plan: String,
+    vault_delivery_mode: String,
+    vault_fallback_delivery_mode: String,
+    toolchain_summary: String,
+    broker_session_active: bool,
+    isolate_ambient_agent: bool,
+    env_set_keys: Vec<String>,
+    env_unset_keys: Vec<String>,
+    ssh_option_overrides: Vec<String>,
+    endpoint_arg: Option<String>,
+    remote_command_arg: Option<String>,
+    askpass_helper_staged: bool,
+    askpass_helper_exists_pre_spawn: Option<bool>,
+    askpass_secret_staged: bool,
+    askpass_secret_exists_pre_spawn: Option<bool>,
+    askpass_secret_size_bytes_pre_spawn: Option<u64>,
+    staged_identity_exists_pre_spawn: Option<bool>,
+    staged_identity_size_bytes_pre_spawn: Option<u64>,
+}
+
+fn sanitize_ssh_option_for_verbose(raw: &str) -> String {
+    let Some((key, value)) = raw.split_once('=') else {
+        return raw.to_string();
+    };
+    if key.eq_ignore_ascii_case("IdentityFile") {
+        let _ = value;
+        return format!("{key}=<redacted-path>");
+    }
+    raw.to_string()
+}
+
+fn collect_ssh_option_overrides_for_verbose(args: &[String]) -> Vec<String> {
+    let mut options = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        if args[index] == "-o" {
+            if let Some(option) = args.get(index + 1) {
+                options.push(sanitize_ssh_option_for_verbose(option));
+            }
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    options
+}
+
 fn append_ssh_test_verbose_log(
     log_path: &Path,
     flow_id: &str,
@@ -6619,6 +7328,7 @@ fn append_ssh_test_verbose_log(
     timeout_ms: u64,
     elapsed_ms: u128,
     result: &SshTestWorkerResult,
+    context: &SshTestVerboseContext,
     stderr: &str,
 ) {
     let Some(parent) = log_path.parent() else {
@@ -6650,6 +7360,49 @@ fn append_ssh_test_verbose_log(
         header.push_str(&format!("error_code={error_code}\n"));
     }
     let _ = file.write_all(header.as_bytes());
+    let context_block = format!(
+        "ssh_probe_context_begin\n\
+executable_path={}\n\
+delivery_plan={}\n\
+vault_delivery_mode={}\n\
+vault_fallback_delivery_mode={}\n\
+toolchain_summary={}\n\
+broker_session_active={}\n\
+isolate_ambient_agent={}\n\
+env_set_keys={:?}\n\
+env_unset_keys={:?}\n\
+ssh_option_overrides={:?}\n\
+endpoint_arg={:?}\n\
+remote_command_arg={:?}\n\
+askpass_helper_staged={}\n\
+askpass_helper_exists_pre_spawn={:?}\n\
+askpass_secret_staged={}\n\
+askpass_secret_exists_pre_spawn={:?}\n\
+askpass_secret_size_bytes_pre_spawn={:?}\n\
+staged_identity_exists_pre_spawn={:?}\n\
+staged_identity_size_bytes_pre_spawn={:?}\n\
+ssh_probe_context_end\n",
+        context.executable_path,
+        context.delivery_plan,
+        context.vault_delivery_mode,
+        context.vault_fallback_delivery_mode,
+        context.toolchain_summary,
+        context.broker_session_active,
+        context.isolate_ambient_agent,
+        context.env_set_keys,
+        context.env_unset_keys,
+        context.ssh_option_overrides,
+        context.endpoint_arg,
+        context.remote_command_arg,
+        context.askpass_helper_staged,
+        context.askpass_helper_exists_pre_spawn,
+        context.askpass_secret_staged,
+        context.askpass_secret_exists_pre_spawn,
+        context.askpass_secret_size_bytes_pre_spawn,
+        context.staged_identity_exists_pre_spawn,
+        context.staged_identity_size_bytes_pre_spawn,
+    );
+    let _ = file.write_all(context_block.as_bytes());
     if !stderr.trim().is_empty() {
         let _ = file.write_all(b"ssh_stderr_begin\n");
         let _ = file.write_all(stderr.as_bytes());
@@ -6659,6 +7412,103 @@ fn append_ssh_test_verbose_log(
         let _ = file.write_all(b"ssh_stderr_end\n");
     }
     let _ = file.write_all(b"\n");
+}
+
+#[derive(Default)]
+struct ProbePathCleanupGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl ProbePathCleanupGuard {
+    fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for ProbePathCleanupGuard {
+    fn drop(&mut self) {
+        for path in self.paths.iter().rev() {
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn stage_secure_local_identity_for_probe(
+    flow_id: &str,
+    identity_path: &str,
+) -> Result<(PathBuf, PathBuf), ()> {
+    let runtime_root = std::env::temp_dir()
+        .join("bridgingio-ssh-secure-local")
+        .join(flow_id);
+    fs::create_dir_all(&runtime_root).map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700));
+    }
+    let staged_identity = runtime_root.join("identity");
+    let identity_bytes = fs::read(identity_path).map_err(|_| ())?;
+    fs::write(&staged_identity, identity_bytes).map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&staged_identity, fs::Permissions::from_mode(0o600));
+    }
+    Ok((staged_identity, runtime_root))
+}
+
+fn password_askpass_helper_script_for_probe() -> String {
+    #[cfg(windows)]
+    {
+        "@echo off\r\nif not \"%BRIDGINGIO_SSH_ASKPASS_SECRET_FILE%\"==\"\" type \"%BRIDGINGIO_SSH_ASKPASS_SECRET_FILE%\"\r\n".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "#!/bin/sh\nif [ -n \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\" ] && [ -f \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\" ]; then\n  cat \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\"\nfi\n".to_string()
+    }
+}
+
+fn stage_password_askpass_for_probe(
+    flow_id: &str,
+    password: &str,
+) -> Result<(PathBuf, PathBuf, PathBuf), ()> {
+    let runtime_root = std::env::temp_dir()
+        .join("bridgingio-ssh-password")
+        .join(flow_id);
+    fs::create_dir_all(&runtime_root).map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700));
+    }
+
+    #[cfg(windows)]
+    let secret_path = runtime_root.join("password.txt");
+    #[cfg(not(windows))]
+    let secret_path = runtime_root.join("password");
+    fs::write(&secret_path, password.as_bytes()).map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600));
+    }
+
+    #[cfg(windows)]
+    let helper_path = runtime_root.join("askpass.cmd");
+    #[cfg(not(windows))]
+    let helper_path = runtime_root.join("askpass.sh");
+    fs::write(&helper_path, password_askpass_helper_script_for_probe()).map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700));
+    }
+
+    Ok((helper_path, secret_path, runtime_root))
 }
 
 fn execute_ssh_test_worker(
@@ -6708,8 +7558,23 @@ fn execute_ssh_test_worker(
         ssh_args.insert(0, "-vvv".to_string());
     }
     let mut broker_session_id = None::<String>;
-    if let Some(ref_id) = credential_ref.as_deref() {
-        if is_vault_managed_credential_ref(ref_id) {
+    let mut isolate_ambient_agent = false;
+    let mut env_set = Vec::<(String, String)>::new();
+    let mut env_unset = Vec::<String>::new();
+    let mut _secure_local_cleanup = ProbePathCleanupGuard::default();
+    let mut askpass_helper_path_for_log: Option<PathBuf> = None;
+    let mut askpass_secret_path_for_log: Option<PathBuf> = None;
+    let mut staged_identity_path_for_log: Option<PathBuf> = None;
+    match &prepared_probe.delivery_plan {
+        SshDeliveryPlan::None => {}
+        SshDeliveryPlan::DirectIdentityFile { identity_path } => {
+            let direct_identity_args = direct_identity_option_args_for_probe(identity_path);
+            apply_ssh_delivery_args_for_probe(&mut ssh_args, &direct_identity_args);
+            isolate_ambient_agent = true;
+        }
+        SshDeliveryPlan::VaultBrokeredIdentity {
+            credential_ref: ref_id,
+        } => {
             if router.is_none() {
                 router = load_vault_router(&settings).ok();
             }
@@ -6795,9 +7660,111 @@ fn execute_ssh_test_worker(
                     }
                 }
             }
-        } else {
-            let direct_identity_args = direct_identity_option_args_for_probe(ref_id);
-            apply_ssh_delivery_args_for_probe(&mut ssh_args, &direct_identity_args);
+        }
+        SshDeliveryPlan::LocalBrokeredIdentity { identity_path } => {
+            let (staged_identity_path, runtime_root) =
+                match stage_secure_local_identity_for_probe(&flow_id, identity_path) {
+                    Ok(paths) => paths,
+                    Err(_) => {
+                        return SshTestWorkerOutcome {
+                            router,
+                            result: SshTestWorkerResult::Failed {
+                                error_code: "local-brokered-identity-unavailable".to_string(),
+                            },
+                            target_index,
+                            target_id: prepared_probe.target_id.clone(),
+                            timeout_ms,
+                            elapsed_ms: started.elapsed().as_millis(),
+                            credential_ref,
+                            toolchain_summary: Some(prepared_probe.toolchain_summary()),
+                        };
+                    }
+                };
+            let staged_identity = staged_identity_path.to_string_lossy().to_string();
+            let secure_local_args = direct_identity_option_args_for_probe(&staged_identity);
+            apply_ssh_delivery_args_for_probe(&mut ssh_args, &secure_local_args);
+            staged_identity_path_for_log = Some(staged_identity_path.clone());
+            _secure_local_cleanup.push(staged_identity_path);
+            _secure_local_cleanup.push(runtime_root);
+            isolate_ambient_agent = true;
+            env_unset.push("SSH_AUTH_SOCK".to_string());
+        }
+        SshDeliveryPlan::PasswordDirectAskpass | SshDeliveryPlan::PasswordManagedAskpass => {
+            let auth = effective_ssh_auth_for_menu_target(&target);
+            let Some(password) = auth
+                .password
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return SshTestWorkerOutcome {
+                    router,
+                    result: SshTestWorkerResult::Failed {
+                        error_code: "password-delivery-rejected:missing-password".to_string(),
+                    },
+                    target_index,
+                    target_id: prepared_probe.target_id.clone(),
+                    timeout_ms,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    credential_ref,
+                    toolchain_summary: Some(prepared_probe.toolchain_summary()),
+                };
+            };
+            let (helper_path, secret_path, runtime_root) =
+                match stage_password_askpass_for_probe(&flow_id, password) {
+                    Ok(paths) => paths,
+                    Err(_) => {
+                        return SshTestWorkerOutcome {
+                            router,
+                            result: SshTestWorkerResult::Failed {
+                                error_code: "password-delivery-unavailable".to_string(),
+                            },
+                            target_index,
+                            target_id: prepared_probe.target_id.clone(),
+                            timeout_ms,
+                            elapsed_ms: started.elapsed().as_millis(),
+                            credential_ref,
+                            toolchain_summary: Some(prepared_probe.toolchain_summary()),
+                        };
+                    }
+                };
+            env_set.push((
+                "SSH_ASKPASS".to_string(),
+                helper_path.to_string_lossy().to_string(),
+            ));
+            env_set.push(("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()));
+            env_set.push(("DISPLAY".to_string(), "bridgingio-headless".to_string()));
+            env_set.push((
+                "BRIDGINGIO_SSH_ASKPASS_SECRET_FILE".to_string(),
+                secret_path.to_string_lossy().to_string(),
+            ));
+            env_unset.push("SSH_AUTH_SOCK".to_string());
+            remove_ssh_option_overrides_for_probe(
+                &mut ssh_args,
+                &[
+                    "BatchMode",
+                    "NumberOfPasswordPrompts",
+                    "PreferredAuthentications",
+                    "PubkeyAuthentication",
+                ],
+            );
+            let password_delivery_args = vec![
+                "-o".to_string(),
+                "BatchMode=no".to_string(),
+                "-o".to_string(),
+                "PreferredAuthentications=password,keyboard-interactive".to_string(),
+                "-o".to_string(),
+                "NumberOfPasswordPrompts=1".to_string(),
+                "-o".to_string(),
+                "PubkeyAuthentication=no".to_string(),
+            ];
+            apply_ssh_delivery_args_for_probe(&mut ssh_args, &password_delivery_args);
+            askpass_helper_path_for_log = Some(helper_path.clone());
+            askpass_secret_path_for_log = Some(secret_path.clone());
+            _secure_local_cleanup.push(helper_path);
+            _secure_local_cleanup.push(secret_path);
+            _secure_local_cleanup.push(runtime_root);
+            isolate_ambient_agent = true;
         }
     }
 
@@ -6848,12 +7815,47 @@ fn execute_ssh_test_worker(
         }
     }
 
-    let mut child = match Command::new(&prepared_probe.executable_path)
-        .args(&ssh_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    let mut env_set_keys: Vec<String> = env_set.iter().map(|(key, _)| key.clone()).collect();
+    env_set_keys.sort();
+    let mut env_unset_keys = env_unset.clone();
+    env_unset_keys.sort();
+    let ssh_option_overrides = collect_ssh_option_overrides_for_verbose(&ssh_args);
+    let endpoint_arg = ssh_args
+        .len()
+        .checked_sub(2)
+        .and_then(|index| ssh_args.get(index))
+        .cloned();
+    let remote_command_arg = ssh_args.last().cloned();
+    let askpass_helper_exists_pre_spawn = askpass_helper_path_for_log
+        .as_ref()
+        .map(|path| path.exists());
+    let askpass_secret_exists_pre_spawn = askpass_secret_path_for_log
+        .as_ref()
+        .map(|path| path.exists());
+    let askpass_secret_size_bytes_pre_spawn = askpass_secret_path_for_log
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len());
+    let staged_identity_exists_pre_spawn = staged_identity_path_for_log
+        .as_ref()
+        .map(|path| path.exists());
+    let staged_identity_size_bytes_pre_spawn = staged_identity_path_for_log
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len());
+
+    let mut ssh_command = Command::new(&prepared_probe.executable_path);
+    ssh_command.args(&ssh_args).stdout(Stdio::null()).stderr(Stdio::piped());
+    if isolate_ambient_agent {
+        ssh_command.env_remove("SSH_AUTH_SOCK");
+    }
+    for key in env_unset {
+        ssh_command.env_remove(key);
+    }
+    for (key, value) in env_set {
+        ssh_command.env(key, value);
+    }
+    let mut child = match ssh_command.spawn() {
         Ok(child) => child,
         Err(_) => {
             cleanup_ssh_probe_broker_session(&mut router, broker_session_id, "spawn failed");
@@ -6929,6 +7931,27 @@ fn execute_ssh_test_worker(
     };
 
     cleanup_ssh_probe_broker_session(&mut router, broker_session_id, "ssh probe completed");
+    let verbose_context = SshTestVerboseContext {
+        executable_path: prepared_probe.executable_path.to_string_lossy().to_string(),
+        delivery_plan: prepared_probe.delivery_plan.as_str().to_string(),
+        vault_delivery_mode: prepared_probe.vault_delivery_mode.clone(),
+        vault_fallback_delivery_mode: prepared_probe.vault_fallback_delivery_mode.clone(),
+        toolchain_summary: prepared_probe.toolchain_summary(),
+        broker_session_active: broker_path_active,
+        isolate_ambient_agent,
+        env_set_keys,
+        env_unset_keys,
+        ssh_option_overrides,
+        endpoint_arg,
+        remote_command_arg,
+        askpass_helper_staged: askpass_helper_path_for_log.is_some(),
+        askpass_helper_exists_pre_spawn,
+        askpass_secret_staged: askpass_secret_path_for_log.is_some(),
+        askpass_secret_exists_pre_spawn,
+        askpass_secret_size_bytes_pre_spawn,
+        staged_identity_exists_pre_spawn,
+        staged_identity_size_bytes_pre_spawn,
+    };
     if let Some(path) = verbose_log_path.as_deref() {
         append_ssh_test_verbose_log(
             path,
@@ -6938,6 +7961,7 @@ fn execute_ssh_test_worker(
             timeout_ms,
             started.elapsed().as_millis(),
             &result,
+            &verbose_context,
             &captured_stderr,
         );
     }
@@ -6978,6 +8002,26 @@ fn apply_ssh_delivery_args_for_probe(args: &mut Vec<String>, delivery_args: &[St
     }
 }
 
+fn remove_ssh_option_overrides_for_probe(args: &mut Vec<String>, option_keys: &[&str]) {
+    let mut index = 0usize;
+    while index + 1 < args.len() {
+        if args[index] != "-o" {
+            index += 1;
+            continue;
+        }
+        let should_remove = args[index + 1]
+            .split_once('=')
+            .map(|(key, _)| option_keys.iter().any(|candidate| key.eq_ignore_ascii_case(candidate)))
+            .unwrap_or(false);
+        if should_remove {
+            args.remove(index + 1);
+            args.remove(index);
+            continue;
+        }
+        index += 2;
+    }
+}
+
 fn direct_identity_option_args_for_probe(identity_path: &str) -> Vec<String> {
     vec![
         "-i".to_string(),
@@ -7012,10 +8056,6 @@ fn ssh_host_key_policy_from_known_hosts(raw: Option<&str>) -> SshHostKeyPolicy {
         }
         _ => SshHostKeyPolicy::Strict,
     }
-}
-
-fn is_vault_managed_credential_ref(raw: &str) -> bool {
-    raw.trim_start().starts_with("vault://") || raw.trim_start().starts_with("vault:")
 }
 
 fn mint_local_admin_attestation(
@@ -7056,6 +8096,116 @@ fn is_sensitive_target(target: &StandaloneTargetProfile) -> bool {
             .eq_ignore_ascii_case("sealed-full")
 }
 
+fn is_vault_credential_locator(raw: &str) -> bool {
+    raw.trim().starts_with("vault:") || raw.trim().starts_with("vault://")
+}
+
+fn effective_ssh_auth_for_menu_target(target: &StandaloneTargetProfile) -> SshAuthConfig {
+    let legacy_credential_ref = target
+        .credential_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut auth = target.ssh_auth.clone().unwrap_or_default();
+    auth.password = auth
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    auth.key_locator = auth
+        .key_locator
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if auth.kind == SshAuthKind::None {
+        if let Some(locator) = legacy_credential_ref {
+            auth.kind = SshAuthKind::PrivateKey;
+            auth.private_key_source = if is_vault_credential_locator(locator) {
+                Some(SshPrivateKeySource::VaultRef)
+            } else {
+                Some(SshPrivateKeySource::LocalPath)
+            };
+            auth.key_locator = Some(locator.to_string());
+            auth.secure_access = is_vault_credential_locator(locator);
+        }
+    }
+    auth
+}
+
+fn sync_legacy_credential_ref_from_ssh_auth(target: &mut StandaloneTargetProfile) {
+    let Some(auth) = target.ssh_auth.as_ref() else {
+        return;
+    };
+    if auth.kind != SshAuthKind::PrivateKey {
+        target.credential_ref = None;
+        return;
+    }
+    target.credential_ref = auth
+        .key_locator
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+}
+
+fn local_ssh_key_locator_for_target(target: &StandaloneTargetProfile) -> Option<String> {
+    if target.kind != TargetKind::Ssh {
+        return None;
+    }
+    let auth = effective_ssh_auth_for_menu_target(target);
+    if auth.kind != SshAuthKind::PrivateKey || auth.private_key_source != Some(SshPrivateKeySource::LocalPath) {
+        return None;
+    }
+    auth.key_locator
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn passphrase_blocked_local_key_message(
+    target: &StandaloneTargetProfile,
+    target_index: usize,
+) -> String {
+    let target_label = if target.id.trim().is_empty() {
+        format!("targets[{target_index}]")
+    } else {
+        target.id.trim().to_string()
+    };
+    if is_sensitive_target(target) {
+        return format!(
+            "{SSH_LOCAL_KEY_PASSPHRASE_BLOCK_SUBCODE}: sealed ssh target `{target_label}` cannot use local passphrase-protected key paths directly; unlock vault and use Import Local SSH Key Into Vault"
+        );
+    }
+    format!(
+        "{SSH_LOCAL_KEY_PASSPHRASE_BLOCK_SUBCODE}: plain ssh target `{target_label}` cannot use local passphrase-protected key paths; switch to sealed target and import the key into vault"
+    )
+}
+
+fn validate_trusted_local_ssh_private_key_constraints(settings: &CoreSettings) -> Result<(), String> {
+    for (index, target) in settings.targets.iter().enumerate() {
+        let Some(locator) = local_ssh_key_locator_for_target(target) else {
+            continue;
+        };
+        let inspection = inspect_trusted_local_ssh_private_key_path(Path::new(&locator)).map_err(|_| {
+            let target_label = if target.id.trim().is_empty() {
+                format!("targets[{index}]")
+            } else {
+                target.id.trim().to_string()
+            };
+            format!(
+                "auth-combination-disallowed: trusted local ssh key inspection failed for `{target_label}`; ensure the local key path is readable and points to a supported OpenSSH/PEM private key"
+            )
+        })?;
+        if inspection.passphrase_protected {
+            return Err(passphrase_blocked_local_key_message(target, index));
+        }
+    }
+    Ok(())
+}
+
 fn default_ssh_target(index: usize) -> StandaloneTargetProfile {
     StandaloneTargetProfile {
         id: format!("ssh-target-{}", index + 1),
@@ -7067,6 +8217,7 @@ fn default_ssh_target(index: usize) -> StandaloneTargetProfile {
         access_class: "anonymous-local".into(),
         sealed_profile_ref: None,
         credential_ref: None,
+        ssh_auth: None,
         notes: None,
         connection: StandaloneConnectionSection {
             host: Some("127.0.0.1".into()),
@@ -7097,6 +8248,7 @@ fn default_adb_target(index: usize) -> StandaloneTargetProfile {
         access_class: "anonymous-local".into(),
         sealed_profile_ref: None,
         credential_ref: None,
+        ssh_auth: None,
         notes: None,
         connection: StandaloneConnectionSection {
             host: None,
@@ -7159,7 +8311,7 @@ fn parse_trigger_policy(raw: &str) -> VaultUnlockTriggerPolicy {
 #[cfg(test)]
 mod tests {
     use super::{ActionKind, EditModeKind, MenuConfigApp, MenuEntryKind, Screen};
-    use bridgingio_domain::TargetKind;
+    use bridgingio_domain::{SshAuthConfig, SshAuthKind, SshPrivateKeySource, TargetKind};
     use bridgingio_engine::{CoreSettings, ToolchainSection};
     use bridgingio_platform::RuntimeLogLevel;
     use bridgingio_secrets::{
@@ -7276,6 +8428,13 @@ mod tests {
 
     const TEST_PRIVATE_KEY_PEM: &str =
         "-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n";
+    const ENCRYPTED_TEST_PRIVATE_KEY_PEM: &str =
+        "-----BEGIN RSA PRIVATE KEY-----\n\
+Proc-Type: 4,ENCRYPTED\n\
+DEK-Info: AES-256-CBC,0123456789ABCDEF0123456789ABCDEF\n\
+\n\
+Zm9v\n\
+-----END RSA PRIVATE KEY-----\n";
 
     #[test]
     fn search_results_find_trigger_policy_field() {
@@ -7302,7 +8461,7 @@ mod tests {
         ));
         app.handle_confirm_key(KeyCode::Enter)
             .expect("confirm plain ssh risk");
-        assert_eq!(app.screen, Screen::TargetEditor(1));
+        assert_eq!(app.screen, Screen::TargetCredentialSource(1));
         assert_eq!(app.settings.targets.len(), 2);
         assert_eq!(app.settings.targets[1].kind, TargetKind::Ssh);
     }
@@ -7326,7 +8485,340 @@ mod tests {
             .expect("add sensitive target while unlocked");
         assert_eq!(app.settings.targets.len(), 2);
         assert!(super::is_sensitive_target(&app.settings.targets[1]));
-        assert_eq!(app.screen, Screen::TargetEditor(1));
+        assert_eq!(app.screen, Screen::TargetCredentialSource(1));
+    }
+
+    #[test]
+    fn plain_local_passphrase_key_is_blocked_during_edit() {
+        let config_path = temp_config_path("plain-local-passphrase-gate");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let key_path = config_path.parent().expect("config parent").join("id_plain_enc");
+        fs::write(&key_path, ENCRYPTED_TEST_PRIVATE_KEY_PEM).expect("write encrypted key");
+
+        let err = app
+            .apply_edit_value("targets[0].credential_ref", &key_path.to_string_lossy())
+            .expect_err("plain local encrypted key must be blocked");
+        assert!(err.contains(super::SSH_LOCAL_KEY_PASSPHRASE_BLOCK_SUBCODE));
+        assert!(err.contains("switch to sealed target and import the key into vault"));
+    }
+
+    #[test]
+    fn sealed_local_passphrase_key_is_blocked_during_edit() {
+        let config_path = temp_config_path("sealed-local-passphrase-gate");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let index = app.settings.targets.len();
+        app.settings.targets.push(super::default_sensitive_ssh_target(index));
+        let key_path = config_path
+            .parent()
+            .expect("config parent")
+            .join("id_sensitive_enc");
+        fs::write(&key_path, ENCRYPTED_TEST_PRIVATE_KEY_PEM).expect("write encrypted key");
+
+        let err = app
+            .apply_edit_value(
+                &format!("targets[{index}].credential_ref"),
+                &key_path.to_string_lossy(),
+            )
+            .expect_err("sealed local encrypted key must be blocked");
+        assert!(err.contains(super::SSH_LOCAL_KEY_PASSPHRASE_BLOCK_SUBCODE));
+        assert!(err.contains("unlock vault and use Import Local SSH Key Into Vault"));
+    }
+
+    #[test]
+    fn ssh_auth_setup_toggle_is_plain_only_and_sealed_is_required_read_only() {
+        let config_path = temp_config_path("ssh-auth-secure-access-rows");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::TargetCredentialSource(0);
+        app.run_action(ActionKind::SelectTargetSshAuthPassword(0))
+            .expect("open plain password confirmation");
+        app.handle_confirm_key(KeyCode::Enter)
+            .expect("confirm plain password risk");
+        let plain_entries = app.entries();
+        assert!(plain_entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::ToggleTargetSshSecureAccess(0))
+        )));
+
+        let index = app.settings.targets.len();
+        app.settings.targets.push(super::default_sensitive_ssh_target(index));
+        app.security_summary.lock_state = "unlocked".into();
+        app.screen = Screen::TargetCredentialSource(index);
+        app.run_action(ActionKind::SelectTargetSshAuthPassword(index))
+            .expect("select sealed password auth");
+        let sealed_entries = app.entries();
+        assert!(!sealed_entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::ToggleTargetSshSecureAccess(i)) if i == index
+        )));
+        assert!(sealed_entries.iter().any(|entry| {
+            matches!(entry.kind, MenuEntryKind::Info)
+                && entry.label == app.t("menu.target.ssh_secure_access")
+        }));
+    }
+
+    #[test]
+    fn ssh_auth_kind_rows_use_single_choice_markers() {
+        let config_path = temp_config_path("ssh-auth-kind-single-choice-markers");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::TargetCredentialSource(0);
+
+        let entries = app.entries();
+        let none_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(0))
+                )
+            })
+            .expect("none entry");
+        let password_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(0))
+                )
+            })
+            .expect("password entry");
+        let private_key_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPrivateKey(0))
+                )
+            })
+            .expect("private-key entry");
+
+        let none_line = super::format_menu_entry_line(&app, none_index, &entries[none_index]);
+        let password_line =
+            super::format_menu_entry_line(&app, password_index, &entries[password_index]);
+        let private_key_line =
+            super::format_menu_entry_line(&app, private_key_index, &entries[private_key_index]);
+        assert!(none_line.contains("<*>"));
+        assert!(!none_line.contains("--->"));
+        assert!(password_line.contains("< >"));
+        assert!(password_line.contains("--->"));
+        assert!(private_key_line.contains("< >"));
+        assert!(private_key_line.contains("--->"));
+
+        app.run_action(ActionKind::SelectTargetSshAuthPassword(0))
+            .expect("open plain password confirmation");
+        app.handle_confirm_key(KeyCode::Enter)
+            .expect("confirm plain password risk");
+        let entries = app.entries();
+        let none_line = super::format_menu_entry_line(&app, none_index, &entries[none_index]);
+        let password_line =
+            super::format_menu_entry_line(&app, password_index, &entries[password_index]);
+        assert!(none_line.contains("< >"));
+        assert!(password_line.contains("<*>"));
+    }
+
+    #[test]
+    fn ssh_auth_setup_continue_is_blocked_until_required_inputs_are_valid() {
+        let config_path = temp_config_path("ssh-auth-continue-gating");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::TargetCredentialSource(0);
+
+        app.run_action(ActionKind::SelectTargetSshAuthPassword(0))
+            .expect("open plain password confirmation");
+        app.handle_confirm_key(KeyCode::Enter)
+            .expect("confirm plain password risk");
+
+        let entries = app.entries();
+        assert!(!entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::ContinueTargetSshAuthSetup(0))
+        )));
+        let blocked = entries
+            .iter()
+            .find(|entry| {
+                matches!(entry.kind, MenuEntryKind::Info)
+                    && entry.label == app.t("menu.target.ssh_auth_continue")
+            })
+            .expect("blocked continue info");
+        assert_eq!(
+            blocked.value.as_deref(),
+            Some(
+                app.t("menu.target.ssh_auth_continue.blocked.password_missing")
+                    .as_str()
+            )
+        );
+        app.run_action(ActionKind::ContinueTargetSshAuthSetup(0))
+            .expect("continue should be guarded");
+        assert_eq!(app.screen, Screen::TargetCredentialSource(0));
+        assert!(app
+            .last_status
+            .contains(&app.t("menu.target.ssh_auth_continue.blocked.password_missing")));
+
+        app.apply_edit_value("targets[0].ssh_auth.password", "plain-password")
+            .expect("set ssh password");
+        let entries = app.entries();
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::ContinueTargetSshAuthSetup(0))
+        )));
+
+        app.run_action(ActionKind::SelectTargetSshAuthPrivateKey(0))
+            .expect("switch to private-key");
+        let entries = app.entries();
+        let blocked = entries
+            .iter()
+            .find(|entry| {
+                matches!(entry.kind, MenuEntryKind::Info)
+                    && entry.label == app.t("menu.target.ssh_auth_continue")
+            })
+            .expect("private-key should block continue when path missing");
+        assert_eq!(
+            blocked.value.as_deref(),
+            Some(
+                app.t("menu.target.ssh_auth_continue.blocked.local_key_missing")
+                    .as_str()
+            )
+        );
+
+        let key_path = config_path.parent().expect("config parent").join("id_plain_unenc");
+        fs::write(&key_path, TEST_PRIVATE_KEY_PEM).expect("write plain key");
+        app.apply_edit_value("targets[0].ssh_auth.key_locator", &key_path.to_string_lossy())
+            .expect("set local key path");
+        let entries = app.entries();
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::ContinueTargetSshAuthSetup(0))
+        )));
+    }
+
+    #[test]
+    fn ssh_auth_kind_requires_space_to_switch_and_enter_to_enter_selected_kind() {
+        let config_path = temp_config_path("ssh-auth-space-switch-enter-enter");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::TargetCredentialSource(0);
+        let entries = app.entries();
+        let password_index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(0))
+                )
+            })
+            .expect("password row");
+        app.selected = password_index;
+
+        app.activate_selected()
+            .expect("enter on unselected password row");
+        let auth = super::effective_ssh_auth_for_menu_target(&app.settings.targets[0]);
+        assert_eq!(auth.kind, SshAuthKind::None);
+        assert_eq!(app.last_status, app.t("menu.status.ssh_auth_kind_space_only"));
+
+        app.handle_space_on_selected()
+            .expect("space should switch auth kind");
+        assert!(matches!(
+            app.confirm_action,
+            Some(super::ConfirmAction::ConfirmPlainSshPasswordRisk(0))
+        ));
+        app.handle_confirm_key(KeyCode::Enter)
+            .expect("confirm plain password risk");
+        assert_eq!(
+            super::effective_ssh_auth_for_menu_target(&app.settings.targets[0]).kind,
+            SshAuthKind::Password
+        );
+
+        app.selected = password_index;
+        app.activate_selected()
+            .expect("enter on selected password row should open editor");
+        assert!(app.edit_mode);
+        assert_eq!(
+            app.edit_field.as_deref(),
+            Some("targets[0].ssh_auth.password")
+        );
+    }
+
+    #[test]
+    fn plain_private_key_auth_does_not_show_vault_source_rows() {
+        let config_path = temp_config_path("plain-private-key-local-only");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::TargetCredentialSource(0);
+        app.run_action(ActionKind::SelectTargetSshAuthPrivateKey(0))
+            .expect("select private-key");
+
+        let entries = app.entries();
+        assert!(!entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::SelectTargetSshKeySourceLocal(0))
+        )));
+        assert!(!entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::SelectTargetSshKeySourceVault(0))
+        )));
+        assert!(!entries.iter().any(|entry| {
+            matches!(entry.kind, MenuEntryKind::Info)
+                && entry.label == app.t("menu.target.ssh_key_source")
+        }));
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::EditField(ref field) if field == "targets[0].ssh_auth.key_locator"
+        )));
+    }
+
+    #[test]
+    fn sealed_private_key_local_source_hides_redundant_local_switch_action() {
+        let config_path = temp_config_path("sealed-private-key-hide-local-switch");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let index = app.settings.targets.len();
+        app.settings.targets.push(super::default_sensitive_ssh_target(index));
+        app.security_summary.lock_state = "unlocked".into();
+        app.screen = Screen::TargetCredentialSource(index);
+        app.run_action(ActionKind::SelectTargetSshAuthPrivateKey(index))
+            .expect("select sealed private-key");
+
+        let entries = app.entries();
+        assert!(!entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::SelectTargetSshKeySourceLocal(i)) if i == index
+        )));
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::Action(ActionKind::SelectTargetSshKeySourceVault(i)) if i == index
+        )));
+        assert!(entries.iter().any(|entry| matches!(
+            entry.kind,
+            MenuEntryKind::EditField(ref field) if field.as_str() == format!("targets[{index}].ssh_auth.key_locator")
+        )));
+    }
+
+    #[test]
+    fn encrypted_local_key_in_auth_setup_opens_block_popup() {
+        let config_path = temp_config_path("ssh-auth-setup-passphrase-popup");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let key_path = config_path.parent().expect("config parent").join("id_popup_enc");
+        fs::write(&key_path, ENCRYPTED_TEST_PRIVATE_KEY_PEM).expect("write encrypted key");
+
+        app.screen = Screen::TargetCredentialSource(0);
+        app.run_action(ActionKind::SelectTargetSshAuthPrivateKey(0))
+            .expect("select private key auth");
+        app.begin_edit("targets[0].ssh_auth.key_locator".to_string())
+            .expect("begin local key path edit");
+        app.edit_input = key_path.to_string_lossy().to_string();
+        app.edit_cursor = app.edit_input.chars().count();
+        app.handle_edit_key(KeyCode::Enter).expect("commit key path edit");
+
+        assert!(app.ssh_auth_block_popup.is_some());
+        app.handle_ssh_auth_block_popup_key(KeyCode::Enter);
+        assert!(app.ssh_auth_block_popup.is_none());
+    }
+
+    #[test]
+    fn save_blocks_passphrase_protected_local_ssh_key_paths() {
+        let config_path = temp_config_path("save-blocks-local-passphrase-key");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let key_path = config_path.parent().expect("config parent").join("id_save_enc");
+        fs::write(&key_path, ENCRYPTED_TEST_PRIVATE_KEY_PEM).expect("write encrypted key");
+        app.settings.targets[0].credential_ref = Some(key_path.to_string_lossy().to_string());
+
+        let err = app.save().expect_err("save must block encrypted local key path");
+        assert!(err.contains(super::SSH_LOCAL_KEY_PASSPHRASE_BLOCK_SUBCODE));
     }
 
     #[test]
@@ -7478,7 +8970,7 @@ mod tests {
         assert!(credential_entry.is_some());
         assert_eq!(
             credential_entry.expect("credential source entry").label,
-            app.t("menu.target.credential_source")
+            app.t("menu.target.ssh_authentication")
         );
 
         app.security_summary.lock_state = "locked".into();
@@ -7738,6 +9230,10 @@ mod tests {
             })
             .expect("import key");
         app.vault_router = Some(router);
+        app.settings.targets[0].storage_class = "sealed-overlay".into();
+        app.settings.targets[0].access_class = "token-scoped".into();
+        app.settings.targets[0].sealed_profile_ref =
+            Some("vault://bridgingio/target-profile/local-ssh".into());
         app.settings.targets[0].credential_ref = Some(imported.credential_ref);
         app.security_summary.lock_state = "unlocked".into();
 
@@ -7791,8 +9287,86 @@ mod tests {
                 .join(super::SSH_TEST_VERBOSE_LOG_FILE_NAME),
         )
         .expect("read ssh verbose log");
+        assert!(verbose_log.contains("ssh_probe_context_begin"));
+        assert!(verbose_log.contains("delivery_plan=none"));
+        assert!(verbose_log.contains("ssh_option_overrides=["));
         assert!(verbose_log.contains("ssh_stderr_begin"));
         assert!(verbose_log.contains("Permission denied (publickey)."));
+    }
+
+    #[test]
+    fn ssh_test_password_debug_level_uses_vvv_and_keeps_password_out_of_argv() {
+        let config_path = temp_config_path("ssh-test-password-vvv-verbose-log");
+        let runtime_root = config_path
+            .parent()
+            .expect("config parent")
+            .join("runtime-log-root");
+        set_config_data_dir(&config_path, &runtime_root);
+        set_config_log_level(&config_path, "debug");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let root = config_path.parent().expect("config parent");
+        let args_path = root.join("ssh-password-vvv-args.txt");
+        let askpass_path = root.join("ssh-password-vvv-askpass-path.txt");
+        let delivered_password_path = root.join("ssh-password-vvv-delivered-password.txt");
+        let password = "plain-password-for-ssh-test";
+
+        #[cfg(windows)]
+        let body = format!(
+            "echo %* > \"{}\"\r\necho %SSH_ASKPASS% > \"{}\"\r\nif not \"%BRIDGINGIO_SSH_ASKPASS_SECRET_FILE%\"==\"\" if exist \"%BRIDGINGIO_SSH_ASKPASS_SECRET_FILE%\" type \"%BRIDGINGIO_SSH_ASKPASS_SECRET_FILE%\" > \"{}\"\r\necho Permission denied (password). 1>&2\r\nexit /b 255",
+            args_path.display(),
+            askpass_path.display(),
+            delivered_password_path.display(),
+        );
+        #[cfg(not(windows))]
+        let body = format!(
+            "printf '%s\\n' \"$@\" > \"{}\"\nprintf '%s\\n' \"$SSH_ASKPASS\" > \"{}\"\nif [ -n \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\" ] && [ -f \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\" ]; then\n  cat \"$BRIDGINGIO_SSH_ASKPASS_SECRET_FILE\" > \"{}\"\nfi\necho 'Permission denied (password).' 1>&2\nexit 255",
+            args_path.display(),
+            askpass_path.display(),
+            delivered_password_path.display(),
+        );
+        let ssh_script = write_mock_ssh_script(root, "mock-ssh-password-vvv-verbose-log", &body);
+        set_target_ssh_override(&mut app, 0, &ssh_script);
+        app.settings.targets[0].ssh_auth = Some(SshAuthConfig {
+            kind: SshAuthKind::Password,
+            secure_access: false,
+            password: Some(password.to_string()),
+            private_key_source: None,
+            key_locator: None,
+        });
+        app.settings.targets[0].credential_ref = None;
+
+        begin_and_start_ssh_test(&mut app, 0, 2000);
+        let category = wait_for_ssh_test_result(&mut app, Duration::from_secs(2));
+        assert_eq!(category, super::SshTestResultCategory::Failed);
+
+        let args = fs::read_to_string(&args_path).expect("read ssh args");
+        assert!(args.contains("-vvv"));
+        assert!(!args.contains(password));
+        assert!(args.contains("BatchMode=no"));
+        assert!(!args.contains("BatchMode=yes"));
+        assert!(args.contains("NumberOfPasswordPrompts=1"));
+        assert!(!args.contains("NumberOfPasswordPrompts=0"));
+
+        let askpass = fs::read_to_string(&askpass_path).expect("read askpass path");
+        assert!(!askpass.trim().is_empty());
+        let delivered_password =
+            fs::read_to_string(&delivered_password_path).expect("read delivered password");
+        assert_eq!(delivered_password.trim(), password);
+
+        let verbose_log = fs::read_to_string(
+            runtime_root
+                .join("logs")
+                .join(super::SSH_TEST_VERBOSE_LOG_FILE_NAME),
+        )
+        .expect("read ssh verbose log");
+        assert!(verbose_log.contains("ssh_probe_context_begin"));
+        assert!(verbose_log.contains("delivery_plan=password-direct-askpass"));
+        assert!(verbose_log.contains("askpass_helper_staged=true"));
+        assert!(verbose_log.contains("askpass_secret_staged=true"));
+        assert!(verbose_log.contains("askpass_secret_size_bytes_pre_spawn=Some("));
+        assert!(verbose_log.contains("PubkeyAuthentication=no"));
+        assert!(verbose_log.contains("ssh_stderr_begin"));
+        assert!(verbose_log.contains("Permission denied (password)."));
     }
 
     #[test]
@@ -7841,7 +9415,7 @@ mod tests {
 
         begin_and_start_ssh_test(&mut app, 0, 2000);
         let category = wait_for_ssh_test_result(&mut app, Duration::from_secs(2));
-        assert_eq!(category, super::SshTestResultCategory::VaultLockedPreflight);
+        assert_eq!(category, super::SshTestResultCategory::Failed);
         assert!(!marker.exists());
     }
 
@@ -9009,8 +10583,17 @@ mod tests {
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         app.security_summary.lock_state = "unlocked".into();
         app.settings.targets[0].kind = TargetKind::Ssh;
-        app.settings.targets[0].credential_ref =
-            Some("vault://bridgingio/ssh-private-key/ops-main".into());
+        app.settings.targets[0].storage_class = "sealed-overlay".into();
+        app.settings.targets[0].access_class = "token-scoped".into();
+        app.settings.targets[0].sealed_profile_ref =
+            Some("vault://bridgingio/target-profile/test-0".into());
+        app.settings.targets[0].ssh_auth = Some(SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::VaultRef),
+            key_locator: Some("vault://bridgingio/ssh-private-key/ops-main".into()),
+        });
         app.ssh_key_rows = vec![
             super::SshKeyManagementRow {
                 credential_ref: "vault://bridgingio/ssh-private-key/ops-main".into(),
@@ -9061,8 +10644,17 @@ mod tests {
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         app.security_summary.lock_state = "unlocked".into();
         app.settings.targets[0].kind = TargetKind::Ssh;
-        app.settings.targets[0].credential_ref =
-            Some("vault://bridgingio/ssh-private-key/ops-main".into());
+        app.settings.targets[0].storage_class = "sealed-overlay".into();
+        app.settings.targets[0].access_class = "token-scoped".into();
+        app.settings.targets[0].sealed_profile_ref =
+            Some("vault://bridgingio/target-profile/test-0".into());
+        app.settings.targets[0].ssh_auth = Some(SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::VaultRef),
+            key_locator: Some("vault://bridgingio/ssh-private-key/ops-main".into()),
+        });
         app.ssh_key_rows = vec![
             super::SshKeyManagementRow {
                 credential_ref: "vault://bridgingio/ssh-private-key/ops-main".into(),
@@ -9095,7 +10687,10 @@ mod tests {
             app.t("menu.status.target_credential_picker_space_only")
         );
         assert_eq!(
-            app.settings.targets[0].credential_ref.as_deref(),
+            app.settings.targets[0]
+                .ssh_auth
+                .as_ref()
+                .and_then(|auth| auth.key_locator.as_deref()),
             Some("vault://bridgingio/ssh-private-key/ops-main")
         );
     }
@@ -9106,8 +10701,17 @@ mod tests {
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         app.security_summary.lock_state = "unlocked".into();
         app.settings.targets[0].kind = TargetKind::Ssh;
-        app.settings.targets[0].credential_ref =
-            Some("vault://bridgingio/ssh-private-key/ops-main".into());
+        app.settings.targets[0].storage_class = "sealed-overlay".into();
+        app.settings.targets[0].access_class = "token-scoped".into();
+        app.settings.targets[0].sealed_profile_ref =
+            Some("vault://bridgingio/target-profile/test-0".into());
+        app.settings.targets[0].ssh_auth = Some(SshAuthConfig {
+            kind: SshAuthKind::PrivateKey,
+            secure_access: true,
+            password: None,
+            private_key_source: Some(SshPrivateKeySource::VaultRef),
+            key_locator: Some("vault://bridgingio/ssh-private-key/ops-main".into()),
+        });
         app.ssh_key_rows = vec![
             super::SshKeyManagementRow {
                 credential_ref: "vault://bridgingio/ssh-private-key/ops-main".into(),
@@ -9136,13 +10740,16 @@ mod tests {
         app.handle_space_on_selected()
             .expect("space binds selected credential row");
         assert_eq!(
-            app.settings.targets[0].credential_ref.as_deref(),
+            app.settings.targets[0]
+                .ssh_auth
+                .as_ref()
+                .and_then(|auth| auth.key_locator.as_deref()),
             Some("vault://bridgingio/ssh-private-key/ops-fallback")
         );
         assert!(app
             .dirty_paths
             .iter()
-            .any(|path| path == "targets[0].credential_ref"));
+            .any(|path| path == "targets[0].ssh_auth.key_locator"));
     }
 
     #[test]

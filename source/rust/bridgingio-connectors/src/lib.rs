@@ -363,6 +363,35 @@ pub struct InvocationDiagnosticsView {
     pub warnings: Vec<String>,
     pub quoting_host_shell_runtime: String,
     pub quoting_target_shell_dialect: String,
+    pub env_overlay_set_keys: Vec<String>,
+    pub env_overlay_unset_keys: Vec<String>,
+    pub cleanup_actions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InvocationEnvironmentOverlay {
+    pub set: HashMap<String, String>,
+    pub unset: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvocationCleanupAction {
+    RemoveFile { path: PathBuf },
+    RemoveDirAll { path: PathBuf },
+}
+
+impl InvocationCleanupAction {
+    pub fn label(&self) -> String {
+        match self {
+            Self::RemoveFile { path } => format!("remove_file:{}", path.display()),
+            Self::RemoveDirAll { path } => format!("remove_dir_all:{}", path.display()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InvocationCleanupContract {
+    pub actions: Vec<InvocationCleanupAction>,
 }
 
 pub fn target_shell_dialect_for(target: &TargetProfile) -> TargetShellDialect {
@@ -426,6 +455,8 @@ pub struct CommandInvocation {
     pub target_shell_dialect: TargetShellDialect,
     pub resolution: InvocationResolution,
     pub quoting_boundary: InvocationQuotingBoundary,
+    pub env_overlay: InvocationEnvironmentOverlay,
+    pub cleanup_contract: InvocationCleanupContract,
 }
 
 impl CommandInvocation {
@@ -442,6 +473,22 @@ impl CommandInvocation {
     }
 
     pub fn diagnostics_view(&self) -> InvocationDiagnosticsView {
+        let mut env_overlay_set_keys = self
+            .env_overlay
+            .set
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        env_overlay_set_keys.sort();
+        let mut env_overlay_unset_keys = self.env_overlay.unset.clone();
+        env_overlay_unset_keys.sort();
+        env_overlay_unset_keys.dedup();
+        let cleanup_actions = self
+            .cleanup_contract
+            .actions
+            .iter()
+            .map(InvocationCleanupAction::label)
+            .collect::<Vec<_>>();
         InvocationDiagnosticsView {
             mode: self.invocation_kind.as_str().to_string(),
             program: self.program.to_string_lossy().to_string(),
@@ -461,6 +508,9 @@ impl CommandInvocation {
             warnings: self.resolution.warnings.clone(),
             quoting_host_shell_runtime: self.quoting_boundary.host_shell_runtime.clone(),
             quoting_target_shell_dialect: self.quoting_boundary.target_shell_dialect.clone(),
+            env_overlay_set_keys,
+            env_overlay_unset_keys,
+            cleanup_actions,
         }
     }
 }
@@ -644,6 +694,8 @@ impl SshConnector {
             target_shell_dialect: target_shell_dialect_for(target),
             resolution: InvocationResolution::default(),
             quoting_boundary: InvocationQuotingBoundary::default(),
+            env_overlay: InvocationEnvironmentOverlay::default(),
+            cleanup_contract: InvocationCleanupContract::default(),
         })
     }
 
@@ -680,6 +732,8 @@ impl SshConnector {
             target_shell_dialect: target_shell_dialect_for(target),
             resolution: InvocationResolution::default(),
             quoting_boundary: InvocationQuotingBoundary::default(),
+            env_overlay: InvocationEnvironmentOverlay::default(),
+            cleanup_contract: InvocationCleanupContract::default(),
         })
     }
 
@@ -828,6 +882,8 @@ impl AdbConnector {
             target_shell_dialect: target_shell_dialect_for(target),
             resolution: InvocationResolution::default(),
             quoting_boundary: InvocationQuotingBoundary::default(),
+            env_overlay: InvocationEnvironmentOverlay::default(),
+            cleanup_contract: InvocationCleanupContract::default(),
         })
     }
 
@@ -860,6 +916,8 @@ impl AdbConnector {
             target_shell_dialect: target_shell_dialect_for(target),
             resolution: InvocationResolution::default(),
             quoting_boundary: InvocationQuotingBoundary::default(),
+            env_overlay: InvocationEnvironmentOverlay::default(),
+            cleanup_contract: InvocationCleanupContract::default(),
         })
     }
 
@@ -1072,6 +1130,7 @@ mod tests {
                 username: "root".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -1099,6 +1158,7 @@ mod tests {
                 username: "root".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -1128,6 +1188,7 @@ mod tests {
                 username: "root".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -1169,6 +1230,7 @@ mod tests {
                 username: "root".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -1193,6 +1255,7 @@ mod tests {
                 transport: None,
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -1215,6 +1278,7 @@ mod tests {
                 username: "root".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -1241,6 +1305,7 @@ mod tests {
                 transport: None,
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -1267,6 +1332,7 @@ mod tests {
                 transport: None,
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),
@@ -1294,6 +1360,7 @@ mod tests {
                 username: "root".into(),
             },
             credential_ref: None,
+            ssh_auth: None,
             default_policy: PolicyProfile::default(),
             notes: None,
             metadata: Default::default(),

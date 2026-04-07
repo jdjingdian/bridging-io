@@ -992,6 +992,7 @@ fn run_self_test() -> Result<(), String> {
         access_class: "anonymous-local".into(),
         sealed_profile_ref: None,
         credential_ref: None,
+        ssh_auth: None,
         notes: Some("self-test synthetic local target".into()),
         connection: StandaloneConnectionSection::default(),
         terminal: StandaloneTerminalSection::default(),

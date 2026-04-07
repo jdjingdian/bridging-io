@@ -67,12 +67,15 @@ display_name = "Local SSH"
 kind = "ssh"
 enabled = true
 aliases = ["local"]
-credential_ref = "vault://bridgingio/ssh-private-key/local"
 
 [targets.connection]
 host = "127.0.0.1"
 port = 22
 username = "dev"
+
+[targets.ssh_auth]
+kind = "none"
+secure_access = false
 
 [targets.providers.terminal]
 enabled = true
