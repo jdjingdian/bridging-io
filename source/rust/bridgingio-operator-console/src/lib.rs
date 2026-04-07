@@ -4807,6 +4807,7 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
         },
         RowTemplate::FieldEntryRow => {
             if let Some(value) = entry.value.as_deref() {
+                let value = localized_entry_value(app, entry, value);
                 format!("{selector}     {} ({value}) --->", entry.label)
             } else {
                 format!("{selector}     {} --->", entry.label)
@@ -4865,6 +4866,52 @@ fn format_menu_entry_line(app: &MenuConfigApp, index: usize, entry: &MenuEntry) 
             }
         }
     }
+}
+
+fn localized_entry_value(app: &MenuConfigApp, entry: &MenuEntry, value: &str) -> String {
+    if let MenuEntryKind::EditField(field) = &entry.kind {
+        return localized_field_value(&app.catalog, field, value);
+    }
+    value.to_string()
+}
+
+fn localized_field_value(catalog: &Catalog, field: &str, value: &str) -> String {
+    let key = match field {
+        "core.log_level" => match value {
+            "trace" => Some("menu.value.trace"),
+            "debug" => Some("menu.value.debug"),
+            "info" => Some("menu.value.info"),
+            "warn" => Some("menu.value.warn"),
+            "error" => Some("menu.value.error"),
+            _ => None,
+        },
+        "storage.artifacts.backend" => match value {
+            "memory" => Some("menu.value.memory"),
+            "filesystem" => Some("menu.value.filesystem"),
+            _ => None,
+        },
+        "model_plane.http.allow_non_loopback" => match value {
+            "true" => Some("menu.value.true"),
+            "false" => Some("menu.value.false"),
+            _ => None,
+        },
+        "vault.unlock.trigger_policy" => match value {
+            "on-first-secret-access" => Some("menu.value.on_first_secret_access"),
+            "on-core-start" => Some("menu.value.on_core_start"),
+            "on-every-secret-access" => Some("menu.value.on_every_secret_access"),
+            "manual-only" => Some("menu.value.manual_only"),
+            _ => None,
+        },
+        _ => None,
+    };
+    key.map_or_else(|| value.to_string(), |item| catalog.t(item))
+}
+
+fn localized_choice_options(catalog: &Catalog, field: &str, options: &[String]) -> Vec<String> {
+    options
+        .iter()
+        .map(|option| localized_field_value(catalog, field, option))
+        .collect()
 }
 
 fn row_value_is_enabled(value: Option<&str>) -> bool {
@@ -5099,11 +5146,12 @@ fn render_edit_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
             render_text_input_modal(frame, &popup);
         }
         PopupTemplate::ChoiceListModal => {
+            let options = localized_choice_options(&app.catalog, field, &app.edit_options);
             let popup = popup_choice_list(
                 app.t("menu.choice.title"),
                 app.tf("menu.choice.field", &[("field", &field_label)]),
                 app.t("menu.choice.hint"),
-                app.edit_options.clone(),
+                options,
                 app.edit_option_selected,
                 70,
                 55,
@@ -5158,16 +5206,6 @@ fn root_entries(catalog: &Catalog) -> Vec<MenuEntry> {
             Screen::Core,
         ),
         nav_entry(
-            &catalog.t("menu.storage.title"),
-            &catalog.t("menu.nav.storage.desc"),
-            Screen::Storage,
-        ),
-        nav_entry(
-            &catalog.t("menu.model_plane.title"),
-            &catalog.t("menu.nav.model_plane.desc"),
-            Screen::ModelPlane,
-        ),
-        nav_entry(
             &catalog.t("menu.vault.title"),
             &catalog.t("menu.nav.vault.desc"),
             Screen::Vault,
@@ -5209,6 +5247,16 @@ fn core_entries(settings: &CoreSettings, catalog: &Catalog) -> Vec<MenuEntry> {
             "core.operator_locale",
             &settings.core.operator_locale,
             &catalog.t("menu.core.operator_locale.desc"),
+        ),
+        nav_entry(
+            &catalog.t("menu.storage.title"),
+            &catalog.t("menu.nav.storage.desc"),
+            Screen::Storage,
+        ),
+        nav_entry(
+            &catalog.t("menu.model_plane.title"),
+            &catalog.t("menu.nav.model_plane.desc"),
+            Screen::ModelPlane,
         ),
     ]
 }
@@ -9984,6 +10032,64 @@ Zm9v\n\
     }
 
     #[test]
+    fn root_menu_scopes_cache_and_http_under_core_settings() {
+        let config_path = temp_config_path("core-settings-root-topology");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.screen = Screen::Root;
+        let root_entries = app.entries();
+        assert!(root_entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Navigate(Screen::Core))));
+        assert!(!root_entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Navigate(Screen::Storage))));
+        assert!(!root_entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Navigate(Screen::ModelPlane))));
+
+        app.screen = Screen::Core;
+        let core_entries = app.entries();
+        assert!(core_entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Navigate(Screen::Storage))));
+        assert!(core_entries
+            .iter()
+            .any(|entry| matches!(entry.kind, MenuEntryKind::Navigate(Screen::ModelPlane))));
+    }
+
+    #[test]
+    fn cache_backend_display_value_localizes_for_zh_locale() {
+        let config_path = temp_config_path("cache-backend-localized-row");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.settings.core.operator_locale = "zh-CN".into();
+        app.catalog = super::Catalog::load("zh-CN").expect("load zh-CN catalog");
+        app.screen = Screen::Storage;
+        app.settings.storage.artifacts.backend = "filesystem".into();
+
+        let entries = app.entries();
+        let index = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::EditField(ref field) if field == "storage.artifacts.backend"
+                )
+            })
+            .expect("backend entry");
+        let line = super::format_menu_entry_line(&app, index, &entries[index]);
+        assert!(line.contains("(文件系统)"));
+    }
+
+    #[test]
+    fn localized_choice_options_map_backend_values() {
+        let catalog = super::Catalog::load("zh-CN").expect("load zh-CN catalog");
+        let options = vec!["memory".to_string(), "filesystem".to_string()];
+        let localized =
+            super::localized_choice_options(&catalog, "storage.artifacts.backend", &options);
+        assert_eq!(localized, vec!["运行内存".to_string(), "文件系统".to_string()]);
+    }
+
+    #[test]
     fn representative_rows_use_explicit_row_templates() {
         let config_path = temp_config_path("row-template-representatives");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
@@ -10117,12 +10223,17 @@ Zm9v\n\
         let config_path = temp_config_path("back-selection-restore");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         app.screen = Screen::Root;
-        app.selected = 4;
+        let targets_index = app
+            .entries()
+            .iter()
+            .position(|entry| matches!(entry.kind, MenuEntryKind::Navigate(Screen::Targets)))
+            .expect("targets entry index");
+        app.selected = targets_index;
         app.activate_selected().expect("open targets");
         assert_eq!(app.screen, Screen::Targets);
         app.go_back();
         assert_eq!(app.screen, Screen::Root);
-        assert_eq!(app.selected, 4);
+        assert_eq!(app.selected, targets_index);
     }
 
     #[test]

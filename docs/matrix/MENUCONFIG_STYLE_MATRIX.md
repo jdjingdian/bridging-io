@@ -113,15 +113,16 @@ grammar. New menu fields should match one of these mappings.
 
 | Scope | Field / Entry | Template Mapping | Canonical Prefix | Canonical Grammar | Keys |
 | --- | --- | --- | --- | --- | --- |
-| Core | `core.instance_name` | `field-entry-row` | blank prefix column | `Instance Name (value) --->` | `Enter` edits |
-| Core | `core.log_level` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Log Level (value) --->` | `Enter` opens choice popup |
-| Core | `core.operator_locale` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Core Locale (value) --->` | `Enter` opens choice popup |
-| Core | `core.data_dir` | `info-row` | `---` | `--- Data Dir = value` | none |
-| Storage | `storage.artifacts.backend` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Artifact Backend (value) --->` | `Enter` opens choice popup |
-| Storage | `storage.artifacts.max_bytes` | `field-entry-row` + `text-input-modal` | blank prefix column | `Artifact Max Bytes (value) --->` | `Enter` edits |
-| Model Plane | `model_plane.http.host` | `field-entry-row` + `text-input-modal` | blank prefix column | `HTTP Host (value) --->` | `Enter` edits |
-| Model Plane | `model_plane.http.port` | `field-entry-row` + `text-input-modal` | blank prefix column | `HTTP Port (value) --->` | `Enter` edits |
-| Model Plane | `model_plane.http.allow_non_loopback` | `boolean-toggle-row` | `< >` / `<*>` | `< > Allow Non Loopback` / `<*> Allow Non Loopback` | `Space` toggles, `Enter` does not toggle |
+| Core Settings | `core.instance_name` | `field-entry-row` | blank prefix column | `Instance Name (value) --->` | `Enter` edits |
+| Core Settings | `core.log_level` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Log Level (value) --->` | `Enter` opens choice popup |
+| Core Settings | `core.operator_locale` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Core Locale (value) --->` | `Enter` opens choice popup |
+| Core Settings | `core.data_dir` | `info-row` | `---` | `--- Data Dir = value` | none |
+| Core Settings | `Cache Settings --->` / `HTTP Interface Settings --->` | `action-row` | blank prefix column | `Label --->` | `Enter` enters submenus |
+| Cache Settings | `storage.artifacts.backend` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Cache Storage Mode (display-value) --->` | `Enter` opens choice popup; display value is localized (`Memory` / `Filesystem` etc.) while persisted value stays canonical (`memory` / `filesystem`) |
+| Cache Settings | `storage.artifacts.max_bytes` | `field-entry-row` + `text-input-modal` | blank prefix column | `Max Cache Usage (value) --->` | `Enter` edits |
+| HTTP Interface Settings | `model_plane.http.host` | `field-entry-row` + `text-input-modal` | blank prefix column | `HTTP Listening Address (value) --->` | `Enter` edits |
+| HTTP Interface Settings | `model_plane.http.port` | `field-entry-row` + `text-input-modal` | blank prefix column | `HTTP Listening Port (value) --->` | `Enter` edits |
+| HTTP Interface Settings | `model_plane.http.allow_non_loopback` | `boolean-toggle-row` | `< >` / `<*>` | `< > Allow Non-Local Binding` / `<*> Allow Non-Local Binding` | `Space` toggles, `Enter` does not toggle |
 | Vault | `vault.unlock.trigger_policy` | `field-entry-row` + `choice-list-modal` | blank prefix column | `Unlock Trigger (value) --->` | `Enter` opens choice popup |
 | Vault | `vault.backend` / `vault.unlock.preferred_method` / `vault.unlock.allowed_methods` | `info-row` | `---` | `--- Label = value` | none |
 | Targets | `targets[*].enabled` | `multi-select-row` | `[ ]` / `[*]` | `[ ] Enabled` / `[*] Enabled` | `Space` toggles, `Enter` does not toggle |

@@ -232,3 +232,28 @@ BridgingIO 必须维护一份正式的本地 operator interface matrix，用于�
 - **那么** 接口矩阵必须明确记录系统返回阻断性错误提示
 - **并且** 必须明确记录该提示会引导用户改走 sealed + vault import 路径
 
+### 需求:本地接口矩阵必须记录 Core Settings 下的缓存与 HTTP 子菜单拓扑
+本地 operator interface matrix 必须正式记录 `menuconfig` 将基础配置收口到 `Core Settings`，并通过 `Cache Settings` 与 `HTTP Interface Settings` 两个子菜单暴露缓存与 HTTP 字段。矩阵不得继续把 `Storage` 与 `Model Plane` 记录为并列一级入口。
+
+#### 场景:矩阵记录缓存子菜单入口与字段
+- **当** 接口矩阵描述 `storage.artifacts.*` 相关 operator surface
+- **那么** 必须明确其路径为 `menuconfig -> Core Settings -> Cache Settings`
+- **并且** 至少记录缓存存储方式与缓存最大占用空间两个字段
+
+#### 场景:矩阵记录 HTTP 子菜单入口与字段
+- **当** 接口矩阵描述 `model_plane.http.*` 相关 operator surface
+- **那么** 必须明确其路径为 `menuconfig -> Core Settings -> HTTP Interface Settings`
+- **并且** 至少记录 HTTP 监听地址、HTTP 监听端口和 non-local binding 控制项
+
+### 需求:本地接口矩阵必须记录枚举显示值与配置写回值分离合同
+当本地 operator surface 通过枚举候选值展示配置项时，接口矩阵必须明确记录显示值是本地化 operator-facing label，而配置写回值仍是 canonical 枚举。该合同至少覆盖缓存 backend 字段。
+
+#### 场景:矩阵记录缓存 backend 的显示与写回语义
+- **当** 接口矩阵描述 `storage.artifacts.backend`
+- **那么** 必须明确界面可显示 `Memory` / `Filesystem` 或 `运行内存` / `文件系统`
+- **并且** 必须明确持久化写回值保持 `memory` / `filesystem`
+
+#### 场景:矩阵记录中文下的正式 operator-facing 命名
+- **当** 接口矩阵描述 `zh-CN` locale 的 Core/Cache/HTTP 设置页
+- **那么** 必须记录 `核心设置`、`缓存设置`、`HTTP 接口设置`、`缓存存储方式`、`缓存最大占用空间`、`HTTP 监听地址` 与 `HTTP 监听端口` 等正式命名
+- **并且** 不得继续把 `Artifact Backend`、`Artifact Max Bytes`、`HTTP Host`、`HTTP Port` 记为中文界面的正式字段名

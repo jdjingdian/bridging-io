@@ -146,3 +146,28 @@ BridgingIO 的 `menuconfig` 风格矩阵除了记录 popup matrix 外，还必�
 - **那么** 风格矩阵必须记录该行使用 `required readonly row`、`fixed enabled row` 或等价只读模板
 - **并且** 不得把该状态渲染成仍可切换的 toggle
 
+### 需求:风格矩阵必须记录 Core Settings 主入口与 Cache/HTTP 子菜单映射
+风格矩阵必须把基础配置入口记录为 `Core Settings`，并明确 `Cache Settings` 与 `HTTP Interface Settings` 是其下的二级导航语义。矩阵不得继续把 `Storage` 与 `Model Plane` 记录为并列一级入口真相。
+
+#### 场景:矩阵记录主菜单入口变化
+- **当** 风格矩阵更新主菜单映射
+- **那么** 基础配置入口必须记录为单一 `Core Settings`
+- **并且** `Storage` 与 `Model Plane` 不得继续作为一级导航入口出现
+
+#### 场景:矩阵记录 Core 页面子菜单动作行
+- **当** 风格矩阵记录 `Core Settings` 页面的导航行
+- **那么** `Cache Settings --->` 与 `HTTP Interface Settings --->` 必须记录为 `action-row` 或等价模板
+- **并且** 缓存字段与 HTTP 字段必须映射到各自子菜单页面
+
+### 需求:风格矩阵必须记录 canonical 值与 localized display 值分离
+对于 `menuconfig` 中采用枚举候选值的字段，风格矩阵必须明确记录“显示值可本地化、持久化值保持 canonical”的合同，并要求字段行和 choice popup 使用同一套 display 映射。
+
+#### 场景:矩阵记录缓存 backend 的 display/persist 合同
+- **当** 风格矩阵记录 `storage.artifacts.backend`
+- **那么** 必须明确 `memory` / `filesystem` 是配置持久化值
+- **并且** 必须明确 `Memory` / `Filesystem`（及其本地化等价）是 operator-facing 显示值
+
+#### 场景:矩阵要求字段行与 choice popup 显示一致
+- **当** 某枚举字段支持 choice popup
+- **那么** 当前值行内显示和 popup 候选显示必须使用一致的本地化映射
+- **并且** 不得出现“行内已本地化、popup 仍显示 canonical 枚举”的不一致状态

@@ -663,3 +663,28 @@ BridgingIO 的 `menuconfig` 操作面必须尽量对齐 Linux kernel `menuconfig
 - **那么** 系统必须通过共享 `choice-list modal` 组件构建该弹窗
 - **并且** 其候选列表、当前选中态与 `Up/Down/Enter/Space/Esc` 语义必须由模板组件统一派生
 
+### 需求:Core 基础运行配置必须收口到 Core Settings 并通过子菜单组织缓存与 HTTP
+`menuconfig` 必须将基础运行配置的主入口收口为单一 `Core Settings`（中文 locale 为 `核心设置`），并在该页面内通过 `Cache Settings --->` 与 `HTTP Interface Settings --->` 子菜单组织缓存与 HTTP 配置，而不是继续把 `Storage` 与 `Model Plane` 作为一级菜单并列暴露。
+
+#### 场景:主菜单仅保留 Core Settings 入口承载基础配置
+- **当** 操作员进入 `menuconfig` 主菜单
+- **那么** 系统必须提供单一 `Core Settings` 或 `核心设置` 一级入口用于基础配置
+- **并且** 不得继续同时并列暴露 `Storage` 与 `Model Plane` 作为一级入口
+
+#### 场景:Core Settings 下进入缓存与 HTTP 子菜单
+- **当** 操作员在 `Core Settings` 页面执行导航
+- **那么** 系统必须通过 `Cache Settings --->` 进入缓存字段编辑页面
+- **并且** 必须通过 `HTTP Interface Settings --->` 进入 HTTP 地址、端口与 non-local binding 设置页面
+
+### 需求:枚举字段必须显示本地化候选值并保持 canonical 写回
+`menuconfig` 对枚举字段的行内当前值和 choice popup 候选值必须使用 locale catalog 的 operator-facing 显示名；保存配置时仍必须写回 canonical 值，禁止将显示名直接持久化到配置。
+
+#### 场景:中文 locale 展示缓存 backend 候选值
+- **当** core locale 为 `zh-CN`，且操作员编辑 `storage.artifacts.backend`
+- **那么** 行内值与 choice popup 候选值必须显示为 `运行内存` / `文件系统`
+- **并且** 保存后配置值仍必须为 `memory` / `filesystem`
+
+#### 场景:HTTP 字段使用产品化 operator-facing 命名
+- **当** 操作员在 HTTP 子菜单浏览相关字段
+- **那么** 系统必须使用 `HTTP 监听地址` / `HTTP Listening Address` 与 `HTTP 监听端口` / `HTTP Listening Port` 等产品化命名
+- **并且** 不得继续把 `HTTP Host` / `HTTP Port` 作为正式 operator-facing 字段名
