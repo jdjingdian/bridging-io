@@ -168,7 +168,7 @@ BridgingIO 的 core contract automation 与 `--self-test` 文档必须维护正�
 - **那么** 自动化检查必须验证这些 operator-facing 文案走统一 catalog / 命令元数据入口，而不是直接拼接字面量字符串
 
 ### 需求:`menuconfig` 的显式解锁时机与反馈流程必须有回归覆盖
-针对 `bridgingio-core menuconfig` 的自动化或 contract 测试必须覆盖显式解锁时机与结果反馈，特别是 macOS `os-native` 路径。测试禁止只验证解锁入口存在，而必须验证进入界面时不触发系统验证、显式 unlock 后才进入等待态，以及成功或失败后 UI 状态完成切换。
+针对 `bridgingio-core menuconfig` 的自动化或 contract 测试必须覆盖显式解锁时机与结果反馈，特别是 macOS `os-native` 路径。测试禁止只验证解锁入口存在，而必须验证进入界面时不触发系统验证、显式 unlock 后才进入等待态，以及成功或失败后 UI 状态完成切换。对于平台取消路径，测试还必须验证 repeated unlock 不会把健康 vault 推入永久损坏态。
 
 #### 场景:macOS 进入 menuconfig 不触发系统验证
 - **当** 自动化在 macOS 上启动 `bridgingio-core menuconfig`，且 vault 当前处于 `locked`
@@ -190,12 +190,17 @@ BridgingIO 的 core contract automation 与 `--self-test` 文档必须维护正�
 - **当** 自动化在等待本地验证时发送 `Esc`
 - **那么** 测试必须验证 UI 立即退出等待态并进入取消反馈，且最终状态保持或恢复为 locked，不得出现“取消后仍报解锁成功”
 
+#### 场景:平台取消后 repeated unlock 仍可重新发起正式验证
+- **当** 自动化在已有健康 vault 的前提下，先模拟一次平台钥匙串取消，再次触发 `Unlock Vault`
+- **那么** 测试必须验证第二次仍重新进入 waiting + verified unlock 流程
+- **并且** 不得因为第一次取消而稳定复现 canonical wrap unwrap 失败
+
 #### 场景:Security 菜单关键状态语义有样式回归覆盖
 - **当** 自动化渲染 Security 菜单
 - **那么** 测试必须验证 `Vault 锁状态` 的值高亮遵循 `locked=红色`、`unlocked=绿色`，并验证 `解锁 Vault --->` 与 `-*- 加密项管理已解锁` 的互斥呈现规则
 
 ### 需求:授权观测与单次触发合同必须具备自动化回归覆盖
-针对 `menuconfig` 与本地受信任授权链路的自动化测试，必须覆盖授权日志落盘、display-safe 边界和 verified `os-native` 的 singleflight 行为，而不是只验证“按钮存在”或“最终状态变成 unlocked”。测试必须能够回答一次显式授权是否产生了稳定 flow、记录了哪些关键事件，以及底层平台验证是否只被调用一次。
+针对 `menuconfig` 与本地受信任授权链路的自动化测试，必须覆盖授权日志落盘、display-safe 边界和 verified `os-native` 的 singleflight 行为，而不是只验证“按钮存在”或“最终状态变成 unlocked”。测试必须能够回答一次显式授权是否产生了稳定 flow、记录了哪些关键事件，以及底层平台验证是否只被调用一次。对于取消、拒绝与 protector 失配等结果，日志也必须保持稳定的 display-safe 分类。
 
 #### 场景:显式授权动作产生持久化日志
 - **当** 自动化在 `menuconfig` 中触发一次显式授权动作，例如 `Unlock Vault` 或 `Delete Token`
@@ -220,6 +225,11 @@ BridgingIO 的 core contract automation 与 `--self-test` 文档必须维护正�
 - **当** 自动化通过 `menuconfig` unlock worker 路径触发一次显式 `Unlock Vault`
 - **那么** 测试必须验证 `logs/local-authorization.jsonl` 的 unlock 成功事件含有非 `not-applicable` 的 dedupe 语义（例如 `leader` 或 `joined`）
 - **并且** 必须验证 `logs/menuconfig-session.jsonl` 中 `action=unlock.worker` 事件复用同一个授权 `flow_id`
+
+#### 场景:取消与失配结果落盘为稳定分类
+- **当** 自动化分别模拟平台取消、ACL 拒绝和 protector 失配三种显式 unlock 结果
+- **那么** 测试必须验证授权日志与 worker 汇总事件能够稳定区分这些 display-safe 分类
+- **并且** 不得全部退化为同一个模糊 `unlock-failed`
 
 ### 需求:`menuconfig` 的 SSH 测试连接流程必须具备自动化回归覆盖
 针对 `bridgingio-core menuconfig` 的自动化或 contract 测试必须覆盖 SSH `Test Connection` 的关键交互和结果语义。测试不得只验证按钮存在，而必须验证其真实探测、状态门控、取消/超时行为与日志边界。
@@ -358,4 +368,22 @@ BridgingIO 的 core contract automation 与 `--self-test` 文档必须维护正�
 - **当** 自动化测试检查当前 menuconfig popup migration
 - **那么** 测试必须覆盖所有可正式映射到 `text-input modal` 与 `choice-list modal` 的现有弹窗
 - **并且** 不得只迁移其中一个流程样例而让其他输入/选择弹窗继续停留在手写布局路径
+
+### 需求:`os-native` protector 的取消安全与持久化不变式必须具备自动化回归覆盖
+针对 canonical vault 的 `os-native` verified unlock，自动化测试必须覆盖 keychain 取消/拒绝后的安全不变式，而不是只验证 UI 仍显示 locked。测试必须证明：取消或失败不会生成新的 protector material、不会改写现有 canonical wrap、不会伪造 verification metadata，并且 protector 失配会产生稳定的 display-safe 诊断。
+
+#### 场景:已有 protector 时取消验证不会改写 key material
+- **当** 自动化准备一个已有 `os-native` protector 的 vault，并在一次显式 verified unlock 中模拟用户取消或 ACL 拒绝
+- **那么** 测试必须验证现有 protector material 未被覆盖或重建
+- **并且** 必须验证 canonical wrap blob 与其 digest 保持不变
+
+#### 场景:verified rewrap 仅在完整成功后推进元数据
+- **当** 自动化覆盖 legacy fallback wrap 迁移到 verified `os-native` 的路径，并分别模拟成功、unwrap 失败与持久化提交失败
+- **那么** 测试必须验证只有完整成功的路径才会推进 `wrapped_key_digest`、`last_verified_at` 与 `status`
+- **并且** 失败路径不得留下半迁移状态
+
+#### 场景:protector 失配返回稳定 display-safe 诊断
+- **当** 自动化构造“当前 keychain protector 与 canonical wrap 已失配”的 vault 状态并触发显式 unlock
+- **那么** 测试必须验证系统返回稳定的 `protector-mismatch` 或等价 display-safe 结果
+- **并且** 不得退化为裸内部错误字符串或普通取消结果
 

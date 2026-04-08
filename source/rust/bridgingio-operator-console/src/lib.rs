@@ -284,7 +284,27 @@ enum UnlockFlowState {
     Idle,
     Waiting,
     Success,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+        category: UnlockFailureCategory,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnlockFailureCategory {
+    Cancelled,
+    Denied,
+    VerificationFailed,
+    ProtectorMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnlockFailureTelemetry {
+    category: UnlockFailureCategory,
+    reason_key: &'static str,
+    phase: &'static str,
+    result: &'static str,
+    error_code: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,7 +386,6 @@ struct TargetEditSession {
 
 const MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT_ENV: &str =
     "BRIDGINGIO_MENUCONFIG_FORCE_FALLBACK_HIGHLIGHT";
-const MENU_UNLOCK_REASON_REQUIRES_OS_NATIVE: &str = "__menu_unlock_requires_os_native__";
 const FOOTER_LOCK_STATE_TOKEN: &str = "__bridgingio_footer_lock_state_token__";
 const TOKEN_CREATE_LABEL_FIELD: &str = "__token_create_label__";
 const TOKEN_CREATE_EXPIRY_MODE_FIELD: &str = "__token_create_expiry_mode__";
@@ -422,10 +441,105 @@ const MENUCONFIG_TARGET_DIRTY_SUFFIXES: &[&str] = &[
     "ssh_auth.key_locator",
 ];
 
+fn classify_unlock_failure(err: &VaultError) -> UnlockFailureTelemetry {
+    match err {
+        VaultError::UnlockCancelled(_) => UnlockFailureTelemetry {
+            category: UnlockFailureCategory::Cancelled,
+            reason_key: "menu.error.vault_unlock_cancelled",
+            phase: "cancelled",
+            result: "cancelled",
+            error_code: "unlock-cancelled",
+        },
+        VaultError::UnlockDenied(_) => UnlockFailureTelemetry {
+            category: UnlockFailureCategory::Denied,
+            reason_key: "menu.error.vault_unlock_denied",
+            phase: "failed",
+            result: "denied",
+            error_code: "unlock-denied",
+        },
+        VaultError::ProtectorMismatch(_) => UnlockFailureTelemetry {
+            category: UnlockFailureCategory::ProtectorMismatch,
+            reason_key: "menu.error.vault_unlock_protector_mismatch",
+            phase: "failed",
+            result: "mismatch",
+            error_code: "protector-mismatch",
+        },
+        VaultError::UnlockVerificationFailed(_) => UnlockFailureTelemetry {
+            category: UnlockFailureCategory::VerificationFailed,
+            reason_key: "menu.error.vault_unlock_verification_failed",
+            phase: "failed",
+            result: "error",
+            error_code: "unlock-verification-failed",
+        },
+        VaultError::UnlockFailed(reason) => classify_unlock_failed_reason(reason),
+        _ => UnlockFailureTelemetry {
+            category: UnlockFailureCategory::VerificationFailed,
+            reason_key: "menu.error.vault_unlock_verification_failed",
+            phase: "failed",
+            result: "error",
+            error_code: "unlock-verification-failed",
+        },
+    }
+}
+
+fn classify_unlock_failed_reason(reason: &str) -> UnlockFailureTelemetry {
+    let normalized = reason.trim().to_ascii_lowercase();
+    if normalized.contains("cancel") {
+        return UnlockFailureTelemetry {
+            category: UnlockFailureCategory::Cancelled,
+            reason_key: "menu.error.vault_unlock_cancelled",
+            phase: "cancelled",
+            result: "cancelled",
+            error_code: "unlock-cancelled",
+        };
+    }
+    if normalized.contains("denied") || normalized.contains("permission") {
+        return UnlockFailureTelemetry {
+            category: UnlockFailureCategory::Denied,
+            reason_key: "menu.error.vault_unlock_denied",
+            phase: "failed",
+            result: "denied",
+            error_code: "unlock-denied",
+        };
+    }
+    if normalized.contains("canonical vault root key")
+        || (normalized.contains("protector") && normalized.contains("unwrap"))
+    {
+        return UnlockFailureTelemetry {
+            category: UnlockFailureCategory::ProtectorMismatch,
+            reason_key: "menu.error.vault_unlock_protector_mismatch",
+            phase: "failed",
+            result: "mismatch",
+            error_code: "protector-mismatch",
+        };
+    }
+    UnlockFailureTelemetry {
+        category: UnlockFailureCategory::VerificationFailed,
+        reason_key: "menu.error.vault_unlock_verification_failed",
+        phase: "failed",
+        result: "error",
+        error_code: "unlock-verification-failed",
+    }
+}
+
+fn unlock_failed_hint_key(category: UnlockFailureCategory) -> &'static str {
+    match category {
+        UnlockFailureCategory::Cancelled => "menu.unlock.failed.hint_cancelled",
+        UnlockFailureCategory::Denied => "menu.unlock.failed.hint_denied",
+        UnlockFailureCategory::VerificationFailed => "menu.unlock.failed.hint",
+        UnlockFailureCategory::ProtectorMismatch => "menu.unlock.failed.hint_protector_mismatch",
+    }
+}
+
 struct UnlockWorkerOutcome {
     router: SecretVaultRouter,
-    result: Result<(), String>,
+    result: Result<(), UnlockWorkerFailure>,
     verified_event: Option<VerifiedOsNativeEvent>,
+}
+
+enum UnlockWorkerFailure {
+    RequiresOsNative,
+    Vault(VaultError),
 }
 
 struct UnlockWorkerHandle {
@@ -1664,6 +1778,7 @@ impl MenuConfigApp {
             Err(err) => {
                 self.unlock_flow_state = UnlockFlowState::Failed {
                     reason: err.clone(),
+                    category: UnlockFailureCategory::VerificationFailed,
                 };
                 self.last_status = self.tf(
                     "menu.status.vault_unlock_failed",
@@ -1711,7 +1826,7 @@ impl MenuConfigApp {
             .name("menuconfig-unlock-worker".into())
             .spawn(move || {
                 let methods = ordered_unlock_methods(&settings);
-                let mut last_error = None::<String>;
+                let mut last_error = None::<UnlockWorkerFailure>;
                 let mut last_verified_event = None::<VerifiedOsNativeEvent>;
                 let mut attempted_os_native = false;
                 for method in methods {
@@ -1731,18 +1846,20 @@ impl MenuConfigApp {
                         }
                         Err(err) => {
                             last_verified_event = take_last_verified_os_native_event();
-                            last_error = Some(format!("{err:?}"));
+                            last_error = Some(UnlockWorkerFailure::Vault(err));
                         }
                     }
                 }
                 if !attempted_os_native {
-                    last_error = Some(MENU_UNLOCK_REASON_REQUIRES_OS_NATIVE.to_string());
+                    last_error = Some(UnlockWorkerFailure::RequiresOsNative);
                 }
                 let _ = tx.send(UnlockWorkerOutcome {
                     router,
-                    result: Err(
-                        last_error.unwrap_or_else(|| "No allowed unlock method succeeded.".into())
-                    ),
+                    result: Err(last_error.unwrap_or_else(|| {
+                        UnlockWorkerFailure::Vault(VaultError::UnlockVerificationFailed(
+                            "no allowed unlock method succeeded".into(),
+                        ))
+                    })),
                     verified_event: last_verified_event,
                 });
             })
@@ -1837,13 +1954,25 @@ impl MenuConfigApp {
                     );
                 }
                 Err(reason) => {
-                    let reason = if reason == MENU_UNLOCK_REASON_REQUIRES_OS_NATIVE {
-                        self.t("menu.error.menu_unlock_requires_os_native")
-                    } else {
-                        reason
+                    let (telemetry, reason) = match reason {
+                        UnlockWorkerFailure::RequiresOsNative => (
+                            UnlockFailureTelemetry {
+                                category: UnlockFailureCategory::VerificationFailed,
+                                reason_key: "menu.error.menu_unlock_requires_os_native",
+                                phase: "failed",
+                                result: "error",
+                                error_code: "menu-unlock-requires-os-native",
+                            },
+                            self.t("menu.error.menu_unlock_requires_os_native"),
+                        ),
+                        UnlockWorkerFailure::Vault(err) => {
+                            let telemetry = classify_unlock_failure(&err);
+                            (telemetry, self.t(telemetry.reason_key))
+                        }
                     };
                     self.unlock_flow_state = UnlockFlowState::Failed {
                         reason: reason.clone(),
+                        category: telemetry.category,
                     };
                     let methods = ordered_unlock_methods(&self.settings);
                     self.last_status = self.tf(
@@ -1863,20 +1992,20 @@ impl MenuConfigApp {
                         flow_id,
                         "Unlock Vault",
                         OP_VAULT_UNLOCK,
-                        "failed",
-                        "error",
+                        telemetry.phase,
+                        telemetry.result,
                         dedupe_state,
-                        Some("unlock-failed"),
+                        Some(telemetry.error_code),
                         None,
                         None,
                     );
                     self.record_session_event_with_flow(
                         flow_id,
                         "unlock.worker",
-                        "failed",
-                        "error",
+                        telemetry.phase,
+                        telemetry.result,
                         RuntimeLogLevel::Debug,
-                        Some("unlock-failed"),
+                        Some(telemetry.error_code),
                     );
                 }
             }
@@ -1888,6 +2017,7 @@ impl MenuConfigApp {
             self.unlock_worker = None;
             self.unlock_flow_state = UnlockFlowState::Failed {
                 reason: self.t("menu.error.unlock_worker_disconnected"),
+                category: UnlockFailureCategory::VerificationFailed,
             };
             let methods = ordered_unlock_methods(&self.settings);
             self.last_status = self.tf(
@@ -1927,17 +2057,21 @@ impl MenuConfigApp {
     #[cfg(test)]
     fn execute_pending_unlock_flow(&mut self) {
         let methods = ordered_unlock_methods(&self.settings);
-        let mut last_error = None::<String>;
+        let mut last_error = None::<UnlockWorkerFailure>;
         let mut attempted_os_native = false;
         for method in methods {
             match method.as_str() {
                 "os-native" => {
                     attempted_os_native = true;
-                    let unlock_result = self.ensure_vault_router_loaded().and_then(|router| {
-                        router
-                            .unlock_with_os_native_verified()
-                            .map_err(|err| format!("{err:?}"))
-                    });
+                    let unlock_result: Result<(), UnlockWorkerFailure> =
+                        match self.ensure_vault_router_loaded() {
+                            Ok(router) => router
+                                .unlock_with_os_native_verified()
+                                .map_err(UnlockWorkerFailure::Vault),
+                            Err(err) => Err(UnlockWorkerFailure::Vault(
+                                VaultError::UnlockVerificationFailed(err),
+                            )),
+                        };
                     match unlock_result {
                         Ok(()) => {
                             self.refresh_security_summary();
@@ -1952,11 +2086,25 @@ impl MenuConfigApp {
             }
         }
         if !attempted_os_native {
-            last_error = Some(self.t("menu.error.menu_unlock_requires_os_native"));
+            last_error = Some(UnlockWorkerFailure::RequiresOsNative);
         }
-        let reason = last_error.unwrap_or_else(|| self.t("menu.error.no_unlock_method_succeeded"));
+        let (category, reason) = match last_error {
+            Some(UnlockWorkerFailure::RequiresOsNative) => (
+                UnlockFailureCategory::VerificationFailed,
+                self.t("menu.error.menu_unlock_requires_os_native"),
+            ),
+            Some(UnlockWorkerFailure::Vault(err)) => {
+                let telemetry = classify_unlock_failure(&err);
+                (telemetry.category, self.t(telemetry.reason_key))
+            }
+            None => (
+                UnlockFailureCategory::VerificationFailed,
+                self.t("menu.error.no_unlock_method_succeeded"),
+            ),
+        };
         self.unlock_flow_state = UnlockFlowState::Failed {
             reason: reason.clone(),
+            category,
         };
         let methods = ordered_unlock_methods(&self.settings);
         self.last_status = self.tf(
@@ -4327,7 +4475,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &MenuConfigApp) {
             app.t("menu.render.unlock_waiting")
         } else if matches!(app.unlock_flow_state, UnlockFlowState::Success) {
             app.t("menu.render.unlock_success_hint")
-        } else if let UnlockFlowState::Failed { reason } = &app.unlock_flow_state {
+        } else if let UnlockFlowState::Failed { reason, .. } = &app.unlock_flow_state {
             app.tf("menu.render.unlock_failed_hint", &[("reason", reason)])
         } else if app.search_mode {
             app.tf("menu.render.search", &[("query", &app.search_input)])
@@ -4585,10 +4733,10 @@ fn render_unlock_flow_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: false }),
-        UnlockFlowState::Failed { reason } => Paragraph::new(vec![
+        UnlockFlowState::Failed { reason, category } => Paragraph::new(vec![
             Line::from(app.tf("menu.unlock.failed.message", &[("reason", reason)])),
             Line::from(""),
-            Line::from(app.t("menu.unlock.failed.hint")),
+            Line::from(app.t(unlock_failed_hint_key(*category))),
         ])
         .block(
             Block::default()
@@ -8664,7 +8812,7 @@ mod tests {
     use bridgingio_platform::RuntimeLogLevel;
     use bridgingio_secrets::{
         SecretBytes, SecretVaultRouter, TrustedLocalSshKeyImportRequest, VaultUnlockTriggerPolicy,
-        VerifiedOsNativeEvent,
+        VaultError, VerifiedOsNativeEvent,
     };
     use crossterm::event::KeyCode;
     use ratatui::layout::Rect;
@@ -10038,6 +10186,115 @@ Zm9v\n\
             .expect("read session log");
         assert!(session.contains("\"flow_id\":\"flow-vault.unlock-test\""));
         assert!(session.contains("\"action\":\"unlock.worker\""));
+    }
+
+    #[test]
+    fn unlock_worker_logs_stable_failure_categories() {
+        let config_path = temp_config_path("unlock-worker-failure-categories");
+        let runtime_root = config_path
+            .parent()
+            .expect("config parent")
+            .join("runtime-failure-categories");
+        set_config_data_dir(&config_path, &runtime_root);
+        set_config_log_level(&config_path, "debug");
+
+        let cases = vec![
+            (
+                VaultError::UnlockCancelled("cancelled".into()),
+                "unlock-cancelled",
+                "cancelled",
+                "cancelled",
+            ),
+            (
+                VaultError::UnlockDenied("denied".into()),
+                "unlock-denied",
+                "failed",
+                "denied",
+            ),
+            (
+                VaultError::ProtectorMismatch("mismatch".into()),
+                "protector-mismatch",
+                "failed",
+                "mismatch",
+            ),
+        ];
+
+        for (index, (err, error_code, phase, result)) in cases.into_iter().enumerate() {
+            let mut app = MenuConfigApp::load(&config_path).expect("load app");
+            let (tx, rx) = mpsc::channel();
+            app.unlock_worker = Some(super::UnlockWorkerHandle {
+                receiver: rx,
+                cancel_requested: false,
+            });
+            app.unlock_flow_id = Some(format!("flow-vault.unlock-category-{index}"));
+            tx.send(super::UnlockWorkerOutcome {
+                router: SecretVaultRouter::default(),
+                result: Err(super::UnlockWorkerFailure::Vault(err)),
+                verified_event: Some(VerifiedOsNativeEvent {
+                    flow_id: format!("verified-os-native-category-{index}"),
+                    dedupe_state: "leader".to_string(),
+                    phase: "failed".to_string(),
+                    result: "error".to_string(),
+                    cache_state: "skip".to_string(),
+                }),
+            })
+            .expect("send worker failure outcome");
+
+            app.poll_unlock_worker();
+
+            let auth = fs::read_to_string(runtime_root.join("logs/local-authorization.jsonl"))
+                .expect("read authorization log");
+            assert!(auth.contains(&format!("\"error_code\":\"{error_code}\"")));
+            assert!(auth.contains(&format!("\"phase\":\"{phase}\"")));
+            assert!(auth.contains(&format!("\"result\":\"{result}\"")));
+
+            let session = fs::read_to_string(runtime_root.join("logs/menuconfig-session.jsonl"))
+                .expect("read session log");
+            assert!(session.contains(&format!("\"error_code\":\"{error_code}\"")));
+            assert!(session.contains(&format!("\"phase\":\"{phase}\"")));
+            assert!(session.contains(&format!("\"result\":\"{result}\"")));
+        }
+    }
+
+    #[test]
+    fn unlock_flow_can_restart_after_platform_cancelled_failure() {
+        let config_path = temp_config_path("unlock-retry-after-cancelled");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+
+        let (tx, rx) = mpsc::channel();
+        app.unlock_worker = Some(super::UnlockWorkerHandle {
+            receiver: rx,
+            cancel_requested: false,
+        });
+        app.unlock_flow_id = Some("flow-vault.unlock-cancelled-first".to_string());
+        tx.send(super::UnlockWorkerOutcome {
+            router: SecretVaultRouter::default(),
+            result: Err(super::UnlockWorkerFailure::Vault(
+                VaultError::UnlockCancelled("cancelled-by-platform".into()),
+            )),
+            verified_event: Some(VerifiedOsNativeEvent {
+                flow_id: "verified-os-native-cancelled".to_string(),
+                dedupe_state: "leader".to_string(),
+                phase: "cancelled".to_string(),
+                result: "cancelled".to_string(),
+                cache_state: "skip".to_string(),
+            }),
+        })
+        .expect("send cancelled outcome");
+        app.poll_unlock_worker();
+        assert!(matches!(
+            app.unlock_flow_state,
+            super::UnlockFlowState::Failed {
+                category: super::UnlockFailureCategory::Cancelled,
+                ..
+            }
+        ));
+        app.handle_unlock_flow_key(KeyCode::Enter);
+        assert_eq!(app.unlock_flow_state, super::UnlockFlowState::Idle);
+
+        app.begin_unlock_flow();
+        assert_eq!(app.unlock_flow_state, super::UnlockFlowState::Waiting);
+        assert!(app.unlock_flow_pending);
     }
 
     #[test]

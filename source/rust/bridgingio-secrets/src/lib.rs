@@ -1112,6 +1112,10 @@ pub enum VaultError {
     VaultLocked(String),
     VaultUnavailable(String),
     UnlockMethodNotAllowed(String),
+    UnlockCancelled(String),
+    UnlockDenied(String),
+    UnlockVerificationFailed(String),
+    ProtectorMismatch(String),
     UnlockFailed(String),
     PassphraseNotConfigured,
     PassphraseRejected,
@@ -1268,6 +1272,34 @@ impl VaultError {
                 "vault.unlock_method_not_allowed",
                 "unlock method is not allowed by policy",
                 "use an allowed unlock method and retry",
+            ),
+            Self::UnlockCancelled(_) => (
+                ContractStatus::Locked,
+                CommonErrorCode::VerificationRequired,
+                "vault.unlock_cancelled",
+                "vault unlock was cancelled",
+                "retry unlock and complete local verification",
+            ),
+            Self::UnlockDenied(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::PermissionDenied,
+                "vault.unlock_denied",
+                "vault unlock was denied by local platform policy",
+                "allow local vault access in platform credential settings and retry",
+            ),
+            Self::UnlockVerificationFailed(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.unlock_verification_failed",
+                "vault unlock verification failed",
+                "retry local verification and inspect platform credential diagnostics",
+            ),
+            Self::ProtectorMismatch(_) => (
+                ContractStatus::Failed,
+                CommonErrorCode::ValidationFailed,
+                "vault.protector_mismatch",
+                "vault protector does not match the canonical wrap binding",
+                "restore the original platform protector or reinitialize the vault",
             ),
             Self::UnlockFailed(_) => (
                 ContractStatus::Failed,
@@ -4434,11 +4466,7 @@ impl SecretVaultRouter {
                 )
             })?;
         let wrapped = self.read_wrap_blob(&manifest.wrapped_key_locator)?;
-        let kek = os_native_protector_kek_verified().ok_or_else(|| {
-            VaultError::UnlockFailed(
-                "os-native unlock verification did not complete or was cancelled".into(),
-            )
-        })?;
+        let kek = os_native_protector_kek_verified()?;
         self.unwrap_os_native_root_key_with_verified_kek(&manifest, &wrapped, &kek)
     }
 
@@ -4450,6 +4478,11 @@ impl SecretVaultRouter {
     ) -> Result<Vec<u8>, VaultError> {
         let aad = format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id);
         if let Ok(root_key) = open_aead(verified_kek, aad.as_bytes(), wrapped) {
+            self.upsert_wrap_manifest(ProtectorWrapManifest {
+                last_verified_at: Some(SystemTime::now()),
+                status: ProtectorWrapStatus::Ready,
+                ..manifest.clone()
+            });
             return Ok(root_key);
         }
 
@@ -4463,23 +4496,19 @@ impl SecretVaultRouter {
             wrapped,
         )
         .map_err(|_| {
-            VaultError::UnlockFailed(
-                "os-native protector could not unwrap the canonical vault root key".into(),
+            VaultError::ProtectorMismatch(
+                "os-native protector does not match the canonical vault root wrap".into(),
             )
         })?;
 
         let rewrapped = seal_aead(verified_kek, aad.as_bytes(), &legacy_root_key);
-        if self
-            .write_wrap_blob(&manifest.wrapped_key_locator, rewrapped.clone())
-            .is_ok()
-        {
-            self.upsert_wrap_manifest(ProtectorWrapManifest {
-                wrapped_key_digest: short_digest(&rewrapped),
-                last_verified_at: Some(SystemTime::now()),
-                status: ProtectorWrapStatus::Ready,
-                ..manifest.clone()
-            });
-        }
+        self.write_wrap_blob(&manifest.wrapped_key_locator, rewrapped.clone())?;
+        self.upsert_wrap_manifest(ProtectorWrapManifest {
+            wrapped_key_digest: short_digest(&rewrapped),
+            last_verified_at: Some(SystemTime::now()),
+            status: ProtectorWrapStatus::Ready,
+            ..manifest.clone()
+        });
 
         Ok(legacy_root_key)
     }
@@ -4555,11 +4584,10 @@ impl SecretVaultRouter {
     }
 
     fn write_wrap_blob(&mut self, locator: &str, payload: Vec<u8>) -> Result<(), VaultError> {
-        self.wrap_blob_cache
-            .insert(locator.to_string(), payload.clone());
         if let Some(layout) = self.storage_layout.as_ref() {
             write_blob(layout.path_for_blob_uri(locator)?, &payload)?;
         }
+        self.wrap_blob_cache.insert(locator.to_string(), payload);
         Ok(())
     }
 
@@ -5254,7 +5282,6 @@ impl SecretVaultRouter {
         for manifest in &mut self.wrap_manifests {
             if let Some(payload) = self.wrap_blob_cache.get(&manifest.wrapped_key_locator) {
                 manifest.wrapped_key_digest = short_digest(payload);
-                manifest.last_verified_at = Some(SystemTime::now());
             }
         }
 
@@ -6435,10 +6462,19 @@ static OS_NATIVE_VERIFIED_FLOW_COUNTER: OnceLock<Mutex<u64>> = OnceLock::new();
 static OS_NATIVE_VERIFIED_SINGLEFLIGHT: OnceLock<VerifiedOsNativeSingleflight> = OnceLock::new();
 #[cfg(test)]
 static TEST_OS_NATIVE_VERIFIED_LOADER: OnceLock<
-    Mutex<Option<Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>>>,
+    Mutex<Option<Arc<dyn Fn() -> OsNativeProtectorKekAccess + Send + Sync>>>,
 > = OnceLock::new();
 #[cfg(test)]
 static TEST_OS_NATIVE_VERIFIED_TIMEOUT_MS: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OsNativeProtectorKekAccess {
+    Found(Vec<u8>),
+    NotFound,
+    Cancelled,
+    Denied,
+    PlatformFailure,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedOsNativeEvent {
@@ -6459,7 +6495,7 @@ pub fn take_last_verified_os_native_event() -> Option<VerifiedOsNativeEvent> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedOsNativeAttempt {
-    value: Option<Vec<u8>>,
+    access: OsNativeProtectorKekAccess,
     event: VerifiedOsNativeEvent,
 }
 
@@ -6468,7 +6504,7 @@ struct VerifiedOsNativeInFlight {
     flow_id: String,
     participants: usize,
     completed: bool,
-    result: Option<Vec<u8>>,
+    result: OsNativeProtectorKekAccess,
 }
 
 struct VerifiedOsNativeSingleflight {
@@ -6519,21 +6555,35 @@ fn os_native_protector_kek() -> Option<Vec<u8>> {
         .clone()
 }
 
-fn os_native_protector_kek_verified() -> Option<Vec<u8>> {
+fn os_native_protector_kek_verified() -> Result<Vec<u8>, VaultError> {
     let attempt = os_native_protector_kek_verified_attempt();
-    if let Some(value) = attempt.value.clone() {
+    if let OsNativeProtectorKekAccess::Found(value) = attempt.access.clone() {
         cache_verified_os_native_kek(Some(value));
     }
     LAST_VERIFIED_OS_NATIVE_EVENT.with(|slot| {
         *slot.borrow_mut() = Some(attempt.event);
     });
-    attempt.value
+    match attempt.access {
+        OsNativeProtectorKekAccess::Found(value) => Ok(value),
+        OsNativeProtectorKekAccess::NotFound => Err(VaultError::ProtectorMismatch(
+            "os-native protector item was not found for the canonical wrap".into(),
+        )),
+        OsNativeProtectorKekAccess::Cancelled => Err(VaultError::UnlockCancelled(
+            "os-native unlock verification was cancelled by the local platform prompt".into(),
+        )),
+        OsNativeProtectorKekAccess::Denied => Err(VaultError::UnlockDenied(
+            "os-native unlock verification was denied by local platform policy".into(),
+        )),
+        OsNativeProtectorKekAccess::PlatformFailure => Err(VaultError::UnlockVerificationFailed(
+            "os-native unlock verification failed to access platform credential storage".into(),
+        )),
+    }
 }
 
 fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
     if let Some(cached) = cached_verified_os_native_kek() {
         return VerifiedOsNativeAttempt {
-            value: Some(cached),
+            access: OsNativeProtectorKekAccess::Found(cached),
             event: VerifiedOsNativeEvent {
                 flow_id: "cached-verified-os-native-kek".to_string(),
                 dedupe_state: "not-applicable".to_string(),
@@ -6547,7 +6597,7 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
     {
         if !os_native_platform_binding_supported() {
             return VerifiedOsNativeAttempt {
-                value: None,
+                access: OsNativeProtectorKekAccess::PlatformFailure,
                 event: VerifiedOsNativeEvent {
                     flow_id: "unsupported-os-native".to_string(),
                     dedupe_state: "not-applicable".to_string(),
@@ -6564,7 +6614,7 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
             Ok(guard) => guard,
             Err(_) => {
                 return VerifiedOsNativeAttempt {
-                    value: None,
+                    access: OsNativeProtectorKekAccess::PlatformFailure,
                     event: VerifiedOsNativeEvent {
                         flow_id: "lock-poisoned-os-native".to_string(),
                         dedupe_state: "not-applicable".to_string(),
@@ -6581,29 +6631,25 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
             loop {
                 if let Some(current) = guard.as_mut() {
                     if current.flow_id == flow_id && current.completed {
-                        let value = current.result.clone();
+                        let access = current.result.clone();
                         current.participants = current.participants.saturating_sub(1);
                         let should_clear = current.participants == 0;
                         if should_clear {
                             *guard = None;
                         }
                         drop(guard);
+                        let (phase, result) = os_native_verified_phase_result(&access);
                         return VerifiedOsNativeAttempt {
-                            value: value.clone(),
+                            access: access.clone(),
                             event: VerifiedOsNativeEvent {
                                 flow_id,
                                 dedupe_state: "joined".to_string(),
-                                phase: if value.is_some() {
-                                    "succeeded".to_string()
-                                } else {
-                                    "failed".to_string()
-                                },
-                                result: if value.is_some() {
-                                    "ok".to_string()
-                                } else {
-                                    "error".to_string()
-                                },
-                                cache_state: if value.is_some() {
+                                phase: phase.to_string(),
+                                result: result.to_string(),
+                                cache_state: if matches!(
+                                    access,
+                                    OsNativeProtectorKekAccess::Found(_)
+                                ) {
                                     "stored".to_string()
                                 } else {
                                     "skip".to_string()
@@ -6624,7 +6670,7 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
                     }
                     drop(guard);
                     return VerifiedOsNativeAttempt {
-                        value: None,
+                        access: OsNativeProtectorKekAccess::Cancelled,
                         event: VerifiedOsNativeEvent {
                             flow_id,
                             dedupe_state: "joined".to_string(),
@@ -6639,7 +6685,7 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
                     Ok(outcome) => outcome,
                     Err(_) => {
                         return VerifiedOsNativeAttempt {
-                            value: None,
+                            access: OsNativeProtectorKekAccess::PlatformFailure,
                             event: VerifiedOsNativeEvent {
                                 flow_id,
                                 dedupe_state: "joined".to_string(),
@@ -6659,16 +6705,16 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
             flow_id: flow_id.clone(),
             participants: 1,
             completed: false,
-            result: None,
+            result: OsNativeProtectorKekAccess::PlatformFailure,
         });
         drop(guard);
 
-        let (value, timed_out) = run_os_native_verified_loader(timeout);
+        let access = run_os_native_verified_loader(timeout);
         if let Ok(mut guard) = singleflight.state.lock() {
             if let Some(current) = guard.as_mut() {
                 if current.flow_id == flow_id {
                     current.completed = true;
-                    current.result = value.clone();
+                    current.result = access.clone();
                     current.participants = current.participants.saturating_sub(1);
                     let should_clear = current.participants == 0;
                     singleflight.cv.notify_all();
@@ -6678,26 +6724,15 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
                 }
             }
         }
+        let (phase, result) = os_native_verified_phase_result(&access);
         return VerifiedOsNativeAttempt {
-            value: value.clone(),
+            access: access.clone(),
             event: VerifiedOsNativeEvent {
                 flow_id,
                 dedupe_state: "leader".to_string(),
-                phase: if timed_out {
-                    "cancelled".to_string()
-                } else if value.is_some() {
-                    "succeeded".to_string()
-                } else {
-                    "failed".to_string()
-                },
-                result: if timed_out {
-                    "cancelled".to_string()
-                } else if value.is_some() {
-                    "ok".to_string()
-                } else {
-                    "error".to_string()
-                },
-                cache_state: if value.is_some() {
+                phase: phase.to_string(),
+                result: result.to_string(),
+                cache_state: if matches!(access, OsNativeProtectorKekAccess::Found(_)) {
                     "stored".to_string()
                 } else {
                     "skip".to_string()
@@ -6708,7 +6743,7 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         VerifiedOsNativeAttempt {
-            value: None,
+            access: OsNativeProtectorKekAccess::PlatformFailure,
             event: VerifiedOsNativeEvent {
                 flow_id: "unsupported-os-native".to_string(),
                 dedupe_state: "not-applicable".to_string(),
@@ -6720,9 +6755,19 @@ fn os_native_protector_kek_verified_attempt() -> VerifiedOsNativeAttempt {
     }
 }
 
+fn os_native_verified_phase_result(access: &OsNativeProtectorKekAccess) -> (&'static str, &'static str) {
+    match access {
+        OsNativeProtectorKekAccess::Found(_) => ("succeeded", "ok"),
+        OsNativeProtectorKekAccess::NotFound => ("failed", "not-found"),
+        OsNativeProtectorKekAccess::Cancelled => ("cancelled", "cancelled"),
+        OsNativeProtectorKekAccess::Denied => ("failed", "denied"),
+        OsNativeProtectorKekAccess::PlatformFailure => ("failed", "error"),
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn run_os_native_verified_loader(timeout: Duration) -> (Option<Vec<u8>>, bool) {
-    let (tx, rx) = mpsc::sync_channel::<Option<Vec<u8>>>(1);
+fn run_os_native_verified_loader(timeout: Duration) -> OsNativeProtectorKekAccess {
+    let (tx, rx) = mpsc::sync_channel::<OsNativeProtectorKekAccess>(1);
     #[cfg(test)]
     let test_loader = TEST_OS_NATIVE_VERIFIED_LOADER
         .get_or_init(|| Mutex::new(None))
@@ -6737,15 +6782,15 @@ fn run_os_native_verified_loader(timeout: Duration) -> (Option<Vec<u8>>, bool) {
                 let _ = tx.send(loader());
                 return;
             }
-            let _ = tx.send(os_native_protector_kek_blocking());
+            let _ = tx.send(read_os_native_protector_kek_blocking());
         });
     if spawned.is_err() {
-        return (None, false);
+        return OsNativeProtectorKekAccess::PlatformFailure;
     }
     match rx.recv_timeout(timeout) {
-        Ok(value) => (value, false),
-        Err(mpsc::RecvTimeoutError::Timeout) => (None, true),
-        Err(mpsc::RecvTimeoutError::Disconnected) => (None, false),
+        Ok(value) => value,
+        Err(mpsc::RecvTimeoutError::Timeout) => OsNativeProtectorKekAccess::Cancelled,
+        Err(mpsc::RecvTimeoutError::Disconnected) => OsNativeProtectorKekAccess::PlatformFailure,
     }
 }
 
@@ -6798,7 +6843,7 @@ fn set_test_os_native_verified_timeout_ms(timeout_ms: Option<u64>) {
 
 #[cfg(test)]
 fn set_test_os_native_verified_loader(
-    loader: Option<Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>>,
+    loader: Option<Arc<dyn Fn() -> OsNativeProtectorKekAccess + Send + Sync>>,
 ) {
     if let Ok(mut guard) = TEST_OS_NATIVE_VERIFIED_LOADER
         .get_or_init(|| Mutex::new(None))
@@ -6837,7 +6882,7 @@ fn os_native_protector_kek_inner() -> Option<Vec<u8>> {
         let spawned = std::thread::Builder::new()
             .name("bridgingio-os-native-kek-probe".into())
             .spawn(move || {
-                let _ = tx.send(os_native_protector_kek_blocking());
+                let _ = tx.send(provision_os_native_protector_kek_blocking());
             });
         if spawned.is_err() {
             return None;
@@ -6854,22 +6899,89 @@ fn os_native_protector_kek_inner() -> Option<Vec<u8>> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn os_native_protector_kek_blocking() -> Option<Vec<u8>> {
+fn provision_os_native_protector_kek_blocking() -> Option<Vec<u8>> {
+    match read_os_native_protector_kek_blocking() {
+        OsNativeProtectorKekAccess::Found(value) => Some(value),
+        OsNativeProtectorKekAccess::NotFound => create_os_native_protector_kek_blocking(),
+        OsNativeProtectorKekAccess::Cancelled
+        | OsNativeProtectorKekAccess::Denied
+        | OsNativeProtectorKekAccess::PlatformFailure => None,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn create_os_native_protector_kek_blocking() -> Option<Vec<u8>> {
     let entry =
         keyring::Entry::new(OS_NATIVE_PROTECTOR_SERVICE, OS_NATIVE_PROTECTOR_ACCOUNT).ok()?;
-    if let Ok(existing) = entry.get_password() {
-        if let Ok(decoded) = hex_decode(existing.trim()) {
-            if decoded.len() == 32 {
-                return Some(decoded);
-            }
-        }
-    }
     let generated = pseudo_random_bytes(32, "os-native-protector-kek");
     let encoded = hex_encode(&generated);
     if entry.set_password(&encoded).is_ok() {
         return Some(generated);
     }
     None
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn read_os_native_protector_kek_blocking() -> OsNativeProtectorKekAccess {
+    let Ok(entry) = keyring::Entry::new(OS_NATIVE_PROTECTOR_SERVICE, OS_NATIVE_PROTECTOR_ACCOUNT)
+    else {
+        return OsNativeProtectorKekAccess::PlatformFailure;
+    };
+    match entry.get_password() {
+        Ok(existing) => {
+            let Ok(decoded) = hex_decode(existing.trim()) else {
+                return OsNativeProtectorKekAccess::PlatformFailure;
+            };
+            if decoded.len() != 32 {
+                return OsNativeProtectorKekAccess::PlatformFailure;
+            }
+            OsNativeProtectorKekAccess::Found(decoded)
+        }
+        Err(err) => classify_os_native_keyring_error(&err),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn classify_os_native_keyring_error(err: &keyring::Error) -> OsNativeProtectorKekAccess {
+    match err {
+        keyring::Error::NoEntry => OsNativeProtectorKekAccess::NotFound,
+        keyring::Error::NoStorageAccess(source) => {
+            classify_os_native_platform_error_text(&source.to_string())
+        }
+        keyring::Error::PlatformFailure(source) => {
+            classify_os_native_platform_error_text(&source.to_string())
+        }
+        keyring::Error::BadEncoding(_)
+        | keyring::Error::TooLong(_, _)
+        | keyring::Error::Invalid(_, _)
+        | keyring::Error::Ambiguous(_) => OsNativeProtectorKekAccess::PlatformFailure,
+        _ => OsNativeProtectorKekAccess::PlatformFailure,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn classify_os_native_platform_error_text(raw: &str) -> OsNativeProtectorKekAccess {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.contains("user canceled")
+        || normalized.contains("user cancelled")
+        || normalized.contains("canceled")
+        || normalized.contains("cancelled")
+        || normalized.contains("errsecusercanceled")
+        || normalized.contains("error code -128")
+    {
+        return OsNativeProtectorKekAccess::Cancelled;
+    }
+    if normalized.contains("denied")
+        || normalized.contains("access denied")
+        || normalized.contains("permission")
+        || normalized.contains("auth failed")
+        || normalized.contains("errsecauthfailed")
+        || normalized.contains("error code -25293")
+        || normalized.contains("error code 5")
+    {
+        return OsNativeProtectorKekAccess::Denied;
+    }
+    OsNativeProtectorKekAccess::PlatformFailure
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -6991,9 +7103,9 @@ mod tests {
         read_passive_vault_projection, reset_verified_os_native_state_for_tests,
         set_test_os_native_verified_loader, set_test_os_native_verified_timeout_ms,
         AgentTokenAuthResult, AgentTokenStatus, CreateAgentTokenRequest, DeleteAgentTokenRequest,
-        DeleteVaultRequest, LocalAdminActionKind, SecretBytes, SecretVaultRouter,
-        SshAgentBrokerEndpointKind, SshAgentBrokerPrepareRequest, SshAgentBrokerSessionState,
-        SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
+        DeleteVaultRequest, LocalAdminActionKind, OsNativeProtectorKekAccess, SecretBytes,
+        SecretVaultRouter, SshAgentBrokerEndpointKind, SshAgentBrokerPrepareRequest,
+        SshAgentBrokerSessionState, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
         TrustedLocalSshKeyImportRequest, TrustedLocalSshPrivateKeyFormat,
         UpdateAgentTokenAccessRequest,
         UpdateAgentTokenLabelRequest, UpdateAgentTokenScopeRequest, VaultError, VaultLockState,
@@ -7527,6 +7639,207 @@ Zm9v\n\
         assert_eq!(manifest_after.status, super::ProtectorWrapStatus::Ready);
     }
 
+    #[test]
+    fn verified_unlock_mismatch_keeps_blob_and_manifest_unchanged() {
+        let mut router = SecretVaultRouter::default();
+        let manifest = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.protector_binding == "os-native")
+            .cloned()
+            .expect("os-native wrap manifest");
+        let aad = format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id);
+        let mismatch_root_key = super::pseudo_random_bytes(32, "mismatch-root-key");
+        let mismatch_wrapped = super::seal_aead(
+            &super::pseudo_random_bytes(32, "mismatch-wrong-kek"),
+            aad.as_bytes(),
+            &mismatch_root_key,
+        );
+        router
+            .write_wrap_blob(&manifest.wrapped_key_locator, mismatch_wrapped.clone())
+            .expect("write mismatch wrap");
+        let manifest_before = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.wrap_id == manifest.wrap_id)
+            .cloned()
+            .expect("manifest before mismatch");
+
+        let err = router
+            .unwrap_os_native_root_key_with_verified_kek(
+                &manifest,
+                &mismatch_wrapped,
+                &super::pseudo_random_bytes(32, "verified-kek-mismatch"),
+            )
+            .expect_err("mismatch must fail closed");
+        assert!(matches!(err, VaultError::ProtectorMismatch(_)));
+        assert_eq!(
+            router
+                .read_wrap_blob(&manifest.wrapped_key_locator)
+                .expect("read wrap after mismatch"),
+            mismatch_wrapped
+        );
+        let manifest_after = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.wrap_id == manifest.wrap_id)
+            .cloned()
+            .expect("manifest after mismatch");
+        assert_eq!(manifest_after, manifest_before);
+    }
+
+    #[test]
+    fn verified_rewrap_commit_failure_keeps_existing_blob_and_manifest() {
+        let vault_dir = new_temp_vault_dir("verified-rewrap-commit-failure");
+        let mut router =
+            SecretVaultRouter::with_persistent_store(&vault_dir).expect("enable persistent store");
+        let manifest = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.protector_binding == "os-native")
+            .cloned()
+            .expect("os-native wrap manifest");
+        let original_blob = router
+            .read_wrap_blob(&manifest.wrapped_key_locator)
+            .expect("read original blob");
+        let manifest_before = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.wrap_id == manifest.wrap_id)
+            .cloned()
+            .expect("manifest before commit failure");
+        let aad = format!("root:{}:{}", manifest.vault_key_id, manifest.wrap_id);
+        let legacy_root_key = super::pseudo_random_bytes(32, "legacy-root-key-commit-failure");
+        let legacy_wrapped = super::seal_aead(
+            &super::fallback_protector_kek("os-native"),
+            aad.as_bytes(),
+            &legacy_root_key,
+        );
+
+        let mut broken_manifest = manifest.clone();
+        broken_manifest.wrapped_key_locator = "invalid://wrap/broken-locator".into();
+        let err = router
+            .unwrap_os_native_root_key_with_verified_kek(
+                &broken_manifest,
+                &legacy_wrapped,
+                &super::pseudo_random_bytes(32, "verified-kek-commit-failure"),
+            )
+            .expect_err("commit failure must fail");
+        assert!(matches!(err, VaultError::StorageIo(_)));
+        assert_eq!(
+            router
+                .read_wrap_blob(&manifest.wrapped_key_locator)
+                .expect("read canonical blob after commit failure"),
+            original_blob
+        );
+        let manifest_after = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.wrap_id == manifest.wrap_id)
+            .cloned()
+            .expect("manifest after commit failure");
+        assert_eq!(manifest_after, manifest_before);
+    }
+
+    #[test]
+    fn persist_metadata_db_does_not_advance_unverified_wrap_timestamp() {
+        let mut router = SecretVaultRouter::default();
+        let wrap_id = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.protector_binding == "os-native")
+            .map(|item| item.wrap_id.clone())
+            .expect("os-native wrap id");
+        let before = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.wrap_id == wrap_id)
+            .cloned()
+            .expect("manifest before persist");
+        assert!(before.last_verified_at.is_none());
+
+        router.persist_metadata_db().expect("persist metadata");
+        let after = router
+            .protector_wrap_manifests()
+            .iter()
+            .find(|item| item.wrap_id == wrap_id)
+            .cloned()
+            .expect("manifest after persist");
+        assert!(after.last_verified_at.is_none());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn verified_unlock_cancelled_or_denied_keeps_existing_wrap_unchanged() {
+        for access in [
+            OsNativeProtectorKekAccess::Cancelled,
+            OsNativeProtectorKekAccess::Denied,
+        ] {
+            reset_verified_os_native_state_for_tests();
+            let mut router = SecretVaultRouter::default();
+            let manifest = router
+                .protector_wrap_manifests()
+                .iter()
+                .find(|item| item.protector_binding == "os-native")
+                .cloned()
+                .expect("os-native wrap manifest");
+            let original_blob = router
+                .read_wrap_blob(&manifest.wrapped_key_locator)
+                .expect("read original blob");
+            let manifest_before = router
+                .protector_wrap_manifests()
+                .iter()
+                .find(|item| item.wrap_id == manifest.wrap_id)
+                .cloned()
+                .expect("manifest before cancel/deny");
+            let loader = Arc::new({
+                let access = access.clone();
+                move || access.clone()
+            });
+            set_test_os_native_verified_loader(Some(loader));
+
+            let err = router
+                .unlock_with_os_native_verified()
+                .expect_err("cancel/deny must fail closed");
+            match access {
+                OsNativeProtectorKekAccess::Cancelled => {
+                    assert!(matches!(err, VaultError::UnlockCancelled(_)));
+                }
+                OsNativeProtectorKekAccess::Denied => {
+                    assert!(matches!(err, VaultError::UnlockDenied(_)));
+                }
+                _ => unreachable!("only cancelled/denied are covered here"),
+            }
+            assert_eq!(
+                router
+                    .read_wrap_blob(&manifest.wrapped_key_locator)
+                    .expect("read blob after cancel/deny"),
+                original_blob
+            );
+            let manifest_after = router
+                .protector_wrap_manifests()
+                .iter()
+                .find(|item| item.wrap_id == manifest.wrap_id)
+                .cloned()
+                .expect("manifest after cancel/deny");
+            assert_eq!(manifest_after, manifest_before);
+        }
+        reset_verified_os_native_state_for_tests();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn os_native_platform_error_text_classifies_cancel_and_denied_patterns() {
+        assert!(matches!(
+            super::classify_os_native_platform_error_text("Security framework error code -128"),
+            OsNativeProtectorKekAccess::Cancelled
+        ));
+        assert!(matches!(
+            super::classify_os_native_platform_error_text("Windows error code 5"),
+            OsNativeProtectorKekAccess::Denied
+        ));
+    }
+
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn verified_os_native_singleflight_joins_and_calls_provider_once() {
@@ -7539,7 +7852,7 @@ Zm9v\n\
             Arc::new(move || {
                 provider_calls.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(120));
-                Some(vec![7u8; 32])
+                OsNativeProtectorKekAccess::Found(vec![7u8; 32])
             })
         };
         set_test_os_native_verified_loader(Some(loader));
@@ -7556,7 +7869,7 @@ Zm9v\n\
         let mut events = Vec::new();
         for handle in handles {
             let attempt = handle.join().expect("join verification thread");
-            assert!(attempt.value.is_some());
+            assert!(matches!(attempt.access, OsNativeProtectorKekAccess::Found(_)));
             events.push(attempt.event.dedupe_state);
         }
 
@@ -7578,7 +7891,7 @@ Zm9v\n\
             Arc::new(move || {
                 provider_calls.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(200));
-                Some(vec![9u8; 32])
+                OsNativeProtectorKekAccess::Found(vec![9u8; 32])
             })
         };
         set_test_os_native_verified_loader(Some(loader));
@@ -7614,15 +7927,15 @@ Zm9v\n\
             let provider_calls = provider_calls.clone();
             Arc::new(move || {
                 provider_calls.fetch_add(1, Ordering::SeqCst);
-                None
+                OsNativeProtectorKekAccess::PlatformFailure
             })
         };
         set_test_os_native_verified_loader(Some(loader));
 
         let first = os_native_protector_kek_verified_attempt();
         let second = os_native_protector_kek_verified_attempt();
-        assert!(first.value.is_none());
-        assert!(second.value.is_none());
+        assert!(!matches!(first.access, OsNativeProtectorKekAccess::Found(_)));
+        assert!(!matches!(second.access, OsNativeProtectorKekAccess::Found(_)));
         assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
         reset_verified_os_native_state_for_tests();
     }
