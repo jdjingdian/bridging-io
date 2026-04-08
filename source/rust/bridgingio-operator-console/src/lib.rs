@@ -6,7 +6,9 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use bridgingio_domain::{SshAuthConfig, SshAuthKind, SshPrivateKeySource, SshDeliveryPlan, TargetKind};
+use bridgingio_domain::{
+    SshAuthConfig, SshAuthKind, SshDeliveryPlan, SshPrivateKeySource, TargetKind,
+};
 use bridgingio_engine::{
     i18n::Catalog, prepare_standalone_ssh_probe, CoreSettings, PrepareSshProbeError,
     StandaloneConnectionSection, StandaloneTargetProfile, StandaloneTerminalSection,
@@ -19,15 +21,15 @@ use bridgingio_platform::{
 #[cfg(test)]
 use bridgingio_secrets::VaultUnlockTriggerPolicy;
 use bridgingio_secrets::{
-    canonical_ssh_private_key_ref_from_key_name, local_admin_create_token_target,
-    local_admin_delete_vault_target, local_admin_payload_digest_for_create_agent_token,
+    canonical_ssh_private_key_ref_from_key_name, inspect_trusted_local_ssh_private_key_path,
+    local_admin_create_token_target, local_admin_delete_vault_target,
+    local_admin_payload_digest_for_create_agent_token,
     local_admin_payload_digest_for_delete_agent_token, local_admin_payload_digest_for_delete_vault,
-    inspect_trusted_local_ssh_private_key_path, read_passive_vault_projection,
-    take_last_verified_os_native_event, CreateAgentTokenRequest, DeleteAgentTokenRequest,
-    DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter, SshAgentBrokerPrepareRequest,
-    SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput, TrustedLocalSshKeyImportRequest,
-    TrustedLocalSshKeyImportResult, UpdateAgentTokenAccessRequest, UpdateAgentTokenLabelRequest,
-    VaultError, VaultPassiveProjection, VerifiedOsNativeEvent,
+    read_passive_vault_projection, take_last_verified_os_native_event, CreateAgentTokenRequest,
+    DeleteAgentTokenRequest, DeleteVaultRequest, LocalAdminActionKind, SecretVaultRouter,
+    SshAgentBrokerPrepareRequest, SshHostKeyPolicy, SshKeyPassphraseHandling, TokenScopeInput,
+    TrustedLocalSshKeyImportRequest, TrustedLocalSshKeyImportResult, UpdateAgentTokenAccessRequest,
+    UpdateAgentTokenLabelRequest, VaultError, VaultPassiveProjection, VerifiedOsNativeEvent,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -387,6 +389,38 @@ const SSH_TEST_VERBOSE_CAPTURE_LIMIT_BYTES: usize = 32 * 1024;
 const SSH_TEST_VERBOSE_LOG_FILE_NAME: &str = "ssh-test-verbose.log";
 const MENUCONFIG_MIN_VIEWPORT_WIDTH: u16 = 80;
 const MENUCONFIG_MIN_VIEWPORT_HEIGHT: u16 = 24;
+const MENUCONFIG_NON_TARGET_DIRTY_FIELDS: &[&str] = &[
+    "core.instance_name",
+    "core.log_level",
+    "core.operator_locale",
+    "storage.artifacts.backend",
+    "storage.artifacts.max_bytes",
+    "model_plane.http.host",
+    "model_plane.http.port",
+    "model_plane.http.allow_non_loopback",
+    "vault.unlock.trigger_policy",
+];
+const MENUCONFIG_TARGET_DIRTY_SUFFIXES: &[&str] = &[
+    "id",
+    "display_name",
+    "enabled",
+    "aliases",
+    "credential_ref",
+    "notes",
+    "storage_class",
+    "access_class",
+    "sealed_profile_ref",
+    "connection.host",
+    "connection.port",
+    "connection.username",
+    "connection.selector_kind",
+    "connection.selector_value",
+    "ssh_auth.kind",
+    "ssh_auth.secure_access",
+    "ssh_auth.password",
+    "ssh_auth.private_key_source",
+    "ssh_auth.key_locator",
+];
 
 struct UnlockWorkerOutcome {
     router: SecretVaultRouter,
@@ -433,6 +467,7 @@ struct SshTestWorkerHandle {
 pub struct MenuConfigApp {
     config_path: PathBuf,
     settings: CoreSettings,
+    baseline_settings: CoreSettings,
     catalog: Catalog,
     authorization_recorder: LocalAuthorizationRecorder,
     session_flow_id: String,
@@ -484,6 +519,7 @@ impl MenuConfigApp {
         let config_path = config_path.into();
         let settings = CoreSettings::load_from_file(&config_path)
             .map_err(|err| format!("load menuconfig settings failed: {err:?}"))?;
+        let baseline_settings = settings.clone();
         let catalog = Catalog::load(&settings.core.operator_locale).map_err(|err| {
             format!(
                 "load menuconfig catalog failed (locale={}): {err}",
@@ -499,6 +535,7 @@ impl MenuConfigApp {
         Ok(Self {
             config_path,
             settings,
+            baseline_settings,
             catalog,
             authorization_recorder,
             session_flow_id: next_local_authorization_flow_id("menuconfig.session"),
@@ -840,7 +877,27 @@ impl MenuConfigApp {
     }
 
     pub fn is_dirty(&self) -> bool {
-        !self.dirty_paths.is_empty()
+        self.settings != self.baseline_settings
+    }
+
+    fn recompute_dirty_paths(&mut self) {
+        let mut paths = Vec::new();
+        for field in MENUCONFIG_NON_TARGET_DIRTY_FIELDS {
+            if field_value(&self.settings, field) != field_value(&self.baseline_settings, field) {
+                paths.push((*field).to_string());
+            }
+        }
+        for index in 0..self.settings.targets.len() {
+            for suffix in MENUCONFIG_TARGET_DIRTY_SUFFIXES {
+                let field = format!("targets[{index}].{suffix}");
+                if target_field_value(&self.settings, &field)
+                    != target_field_value(&self.baseline_settings, &field)
+                {
+                    paths.push(field);
+                }
+            }
+        }
+        self.dirty_paths = paths;
     }
 
     fn handle_edit_key(&mut self, code: KeyCode) -> Result<(), String> {
@@ -933,17 +990,15 @@ impl MenuConfigApp {
                 self.last_status =
                     self.tf("menu.status.opened_screen", &[("screen", &screen_title)]);
             }
-            MenuEntryKind::EditField(field) => {
-                match entry.template {
-                    RowTemplate::FieldEntryRow => self.begin_edit(field)?,
-                    RowTemplate::BooleanToggleRow | RowTemplate::MultiSelectRow => {
-                        self.last_status = self.t("menu.status.bool_toggle_space_only");
-                    }
-                    _ => {
-                        self.last_status = entry.description;
-                    }
+            MenuEntryKind::EditField(field) => match entry.template {
+                RowTemplate::FieldEntryRow => self.begin_edit(field)?,
+                RowTemplate::BooleanToggleRow | RowTemplate::MultiSelectRow => {
+                    self.last_status = self.t("menu.status.bool_toggle_space_only");
                 }
-            }
+                _ => {
+                    self.last_status = entry.description;
+                }
+            },
             MenuEntryKind::FocusField { screen, field } => {
                 self.push_navigation_state();
                 if let Some(index) = target_screen_index(&screen) {
@@ -964,7 +1019,8 @@ impl MenuConfigApp {
                 RowTemplate::ExclusiveChoiceRow | RowTemplate::ExclusiveChoiceEntryRow => {
                     match action {
                         ActionKind::BindTargetCredentialRef { .. } => {
-                            self.last_status = self.t("menu.status.target_credential_picker_space_only");
+                            self.last_status =
+                                self.t("menu.status.target_credential_picker_space_only");
                         }
                         ActionKind::SelectTargetSshAuthNone(index) => {
                             self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::None)?;
@@ -973,7 +1029,10 @@ impl MenuConfigApp {
                             self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::Password)?;
                         }
                         ActionKind::SelectTargetSshAuthPrivateKey(index) => {
-                            self.handle_enter_on_ssh_auth_kind_entry(index, SshAuthKind::PrivateKey)?;
+                            self.handle_enter_on_ssh_auth_kind_entry(
+                                index,
+                                SshAuthKind::PrivateKey,
+                            )?;
                         }
                         _ => self.run_action(action)?,
                     }
@@ -1266,9 +1325,7 @@ impl MenuConfigApp {
                 self.settings.core.operator_locale
             )
         })?;
-        if !self.dirty_paths.contains(&field.to_string()) {
-            self.dirty_paths.push(field.to_string());
-        }
+        self.recompute_dirty_paths();
         self.refresh_security_summary();
         Ok(())
     }
@@ -1316,17 +1373,7 @@ impl MenuConfigApp {
                 apply_target_field_edit(&mut self.settings, &field_source, source.as_str())?;
             }
         }
-        for field in [
-            field_kind,
-            field_secure,
-            field_password,
-            field_source,
-            field_locator,
-        ] {
-            if !self.dirty_paths.contains(&field) {
-                self.dirty_paths.push(field);
-            }
-        }
+        self.recompute_dirty_paths();
         Ok(())
     }
 
@@ -1370,11 +1417,7 @@ impl MenuConfigApp {
                 }
             }
         }
-        for field in [field_source, field_locator] {
-            if !self.dirty_paths.contains(&field) {
-                self.dirty_paths.push(field);
-            }
-        }
+        self.recompute_dirty_paths();
         Ok(())
     }
 
@@ -1538,6 +1581,7 @@ impl MenuConfigApp {
             )
         })?;
         self.last_apply_strategy = Some("restart_required".into());
+        self.baseline_settings = self.settings.clone();
         self.dirty_paths.clear();
         self.last_status = self.tf(
             "menu.status.saved",
@@ -2657,6 +2701,7 @@ impl MenuConfigApp {
             ActionKind::AddAdbTarget => {
                 let index = self.settings.targets.len();
                 self.settings.targets.push(default_adb_target(index));
+                self.recompute_dirty_paths();
                 self.push_navigation_state();
                 self.start_target_edit_session(index, true);
                 self.screen = Screen::TargetEditor(index);
@@ -2786,7 +2831,8 @@ impl MenuConfigApp {
                 if !is_sensitive_target(target) {
                     self.confirm_action = Some(ConfirmAction::ConfirmPlainSshPasswordRisk(index));
                     self.confirm_selected = 0;
-                    self.last_status = self.t("menu.status.plain_ssh_password_risk_confirm_pending");
+                    self.last_status =
+                        self.t("menu.status.plain_ssh_password_risk_confirm_pending");
                     return Ok(());
                 }
                 if let Err(err) = self.set_ssh_auth_kind(index, SshAuthKind::Password) {
@@ -2802,7 +2848,9 @@ impl MenuConfigApp {
                     self.last_status = err;
                     return Ok(());
                 }
-                if let Err(err) = self.set_ssh_private_key_source(index, SshPrivateKeySource::LocalPath) {
+                if let Err(err) =
+                    self.set_ssh_private_key_source(index, SshPrivateKeySource::LocalPath)
+                {
                     self.maybe_show_ssh_auth_block_popup(&err);
                     self.last_status = err;
                 } else {
@@ -2810,7 +2858,9 @@ impl MenuConfigApp {
                 }
             }
             ActionKind::SelectTargetSshKeySourceLocal(index) => {
-                if let Err(err) = self.set_ssh_private_key_source(index, SshPrivateKeySource::LocalPath) {
+                if let Err(err) =
+                    self.set_ssh_private_key_source(index, SshPrivateKeySource::LocalPath)
+                {
                     self.maybe_show_ssh_auth_block_popup(&err);
                     self.last_status = err;
                 } else {
@@ -2836,8 +2886,8 @@ impl MenuConfigApp {
                 }
                 let auth = effective_ssh_auth_for_menu_target(target);
                 let next = (!auth.secure_access).to_string();
-                if let Err(err) =
-                    self.apply_edit_value(&format!("targets[{index}].ssh_auth.secure_access"), &next)
+                if let Err(err) = self
+                    .apply_edit_value(&format!("targets[{index}].ssh_auth.secure_access"), &next)
                 {
                     self.maybe_show_ssh_auth_block_popup(&err);
                     self.last_status = err;
@@ -2951,6 +3001,7 @@ impl MenuConfigApp {
                 self.settings
                     .targets
                     .push(default_sensitive_ssh_target(index));
+                self.recompute_dirty_paths();
                 self.push_navigation_state();
                 self.start_target_edit_session(index, true);
                 self.screen = Screen::TargetCredentialSource(index);
@@ -2967,6 +3018,7 @@ impl MenuConfigApp {
                 self.settings
                     .targets
                     .push(default_sensitive_adb_target(index));
+                self.recompute_dirty_paths();
                 self.push_navigation_state();
                 self.start_target_edit_session(index, true);
                 self.screen = Screen::TargetEditor(index);
@@ -3264,6 +3316,7 @@ impl MenuConfigApp {
                     Some(ConfirmAction::ConfirmPlainSshRisk) => {
                         let index = self.settings.targets.len();
                         self.settings.targets.push(default_ssh_target(index));
+                        self.recompute_dirty_paths();
                         self.push_navigation_state();
                         self.start_target_edit_session(index, true);
                         self.screen = Screen::TargetCredentialSource(index);
@@ -3723,9 +3776,8 @@ impl MenuConfigApp {
         }
     }
 
-    fn strip_dirty_paths_for_target(&mut self, index: usize) {
-        let prefix = format!("targets[{index}].");
-        self.dirty_paths.retain(|path| !path.starts_with(&prefix));
+    fn strip_dirty_paths_for_target(&mut self, _index: usize) {
+        self.recompute_dirty_paths();
     }
 
     fn leaving_target_flow_on_back(&self) -> Option<usize> {
@@ -4564,7 +4616,10 @@ fn render_ssh_test_flow_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
                 .unwrap_or_else(|| "unknown-target".to_string());
             let popup = popup_text_input(
                 app.t("menu.ssh_test.timeout.title"),
-                app.tf("menu.ssh_test.timeout.message", &[("target_id", &target_id)]),
+                app.tf(
+                    "menu.ssh_test.timeout.message",
+                    &[("target_id", &target_id)],
+                ),
                 app.t("menu.ssh_test.timeout.hint"),
                 app.t("menu.ssh_test.timeout.input_prefix"),
                 timeout_input.clone(),
@@ -4653,7 +4708,9 @@ fn render_confirm_popup(frame: &mut ratatui::Frame, app: &MenuConfigApp) {
     let action_text = match action {
         ConfirmAction::DeleteVault => app.t("menu.confirm.delete_vault"),
         ConfirmAction::ConfirmPlainSshRisk => app.t("menu.confirm.plain_ssh_risk"),
-        ConfirmAction::ConfirmPlainSshPasswordRisk(_) => app.t("menu.confirm.plain_ssh_password_risk"),
+        ConfirmAction::ConfirmPlainSshPasswordRisk(_) => {
+            app.t("menu.confirm.plain_ssh_password_risk")
+        }
         ConfirmAction::DeleteSshKey(reference) => app.tf(
             "menu.confirm.delete_ssh_key",
             &[("ref", reference.as_str())],
@@ -5070,14 +5127,22 @@ fn render_text_input_modal(frame: &mut ratatui::Frame, popup: &TextInputPopupMod
         Line::from(""),
         Line::from(format!("{}{}", popup.input_prefix, popup.input_value)),
     ])
-    .block(Block::default().title(popup.title.clone()).borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(popup.title.clone())
+            .borders(Borders::ALL),
+    )
     .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 
     // Keep caret behavior shared by all text-input modal instances.
     let content_x = area.x.saturating_add(1);
     let content_y = area.y.saturating_add(4);
-    let desired_offset = popup.input_prefix.chars().count().saturating_add(popup.cursor);
+    let desired_offset = popup
+        .input_prefix
+        .chars()
+        .count()
+        .saturating_add(popup.cursor);
     let max_offset = area.width.saturating_sub(3) as usize;
     let cursor_x = content_x.saturating_add(desired_offset.min(max_offset) as u16);
     frame.set_cursor_position((cursor_x, content_y));
@@ -5099,7 +5164,11 @@ fn render_choice_list_modal(
         Line::from(popup.header.clone()),
         Line::from(popup.hint.clone()),
     ])
-    .block(Block::default().title(popup.title.clone()).borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(popup.title.clone())
+            .borders(Borders::ALL),
+    )
     .wrap(Wrap { trim: false });
     frame.render_widget(header, chunks[0]);
 
@@ -5663,7 +5732,9 @@ fn ssh_auth_setup_continue_block_reason(
                     Err(_) => Some(SshAuthSetupContinueBlockReason::LocalKeyPathInvalid),
                 };
             }
-            let source = auth.private_key_source.unwrap_or(SshPrivateKeySource::LocalPath);
+            let source = auth
+                .private_key_source
+                .unwrap_or(SshPrivateKeySource::LocalPath);
             match source {
                 SshPrivateKeySource::LocalPath => {
                     let Some(locator) = auth
@@ -5799,7 +5870,9 @@ fn target_credential_source_entries(
         }
         SshAuthKind::PrivateKey => {
             if is_sensitive_target(target) {
-                let source = auth.private_key_source.unwrap_or(SshPrivateKeySource::LocalPath);
+                let source = auth
+                    .private_key_source
+                    .unwrap_or(SshPrivateKeySource::LocalPath);
                 let source_value = match source {
                     SshPrivateKeySource::LocalPath => catalog.t("menu.target.ssh_key_source.local"),
                     SshPrivateKeySource::VaultRef => catalog.t("menu.target.ssh_key_source.vault"),
@@ -5924,8 +5997,8 @@ fn target_credential_picker_entries(
                 selected_ref == item.credential_ref,
                 &catalog.t("menu.target.credential_picker_row.desc"),
                 ActionKind::BindTargetCredentialRef {
-                target_index: index,
-                credential_ref: item.credential_ref.clone(),
+                    target_index: index,
+                    credential_ref: item.credential_ref.clone(),
                 },
             )
         })
@@ -6776,7 +6849,12 @@ fn nav_entry(label: &str, description: &str, screen: Screen) -> MenuEntry {
     )
 }
 
-fn status_nav_entry(label: &str, value: Option<String>, description: &str, screen: Screen) -> MenuEntry {
+fn status_nav_entry(
+    label: &str,
+    value: Option<String>,
+    description: &str,
+    screen: Screen,
+) -> MenuEntry {
     menu_entry(
         RowTemplate::StatusEntryCompat,
         label,
@@ -7165,8 +7243,9 @@ fn apply_target_field_edit(
         }
         "ssh_auth.kind" => {
             let auth = target.ssh_auth.get_or_insert_with(SshAuthConfig::default);
-            auth.kind = SshAuthKind::parse(value)
-                .ok_or_else(|| "ssh_auth.kind must be one of none/password/private-key".to_string())?;
+            auth.kind = SshAuthKind::parse(value).ok_or_else(|| {
+                "ssh_auth.kind must be one of none/password/private-key".to_string()
+            })?;
             match auth.kind {
                 SshAuthKind::None => {
                     auth.secure_access = false;
@@ -7205,13 +7284,9 @@ fn apply_target_field_edit(
             auth.private_key_source = if value.trim().is_empty() {
                 None
             } else {
-                Some(
-                    SshPrivateKeySource::parse(value)
-                        .ok_or_else(|| {
-                            "ssh_auth.private_key_source must be local-path or vault-ref"
-                                .to_string()
-                        })?,
-                )
+                Some(SshPrivateKeySource::parse(value).ok_or_else(|| {
+                    "ssh_auth.private_key_source must be local-path or vault-ref".to_string()
+                })?)
             };
             sync_legacy_credential_ref_from_ssh_auth(target);
         }
@@ -8107,7 +8182,10 @@ fn execute_ssh_test_worker(
         .map(|metadata| metadata.len());
 
     let mut ssh_command = Command::new(&prepared_probe.executable_path);
-    ssh_command.args(&ssh_args).stdout(Stdio::null()).stderr(Stdio::piped());
+    ssh_command
+        .args(&ssh_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     if isolate_ambient_agent {
         ssh_command.env_remove("SSH_AUTH_SOCK");
     }
@@ -8273,7 +8351,11 @@ fn remove_ssh_option_overrides_for_probe(args: &mut Vec<String>, option_keys: &[
         }
         let should_remove = args[index + 1]
             .split_once('=')
-            .map(|(key, _)| option_keys.iter().any(|candidate| key.eq_ignore_ascii_case(candidate)))
+            .map(|(key, _)| {
+                option_keys
+                    .iter()
+                    .any(|candidate| key.eq_ignore_ascii_case(candidate))
+            })
             .unwrap_or(false);
         if should_remove {
             args.remove(index + 1);
@@ -8417,7 +8499,9 @@ fn local_ssh_key_locator_for_target(target: &StandaloneTargetProfile) -> Option<
         return None;
     }
     let auth = effective_ssh_auth_for_menu_target(target);
-    if auth.kind != SshAuthKind::PrivateKey || auth.private_key_source != Some(SshPrivateKeySource::LocalPath) {
+    if auth.kind != SshAuthKind::PrivateKey
+        || auth.private_key_source != Some(SshPrivateKeySource::LocalPath)
+    {
         return None;
     }
     auth.key_locator
@@ -8446,7 +8530,9 @@ fn passphrase_blocked_local_key_message(
     )
 }
 
-fn validate_trusted_local_ssh_private_key_constraints(settings: &CoreSettings) -> Result<(), String> {
+fn validate_trusted_local_ssh_private_key_constraints(
+    settings: &CoreSettings,
+) -> Result<(), String> {
     for (index, target) in settings.targets.iter().enumerate() {
         let Some(locator) = local_ssh_key_locator_for_target(target) else {
             continue;
@@ -8588,26 +8674,47 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    fn repo_tmp_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repo root")
+            .join("tmp")
+    }
+
     fn temp_config_path(label: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("bridgingio-operator-console-{label}-{stamp}"));
+        let root = repo_tmp_dir().join(format!("bridgingio-operator-console-{label}-{stamp}"));
         fs::create_dir_all(&root).expect("create root");
         let config_path = root.join("standalone.toml");
         fs::write(&config_path, CoreSettings::minimal_example()).expect("write config");
+        let runtime_root = root.join("runtime");
+        fs::create_dir_all(&runtime_root).expect("create runtime root");
+        set_config_data_dir(&config_path, &runtime_root);
         config_path
     }
 
     fn set_config_data_dir(config_path: &Path, data_dir: &Path) {
         let config = fs::read_to_string(config_path).expect("read config");
         let toml_data_dir = data_dir.to_string_lossy().replace('\\', "\\\\");
-        let updated = config.replace(
-            "data_dir = \"auto\"",
-            &format!("data_dir = \"{toml_data_dir}\""),
-        );
+        let mut replaced = false;
+        let mut lines = Vec::new();
+        for line in config.lines() {
+            if line.trim_start().starts_with("data_dir = ") {
+                lines.push(format!("data_dir = \"{toml_data_dir}\""));
+                replaced = true;
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+        assert!(replaced, "config missing core.data_dir field");
+        let mut updated = lines.join("\n");
+        if config.ends_with('\n') {
+            updated.push('\n');
+        }
         fs::write(config_path, updated).expect("write config with custom data dir");
     }
 
@@ -8690,8 +8797,7 @@ mod tests {
 
     const TEST_PRIVATE_KEY_PEM: &str =
         "-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n";
-    const ENCRYPTED_TEST_PRIVATE_KEY_PEM: &str =
-        "-----BEGIN RSA PRIVATE KEY-----\n\
+    const ENCRYPTED_TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
 Proc-Type: 4,ENCRYPTED\n\
 DEK-Info: AES-256-CBC,0123456789ABCDEF0123456789ABCDEF\n\
 \n\
@@ -8754,7 +8860,10 @@ Zm9v\n\
     fn plain_local_passphrase_key_is_blocked_during_edit() {
         let config_path = temp_config_path("plain-local-passphrase-gate");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
-        let key_path = config_path.parent().expect("config parent").join("id_plain_enc");
+        let key_path = config_path
+            .parent()
+            .expect("config parent")
+            .join("id_plain_enc");
         fs::write(&key_path, ENCRYPTED_TEST_PRIVATE_KEY_PEM).expect("write encrypted key");
 
         let err = app
@@ -8769,7 +8878,9 @@ Zm9v\n\
         let config_path = temp_config_path("sealed-local-passphrase-gate");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         let index = app.settings.targets.len();
-        app.settings.targets.push(super::default_sensitive_ssh_target(index));
+        app.settings
+            .targets
+            .push(super::default_sensitive_ssh_target(index));
         let key_path = config_path
             .parent()
             .expect("config parent")
@@ -8802,7 +8913,9 @@ Zm9v\n\
         )));
 
         let index = app.settings.targets.len();
-        app.settings.targets.push(super::default_sensitive_ssh_target(index));
+        app.settings
+            .targets
+            .push(super::default_sensitive_ssh_target(index));
         app.security_summary.lock_state = "unlocked".into();
         app.screen = Screen::TargetCredentialSource(index);
         app.run_action(ActionKind::SelectTargetSshAuthPassword(index))
@@ -8940,10 +9053,16 @@ Zm9v\n\
             )
         );
 
-        let key_path = config_path.parent().expect("config parent").join("id_plain_unenc");
+        let key_path = config_path
+            .parent()
+            .expect("config parent")
+            .join("id_plain_unenc");
         fs::write(&key_path, TEST_PRIVATE_KEY_PEM).expect("write plain key");
-        app.apply_edit_value("targets[0].ssh_auth.key_locator", &key_path.to_string_lossy())
-            .expect("set local key path");
+        app.apply_edit_value(
+            "targets[0].ssh_auth.key_locator",
+            &key_path.to_string_lossy(),
+        )
+        .expect("set local key path");
         let entries = app.entries();
         assert!(entries.iter().any(|entry| matches!(
             entry.kind,
@@ -8972,7 +9091,10 @@ Zm9v\n\
             .expect("enter on unselected password row");
         let auth = super::effective_ssh_auth_for_menu_target(&app.settings.targets[0]);
         assert_eq!(auth.kind, SshAuthKind::None);
-        assert_eq!(app.last_status, app.t("menu.status.ssh_auth_kind_space_only"));
+        assert_eq!(
+            app.last_status,
+            app.t("menu.status.ssh_auth_kind_space_only")
+        );
 
         app.handle_space_on_selected()
             .expect("space should switch auth kind");
@@ -9029,7 +9151,9 @@ Zm9v\n\
         let config_path = temp_config_path("sealed-private-key-hide-local-switch");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
         let index = app.settings.targets.len();
-        app.settings.targets.push(super::default_sensitive_ssh_target(index));
+        app.settings
+            .targets
+            .push(super::default_sensitive_ssh_target(index));
         app.security_summary.lock_state = "unlocked".into();
         app.screen = Screen::TargetCredentialSource(index);
         app.run_action(ActionKind::SelectTargetSshAuthPrivateKey(index))
@@ -9054,7 +9178,10 @@ Zm9v\n\
     fn encrypted_local_key_in_auth_setup_opens_block_popup() {
         let config_path = temp_config_path("ssh-auth-setup-passphrase-popup");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
-        let key_path = config_path.parent().expect("config parent").join("id_popup_enc");
+        let key_path = config_path
+            .parent()
+            .expect("config parent")
+            .join("id_popup_enc");
         fs::write(&key_path, ENCRYPTED_TEST_PRIVATE_KEY_PEM).expect("write encrypted key");
 
         app.screen = Screen::TargetCredentialSource(0);
@@ -9064,7 +9191,8 @@ Zm9v\n\
             .expect("begin local key path edit");
         app.edit_input = key_path.to_string_lossy().to_string();
         app.edit_cursor = app.edit_input.chars().count();
-        app.handle_edit_key(KeyCode::Enter).expect("commit key path edit");
+        app.handle_edit_key(KeyCode::Enter)
+            .expect("commit key path edit");
 
         assert!(app.ssh_auth_block_popup.is_some());
         app.handle_ssh_auth_block_popup_key(KeyCode::Enter);
@@ -9075,11 +9203,16 @@ Zm9v\n\
     fn save_blocks_passphrase_protected_local_ssh_key_paths() {
         let config_path = temp_config_path("save-blocks-local-passphrase-key");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
-        let key_path = config_path.parent().expect("config parent").join("id_save_enc");
+        let key_path = config_path
+            .parent()
+            .expect("config parent")
+            .join("id_save_enc");
         fs::write(&key_path, ENCRYPTED_TEST_PRIVATE_KEY_PEM).expect("write encrypted key");
         app.settings.targets[0].credential_ref = Some(key_path.to_string_lossy().to_string());
 
-        let err = app.save().expect_err("save must block encrypted local key path");
+        let err = app
+            .save()
+            .expect_err("save must block encrypted local key path");
         assert!(err.contains(super::SSH_LOCAL_KEY_PASSPHRASE_BLOCK_SUBCODE));
     }
 
@@ -9181,6 +9314,26 @@ Zm9v\n\
             .expect("confirm discard existing target changes");
         assert_eq!(app.screen, Screen::Targets);
         assert_eq!(app.settings.targets[0].display_name, original);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn apply_target_keeps_root_dirty_until_save() {
+        let config_path = temp_config_path("apply-target-keeps-root-dirty");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        app.run_action(ActionKind::AddAdbTarget)
+            .expect("open create target editor");
+        app.apply_edit_value("targets[1].display_name", "Draft Target")
+            .expect("edit draft target");
+        app.run_action(ActionKind::ApplyTarget(1))
+            .expect("apply target draft");
+        assert!(app.is_dirty());
+
+        app.screen = Screen::Root;
+        app.navigation_stack.clear();
+        let outcome = app.request_exit_or_back().expect("request root exit");
+        assert!(outcome.is_none());
+        assert!(app.exit_confirm_mode);
     }
 
     #[test]
@@ -9788,7 +9941,6 @@ Zm9v\n\
             .expect("add adb target");
         super::apply_field_edit(&mut app.settings, "targets[1].display_name", "My ADB")
             .expect("edit target");
-        app.dirty_paths.push("targets[1].display_name".into());
         app.save().expect("save");
         let saved = fs::read_to_string(&config_path).expect("read saved config");
         assert!(saved.contains("display_name = \"My ADB\""));
@@ -10086,7 +10238,10 @@ Zm9v\n\
         let options = vec!["memory".to_string(), "filesystem".to_string()];
         let localized =
             super::localized_choice_options(&catalog, "storage.artifacts.backend", &options);
-        assert_eq!(localized, vec!["运行内存".to_string(), "文件系统".to_string()]);
+        assert_eq!(
+            localized,
+            vec!["运行内存".to_string(), "文件系统".to_string()]
+        );
     }
 
     #[test]
@@ -10098,22 +10253,29 @@ Zm9v\n\
         let model_entries = app.entries();
         let allow_non_loopback = model_entries
             .iter()
-            .find(|entry| matches!(
-                entry.kind,
-                MenuEntryKind::EditField(ref field)
-                    if field == "model_plane.http.allow_non_loopback"
-            ))
+            .find(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::EditField(ref field)
+                        if field == "model_plane.http.allow_non_loopback"
+                )
+            })
             .expect("allow_non_loopback entry");
-        assert_eq!(allow_non_loopback.template, super::RowTemplate::BooleanToggleRow);
+        assert_eq!(
+            allow_non_loopback.template,
+            super::RowTemplate::BooleanToggleRow
+        );
 
         app.screen = Screen::TargetPublicDescriptor(0);
         let target_entries = app.entries();
         let enabled = target_entries
             .iter()
-            .find(|entry| matches!(
-                entry.kind,
-                MenuEntryKind::EditField(ref field) if field == "targets[0].enabled"
-            ))
+            .find(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::EditField(ref field) if field == "targets[0].enabled"
+                )
+            })
             .expect("target enabled entry");
         assert_eq!(enabled.template, super::RowTemplate::MultiSelectRow);
 
@@ -10124,7 +10286,10 @@ Zm9v\n\
             .iter()
             .find(|entry| entry.label == app.t("menu.security.unlocked_notice"))
             .expect("unlocked notice");
-        assert_eq!(unlocked_notice.template, super::RowTemplate::FixedEnabledRow);
+        assert_eq!(
+            unlocked_notice.template,
+            super::RowTemplate::FixedEnabledRow
+        );
     }
 
     #[test]
@@ -10149,19 +10314,23 @@ Zm9v\n\
 
         let none_entry = entries
             .iter()
-            .find(|entry| matches!(
-                entry.kind,
-                MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(0))
-            ))
+            .find(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::SelectTargetSshAuthNone(0))
+                )
+            })
             .expect("none entry");
         assert_eq!(none_entry.template, super::RowTemplate::ExclusiveChoiceRow);
 
         let password_entry = entries
             .iter()
-            .find(|entry| matches!(
-                entry.kind,
-                MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(0))
-            ))
+            .find(|entry| {
+                matches!(
+                    entry.kind,
+                    MenuEntryKind::Action(ActionKind::SelectTargetSshAuthPassword(0))
+                )
+            })
             .expect("password entry");
         assert_eq!(
             password_entry.template,
@@ -10240,7 +10409,7 @@ Zm9v\n\
     fn root_exit_with_dirty_changes_opens_confirm_dialog() {
         let config_path = temp_config_path("root-exit-dirty-confirm");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
-        app.dirty_paths.push("core.instance_name".into());
+        app.settings.core.instance_name.push_str("-changed");
         let outcome = app.request_exit_or_back().expect("request exit");
         assert!(outcome.is_none());
         assert!(app.exit_confirm_mode);
@@ -10250,7 +10419,7 @@ Zm9v\n\
     fn exit_confirm_yes_saves_before_exit() {
         let config_path = temp_config_path("exit-confirm-save");
         let mut app = MenuConfigApp::load(&config_path).expect("load app");
-        app.dirty_paths.push("core.instance_name".into());
+        app.settings.core.instance_name.push_str("-changed");
         app.begin_exit_confirm();
         app.exit_confirm_selected = 0;
         let outcome = app
@@ -10259,6 +10428,47 @@ Zm9v\n\
             .expect("must exit");
         assert!(outcome.saved);
         assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn log_level_reverted_to_baseline_is_not_dirty_and_exits_without_confirm() {
+        let config_path = temp_config_path("revert-log-level-clears-dirty");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let baseline = app.settings.core.log_level.clone();
+
+        app.apply_edit_value("core.log_level", "debug")
+            .expect("set debug");
+        assert!(app.is_dirty());
+        app.apply_edit_value("core.log_level", &baseline)
+            .expect("revert to baseline");
+
+        assert!(!app.is_dirty());
+        assert!(!app.dirty_paths.iter().any(|path| path == "core.log_level"));
+
+        let outcome = app.request_exit_or_back().expect("request exit");
+        assert!(outcome.is_some());
+        assert!(!app.exit_confirm_mode);
+    }
+
+    #[test]
+    fn bool_toggle_reverted_to_baseline_clears_dirty() {
+        let config_path = temp_config_path("revert-bool-clears-dirty");
+        let mut app = MenuConfigApp::load(&config_path).expect("load app");
+        let baseline = app.settings.model_plane.http.allow_non_loopback;
+        let flipped = (!baseline).to_string();
+
+        app.apply_edit_value("model_plane.http.allow_non_loopback", &flipped)
+            .expect("flip bool");
+        assert!(app.is_dirty());
+
+        app.apply_edit_value("model_plane.http.allow_non_loopback", &baseline.to_string())
+            .expect("revert bool");
+
+        assert!(!app.is_dirty());
+        assert!(!app
+            .dirty_paths
+            .iter()
+            .any(|path| path == "model_plane.http.allow_non_loopback"));
     }
 
     #[test]

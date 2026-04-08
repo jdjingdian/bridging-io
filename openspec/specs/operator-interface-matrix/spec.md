@@ -14,6 +14,19 @@ BridgingIO 必须维护一份正式的本地 operator interface matrix，用于�
 - **当** 某个本地 operator 接口存在 `restart_required`、`not_ready`、`method_not_implemented`、一次性 reveal 或 destructive confirmation 等正式语义
 - **那么** 接口矩阵必须明确记录这些状态与对应恢复动作，而不是仅靠 README 叙述或代码注释隐式表达
 
+### 需求:本地 operator interface matrix 必须记录 menuconfig 保存确认的真实差异合同
+当本地 operator interface matrix 记录 `bridgingio-core menuconfig` 的保存与退出行为时，必须明确区分“当前配置仍有真实未保存差异”和“用户只是编辑过但已恢复基线”这两种状态。矩阵不得继续把退出确认描述成由编辑历史直接触发的弱语义。
+
+#### 场景:矩阵记录字段恢复基线后的退出行为
+- **当** 接口矩阵记录 `menuconfig` 根页面的 `Esc` / `Exit` 语义
+- **并且** 某个字段在本次会话中被修改后又恢复为会话基线值，且整体配置不再偏离基线
+- **那么** 矩阵必须明确记录该场景直接退出，不弹保存确认
+
+#### 场景:矩阵记录 apply 后仍需 save 的退出行为
+- **当** 接口矩阵记录一个 target 编辑会话已经执行 `Apply Target --->`，但整体配置尚未 `Save` 到磁盘的场景
+- **那么** 矩阵必须明确记录只要整体配置相对会话基线仍存在真实差异，根页面退出仍会弹出保存确认
+- **并且** 必须明确记录 `Apply Target --->` 不等价于整体配置已保存
+
 ### 需求:本地安全管理接口矩阵必须记录 vault/token 的状态门控与删除前置条件
 当本地 operator surface 提供 vault 与 token 管理动作时，接口矩阵必须明确记录这些动作各自的状态前置条件、确认要求与输出合同，而不是只列出命令名称。至少必须覆盖 `vault init`、`vault delete`、`token create`、`token revoke`、`token delete` 以及它们与 `uninitialized / locked / unlocked / revoked / expired / deleted` 等状态的关系。
 

@@ -18,6 +18,8 @@ menuconfig grammar.
 - `>` marks current focus on actionable rows only.
 - `Esc` first closes the current popup, then backs out one level, then exits
   from root.
+- Title dirty suffix and root exit-confirm must be derived from current draft
+  vs session baseline differences, not from edit-history alone.
 - Future menuconfig feature work must match this matrix before merge.
 - Screen implementations must choose a template first, then fill data.
 - Screen implementations must not handcraft semantic prefixes or `--->`.
@@ -88,6 +90,17 @@ menuconfig grammar.
 | Status / description block | multi-line status panel | left-aligned inside block | read-only | may wrap |
 | Popup overlay | centered modal overlay | content left-aligned unless button row requires centering | background menu is frozen | `Esc` closes current popup first |
 | Resize guard | centered blocking overlay | centered or left-aligned prompt | normal navigation suspended until size recovers or operator exits | shown when viewport is smaller than minimum supported size |
+
+## Dirty Tracking Contract
+
+- Title dirty suffix appears only when current `settings` differs from the
+  session baseline snapshot.
+- Reverting an edited field back to its baseline value clears dirty state for
+  that field; if no real differences remain, the title dirty suffix must
+  disappear.
+- Root `Esc` / `< Exit >` opens `Yes/No/Cancel` save confirm only when real
+  unsaved differences remain; if all edits are reverted to baseline, root exit
+  must proceed without save confirm.
 
 ## Row Grammar Matrix (Template-Derived)
 
